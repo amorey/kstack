@@ -1,0 +1,52 @@
+// Copyright 2026 The Kstack Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//go:build windows
+
+package bash
+
+import (
+	"os"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/kstackhq/kstack/sidecar/internal/tools"
+)
+
+// A task keeps its script and its job while it runs, since bash reads the
+// script as it goes and closing the job's handle kills the tree; the reap
+// releases both.
+func TestATaskKeepsItsScriptAndJob(t *testing.T) {
+	tl := tool(t)
+	tk, err := startTask(t.Context(), tl.spec("sleep 60", 1024), taskOut(t))
+	require.NoError(t, err)
+	_, err = os.Stat(tk.script)
+	require.NoError(t, err, "the script is kept while bash runs")
+
+	tk.Stop(true)
+	assert.Equal(t, tools.Exit{Code: cancelCode, OK: true, Stopped: true}, tk.Wait())
+	_, err = os.Stat(tk.script)
+	assert.True(t, os.IsNotExist(err), "the reap removes the script")
+}
+
+// A stop without now still ends the job at once: there is no SIGTERM to give.
+func TestAStopEndsTheJobAtOnce(t *testing.T) {
+	tl := tool(t)
+	tk, err := startTask(t.Context(), tl.spec("sleep 60", 1024), taskOut(t))
+	require.NoError(t, err)
+	tk.Stop(false)
+	assert.Equal(t, tools.Exit{Code: timeoutCode, OK: true, Stopped: true}, tk.Wait())
+}

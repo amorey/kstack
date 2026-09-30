@@ -1,0 +1,59 @@
+;; A sandboxed run's Seatbelt profile. A later rule wins over an earlier one.
+;; Every path Kstack does not fix here is a parameter, and each marker line
+;; is replaced by one rule per path (sandbox_darwin.go).
+(version 1)
+(deny default)
+
+;; Processes and the system.
+(allow process-exec)
+(allow process-fork)
+;; A process stays in the run's group, which the group's kill ends. posix_spawn
+;; can still start one in a new session or group (TestAProcessThatLeavesTheGroupStaysConfined).
+(deny syscall-unix (syscall-number SYS_setsid SYS_setpgid))
+(allow signal (target same-sandbox))
+(allow process-info* (target same-sandbox))
+(allow sysctl-read)
+;; No /dev/tty: input pushed into a terminal (TIOCSTI) is run by whatever reads
+;; it, outside the sandbox (TestATerminalIsUnreachable).
+(allow file-ioctl (literal "/dev/null") (subpath "/dev/fd"))
+
+;; Reads: the system's named files, then the roots, the PATH trees and the
+;; sidecar's own executable.
+(allow file-read*
+  (subpath "/private/var/select")
+  (subpath "/private/var/db/timezone")
+  (subpath "/private/var/db/dyld")
+  (literal "/private/var/db/xcode_select_link")
+  (literal "/dev/null")
+  (literal "/dev/zero")
+  (literal "/dev/random")
+  (literal "/dev/urandom")
+  (subpath "/dev/fd")
+  (literal "/dev/stdin")
+  (literal "/dev/stdout")
+  (literal "/dev/stderr"))
+;; dyld opens the root at launch and aborts every program when it cannot.
+;; This lists the root's own names, never what lies under them.
+(allow file-read-data (literal "/"))
+;; TREES
+
+;; Denials: the credential paths a tree takes in, Homebrew's var and
+;; Kstack's directories.
+;; DENIED
+
+;; The run's own, which lie under Kstack's directories.
+;; OWN
+(allow file-write* (literal "/dev/null") (subpath "/dev/fd"))
+
+;; Ancestors: an lstat alone, so a program resolves its own path and git
+;; looks upward. The root's own links into /private are among them.
+(allow file-read-metadata (literal "/etc") (literal "/var") (literal "/tmp"))
+;; ANCESTORS
+
+;; Mach services. Each is here because a listed program needs it
+;; (TestTheListedProgramsRun); refusedServices is what never is.
+(allow mach-lookup
+  ;; zsh, git and python3 look the user up (getpwuid).
+  (global-name "com.apple.system.opendirectoryd.libinfo"))
+
+;; NETWORK

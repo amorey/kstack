@@ -1,0 +1,161 @@
+// Copyright 2026 The Kstack Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//go:build !windows
+
+package main
+
+import (
+	"context"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+)
+
+// socketPath returns a bindable AF_UNIX path for one test.
+//
+// Not t.TempDir(): it embeds the test's name, and a socket path over sun_path —
+// 104 bytes on macOS — fails to bind with EINVAL.
+func socketPath(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "sidecar")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return filepath.Join(dir, "s.sock")
+}
+
+// unbindableEndpoint names a socket under a directory that does not exist.
+func unbindableEndpoint(t *testing.T) string {
+	t.Helper()
+	return filepath.Join(t.TempDir(), "missing", "sidecar.sock")
+}
+
+// The full lifecycle: bind, announce READY, serve, then shut down on stdin EOF
+// (the host's parent-died signal) and clean the socket file up. Serving is
+// proven by a real request over the socket, which is also what makes the
+// shutdown deterministic — no wall-clock wait for the server to come up.
+func TestRunServesUntilStdinCloses(t *testing.T) {
+	sock := socketPath(t)
+	stdin, hostEnd := net.Pipe() // hostEnd.Close() is the host exiting
+	out := &syncBuffer{}
+
+	cfg := runArgs(t, "--socket", sock, "--cache-dir", t.TempDir(), "--runtime-dir", t.TempDir(), "--data-dir", t.TempDir(), "--kubeconfig", filepath.Join(t.TempDir(), "none"))
+
+	var code int
+	var done sync.WaitGroup
+	done.Add(1)
+	go func() {
+		defer done.Done()
+		code = run(t.Context(), cfg, stdin, out)
+	}()
+
+	client := &http.Client{Transport: &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "unix", sock)
+		},
+	}}
+	// The socket appears when run binds it; a served response proves Serve is up.
+	require.Eventually(t, func() bool {
+		resp, err := client.Get("http://sidecar/graphql")
+		if err != nil {
+			return false
+		}
+		resp.Body.Close()
+		return true
+	}, 10*time.Second, 10*time.Millisecond, "sidecar never served over its socket")
+
+	hostEnd.Close()
+	done.Wait()
+
+	if code != 0 {
+		t.Errorf("exit code = %d, want 0", code)
+	}
+	if got := out.String(); !strings.Contains(got, "READY unix:"+sock) {
+		t.Errorf("stdout = %q, want the READY line for %s", got, sock)
+	}
+	if _, err := os.Stat(sock); !os.IsNotExist(err) {
+		t.Errorf("socket file still present after shutdown: %v", err)
+	}
+}
+
+// syncBuffer collects run's stdout while the test reads it from another
+// goroutine.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// runSidecar runs run on its own goroutine over ctx and cfg, returning a client
+// over its socket once it serves, and the func that ends it the way the host does
+// — by closing its end of stdin — and returns the exit code.
+func runSidecar(t *testing.T, ctx context.Context, cfg config) (*http.Client, func() int) {
+	t.Helper()
+	stdin, hostEnd := net.Pipe()
+	out := &syncBuffer{}
+	code := make(chan int, 1)
+	go func() { code <- run(ctx, cfg, stdin, out) }()
+
+	client := &http.Client{Transport: &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "unix", cfg.Socket)
+		},
+	}}
+	require.Eventually(t, func() bool {
+		resp, err := client.Get("http://sidecar/graphql")
+		if err != nil {
+			return false
+		}
+		resp.Body.Close()
+		return true
+	}, 10*time.Second, 10*time.Millisecond, "sidecar never served over its socket")
+	require.Contains(t, out.String(), "READY unix:"+cfg.Socket)
+
+	return client, func() int {
+		hostEnd.Close()
+		return <-code
+	}
+}
+
+// The context main hands run is the shutdown signals': ending it shuts the
+// sidecar down cleanly, the way stdin's EOF does.
+func TestRunShutsDownWhenItsContextEnds(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	cfg := runArgs(t, "--socket", socketPath(t), "--cache-dir", t.TempDir(), "--runtime-dir", t.TempDir(), "--data-dir", t.TempDir(), "--kubeconfig", filepath.Join(t.TempDir(), "none"))
+	_, end := runSidecar(t, ctx, cfg)
+
+	cancel()
+
+	require.Equal(t, 0, end())
+	_, err := os.Stat(cfg.Socket)
+	require.True(t, os.IsNotExist(err), "socket file still present after shutdown")
+}

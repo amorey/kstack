@@ -1,0 +1,51 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+.pnpm-store
+target
+.env.local
+
+# Sidecar build output (produced by `make sidecar`).
+src-tauri/binaries/
+# Kstack's own bwrap, its license and its source (produced by `make bwrap`).
+src-tauri/linux/bwrap
+src-tauri/linux/bubblewrap-*
+# Editor directories and files. The shared team config is re-included; anything
+# else under .vscode/ is personal.
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Agents. Ignore the directory's contents rather than the directory itself, so
+# the shared team config below can be re-included — a negation cannot resurrect
+# a file whose parent directory is excluded. Personal settings
+# (settings.local.json), worktrees, and lock files stay ignored.
+CLAUDE.local.md
+.claude/*
+!.claude/settings.json
+
+# Linux build outputs when developing inside the sandbox (see scripts note).
+.sandbox-linux/
+
+# custom
+.worktrees
+
+# Coverage output (make cover-js)
+coverage/

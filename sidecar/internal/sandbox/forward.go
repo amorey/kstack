@@ -1,0 +1,115 @@
+// Copyright 2026 The Kstack Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// The forwarder, kstack-sidecar sandbox-init: a sandboxed run's first process.
+// It listens on loopback where the run's kubeconfig points, relays each
+// connection to the run's socket, and runs the shell as its child. It reads
+// nothing it relays and checks nothing: every check is the proxy's. Running
+// the child is forward_unix.go and forward_windows.go.
+package sandbox
+
+import (
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"net"
+	"strconv"
+)
+
+// InitCommand is the subcommand that makes this executable a run's forwarder.
+const InitCommand = "sandbox-init"
+
+// ForwarderArgs is the forwarder's command line for r, after the executable:
+// InitCommand, the socket and port where r has a socket, and the -- the
+// child's command follows.
+func ForwarderArgs(r Run) []string {
+	args := []string{InitCommand}
+	if r.Socket != "" {
+		args = append(args, "--socket", r.Socket, "--port", strconv.Itoa(r.Port))
+	}
+	return append(args, "--")
+}
+
+// initFailed is the forwarder's or the shell launcher's own failure, clear of
+// the shell's 126 and 127. A command can exit 125 itself, so the subcommand's
+// line on stderr is what tells the two apart.
+const initFailed = 125
+
+// initArgs is sandbox-init's command line.
+type initArgs struct {
+	socket string   // the run's proxy socket, empty for a run with no cluster
+	port   int      // the loopback port to listen on, beside socket
+	argv   []string // the command to run as the child
+}
+
+// parseInitArgs reads [--socket <path> --port <n>] -- <argv…>, the two flags
+// together or neither; flag stops at the --, so argv is never read as flags.
+func parseInitArgs(args []string) (initArgs, error) {
+	var a initArgs
+	fs := flag.NewFlagSet(InitCommand, flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	fs.StringVar(&a.socket, "socket", "", "")
+	fs.IntVar(&a.port, "port", 0, "")
+	if err := fs.Parse(args); err != nil {
+		return initArgs{}, err
+	}
+	a.argv = fs.Args()
+	set := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
+	forwards := set["socket"] || set["port"]
+	switch {
+	case forwards && a.socket == "":
+		return initArgs{}, errors.New("no --socket")
+	case forwards && (a.port < 1 || a.port > 65535):
+		return initArgs{}, errors.New("no --port from 1 to 65535")
+	case len(a.argv) == 0:
+		return initArgs{}, errors.New("no command")
+	}
+	return a, nil
+}
+
+// relay carries conn to the run's socket and back, byte for byte, passing
+// each side's end of input to the other, and closes both once both are done.
+func relay(conn net.Conn, socket string) {
+	defer conn.Close()
+	up, err := net.Dial("unix", socket)
+	if err != nil {
+		return
+	}
+	defer up.Close()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = io.Copy(up, conn)
+		closeWrite(up)
+	}()
+	_, _ = io.Copy(conn, up)
+	closeWrite(conn)
+	<-done
+}
+
+// closeWrite half-closes c, where its kind can.
+func closeWrite(c net.Conn) {
+	if hc, ok := c.(interface{ CloseWrite() error }); ok {
+		_ = hc.CloseWrite()
+	}
+}
+
+// fail writes the subcommand's one line on stderr, which is the run's output,
+// so the model reads why, and answers initFailed.
+func fail(stderr io.Writer, command, what string, err error) int {
+	fmt.Fprintf(stderr, "%s: %s: %v\n", command, what, err)
+	return initFailed
+}

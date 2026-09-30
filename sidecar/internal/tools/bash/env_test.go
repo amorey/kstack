@@ -1,0 +1,64 @@
+// Copyright 2026 The Kstack Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package bash
+
+import (
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+)
+
+// processEnv is a process environment carrying credentials a sandboxed run
+// must not inherit.
+var processEnv = []string{
+	"PATH=/usr/local/bin:/usr/bin",
+	"HOME=/Users/ana",
+	"AWS_ACCESS_KEY_ID=AKIAEXAMPLE",
+	"KUBECONFIG=/Users/ana/.kube/config",
+	"SSH_AUTH_SOCK=/tmp/ssh.sock",
+	"GITHUB_TOKEN=ghp_example",
+	"LANG=en_US.UTF-8",
+	"LC_ALL=en_US.UTF-8",
+	"LC_CTYPE=UTF-8",
+	"TMPDIR=/var/folders/x/T/",
+	"TERM=xterm-256color",
+}
+
+var kstackVars = []string{"KSTACK=1", "KSTACK_SIDECAR_PID=10", "KSTACK_HOST_PID=9"}
+
+// A run with no cluster has no kubeconfig and no kubectl cache to name.
+func TestWithNoClusterTheEnvironmentNamesNoKubeconfig(t *testing.T) {
+	got := sandboxedRunEnv(processEnv, kstackVars, "/data/ws", "/data/ws", &runDir{path: "/tmp/r"}, nil)
+
+	for _, kv := range got {
+		assert.NotRegexp(t, `^KUBE`, kv)
+	}
+}
+
+// A process with no PATH gives the run none.
+func TestNoPathIsNoPath(t *testing.T) {
+	rd := &runDir{path: "/run/r", tmp: "/cache/t"}
+	got := sandboxedRunEnv([]string{"LANG=C"}, nil, "/ws", "/ws", rd, nil)
+
+	assert.Equal(t, []string{"HOME=/ws", "PWD=/ws", "ZDOTDIR=/run/r", "TMPDIR=/cache/t", "LANG=C", "TERM=dumb"}, got)
+}
+
+// A run outside the sandbox keeps the process's environment whole, then what
+// Kstack adds, then PWD.
+func TestAnOutsideRunKeepsItsEnvironment(t *testing.T) {
+	got := outsideEnv(processEnv, kstackVars, "/data/ws")
+
+	assert.Equal(t, append(append(append([]string{}, processEnv...), kstackVars...), "PWD=/data/ws"), got)
+}

@@ -1,0 +1,494 @@
+// Copyright 2026 The Kstack Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use std::sync::mpsc::{sync_channel, Receiver};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use tauri::ipc::Channel;
+use tauri::{AppHandle, Runtime};
+use tauri_plugin_shell::process::{CommandChild, CommandEvent};
+use tauri_plugin_shell::ShellExt;
+use tokio::sync::watch;
+
+use crate::error::{AppError, Result};
+use crate::paths::{app_cache_dir, app_data_dir, log_dir, runtime_dir};
+
+use super::graphql::{FrameSink, GraphqlResponse, QueryClient, SubscriptionClient};
+use super::grpc::{AuthStateStream, GrpcClient};
+use super::ipc::{Endpoint, Target};
+use super::logs::forward_sidecar_line;
+
+/// First-token marker the sidecar prints on stdout once its listener is up
+/// (`sidecar/main.go`); the drain task matches it to flip the readiness watch.
+const READY_MARKER: &[u8] = b"READY ";
+
+/// The sidecar's log, beside the host's `main.log` in the same directory.
+const SIDECAR_LOG_FILE: &str = "sidecar.log";
+
+/// How long [`SidecarService::ready`] waits for [`READY_MARKER`]. Startup is not
+/// a dial but a sum: on macOS the sidecar first imports the user's login-shell
+/// environment (`sidecar/internal/loginshell`, five seconds at worst), then
+/// migrates and binds. The model catalogs are discovered after `READY`, so they
+/// are not in it. The frontend's `ReadyGate` does not retry on its own — one
+/// timeout is an error screen — so this clears that sum with room to spare.
+const READY_BUDGET: Duration = Duration::from_secs(30);
+
+/// Sidecar child lifecycle state. `graceful_shutdown` takes `child` (dropping
+/// it closes stdin) but keeps `pid` so `kill` can still force-terminate;
+/// `exited` makes `kill` skip the pid fallback — the number may be reused.
+struct State {
+    /// The running child, or `None` once graceful_shutdown/kill has run.
+    child: Option<CommandChild>,
+    /// Retained after `child` is dropped; `None` once force-killed.
+    pid: Option<u32>,
+    /// Set by the drain task; once true the pid is not safe to kill.
+    exited: bool,
+}
+
+/// Owns the bundled sidecar child process and its IPC bridges (query client,
+/// SSE reader, gRPC channel), all on the [`Endpoint`] picked at spawn time.
+/// Construct via [`SidecarService::spawn`]. Shutdown can be driven from any
+/// thread (state behind `Arc<Mutex>`).
+pub struct SidecarService {
+    state: Arc<Mutex<State>>,
+    exit_rx: Mutex<Receiver<()>>,
+    /// Flipped true on [`READY_MARKER`]; on process exit the sender drops,
+    /// surfacing to `wait_for` as a recv error ("exited before ready").
+    ready_rx: watch::Receiver<bool>,
+    query_client: QueryClient,
+    subscription_client: SubscriptionClient,
+    /// Host-internal control surface (auth watch/login/logout, poke), h2c over
+    /// the same socket as GraphQL. See docs/adr/2026-08-09-single-socket-h2c.md.
+    grpc_client: GrpcClient,
+}
+
+impl SidecarService {
+    /// Spawns the `kstack-sidecar` binary; a background task drains its event
+    /// stream (log forwarding + termination reporting).
+    pub fn spawn<R: Runtime>(app: &AppHandle<R>) -> Result<Self> {
+        // Created up front, owner-only, so the sidecar makes its own beneath them.
+        let data = app_data_dir(app)?;
+        let dirs = Dirs {
+            cache: app_cache_dir(app, &data)?,
+            runtime: runtime_dir(&data)?,
+            data,
+        };
+        let endpoint = Endpoint::pick(&dirs.runtime)?;
+
+        // The sidecar keeps its own log beside main.log. Failing to place one
+        // never stops the app: the flag is omitted and its records come back
+        // over the pipes instead.
+        let log_file = match log_dir(app) {
+            Ok(dir) => Some(dir.join(SIDECAR_LOG_FILE)),
+            Err(e) => {
+                tracing::warn!(err = %e, "no sidecar log file; forwarding its pipes");
+                None
+            }
+        };
+
+        let (mut rx, child) = app
+            .shell()
+            .sidecar("kstack-sidecar")?
+            .args(cmd_args(&endpoint, &dirs, log_file.as_deref()))
+            .spawn()?;
+        let pid = child.pid();
+        // The sidecar's own account of its startup is in the other file, so
+        // main.log records that it was spawned and says where to look.
+        tracing::info!(pid, log_file = ?log_file, "sidecar spawned");
+
+        let state = Arc::new(Mutex::new(State {
+            child: Some(child),
+            pid: Some(pid),
+            exited: false,
+        }));
+
+        // What the dialers check every peer against. `State.pid` cannot serve:
+        // it outlives the child so `kill` can still reach it, and the kernel
+        // may have reassigned the number by then.
+        let (expect_tx, expect_rx) = watch::channel(Some(pid));
+
+        // Capacity 1 so the drain task never blocks delivering the exit.
+        let (exit_tx, exit_rx) = sync_channel::<()>(1);
+
+        let (ready_tx, ready_rx) = watch::channel(false);
+
+        let drain_state = Arc::clone(&state);
+        tauri::async_runtime::spawn(async move {
+            while let Some(ev) = rx.recv().await {
+                match ev {
+                    CommandEvent::Stdout(line) => {
+                        // stdout carries the readiness protocol and nothing
+                        // else; anything else there is as unexpected as a
+                        // stderr line and forwarded the same way.
+                        if line.starts_with(READY_MARKER) {
+                            tracing::info!("sidecar ready");
+                            let _ = ready_tx.send(true);
+                            continue;
+                        }
+                        forward_sidecar_line(&line);
+                    }
+                    CommandEvent::Stderr(line) => forward_sidecar_line(&line),
+                    CommandEvent::Terminated(payload) => {
+                        tracing::info!(?payload, "sidecar exited");
+
+                        // No sidecar, so no peer is legitimate any more.
+                        let _ = expect_tx.send(None);
+
+                        // `kill` must skip the pid fallback after this (pid may
+                        // be reused).
+                        drain_state
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .exited = true;
+
+                        // Wake any thread blocked in graceful_shutdown.
+                        let _ = exit_tx.try_send(());
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let target = Target::new(endpoint, expect_rx);
+        let query_client = QueryClient::new(target.clone());
+        let subscription_client = SubscriptionClient::new(target.clone());
+        let grpc_client = GrpcClient::new(target);
+
+        Ok(Self {
+            state,
+            exit_rx: Mutex::new(exit_rx),
+            ready_rx,
+            query_client,
+            subscription_client,
+            grpc_client,
+        })
+    }
+
+    /// Waits for the sidecar's [`READY_MARKER`]; errors if the sidecar exits
+    /// first (`Io`) or [`READY_BUDGET`] elapses (`TimedOut`). The frontend's
+    /// startup gate — without it the first GraphQL call silently absorbs the
+    /// bind-wait latency.
+    pub async fn ready(&self) -> Result<()> {
+        let mut rx = self.ready_rx.clone();
+        if *rx.borrow() {
+            return Ok(());
+        }
+        // `.map(|_| ())` drops the `watch::Ref` before the match arm — its
+        // borrow on `rx` would otherwise trip the borrow checker.
+        let waited = tokio::time::timeout(READY_BUDGET, rx.wait_for(|ready| *ready))
+            .await
+            .map(|res| res.map(|_| ()));
+        match waited {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(AppError::Io(std::io::Error::other(
+                "sidecar exited before announcing readiness",
+            ))),
+            Err(_) => Err(AppError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "sidecar did not announce readiness within budget",
+            ))),
+        }
+    }
+
+    /// Forwards a GraphQL query/mutation over UDS HTTP; see [`QueryClient`].
+    pub async fn query(&self, body: String) -> Result<GraphqlResponse> {
+        self.query_client.query(body).await
+    }
+
+    /// Registers a GraphQL subscription on its own SSE connection, forwarding
+    /// envelopes to `channel`. Returns the op id for
+    /// [`SidecarService::unsubscribe`]. `webview` is the label of the webview
+    /// that owns the channel, so [`SidecarService::cancel_webview`] can reach
+    /// it.
+    pub async fn subscribe(
+        &self,
+        query: String,
+        variables: serde_json::Value,
+        channel: Channel<String>,
+        webview: String,
+    ) -> Result<u64> {
+        // `FrameSink` is the delivery seam; the webview's `Channel` is wrapped
+        // in `TauriChannelSink`.
+        self.subscription_client
+            .subscribe(
+                query,
+                variables,
+                Arc::new(TauriChannelSink(channel)),
+                webview,
+            )
+            .await
+    }
+
+    /// Cancels a subscription; tolerant of unknown ids — see
+    /// [`SubscriptionClient::unsubscribe`].
+    pub async fn unsubscribe(&self, id: u64) {
+        self.subscription_client.unsubscribe(id).await;
+    }
+
+    /// Cancels every subscription a webview opened — see
+    /// [`SubscriptionClient::cancel_webview`].
+    pub fn cancel_webview(&self, webview: &str) {
+        self.subscription_client.cancel_webview(webview);
+    }
+
+    /// Runs the sidecar's synchronous login setup (loopback bind + browser
+    /// open); the resulting session change arrives via
+    /// [`Self::watch_auth_state`].
+    pub async fn start_login(&self) -> Result<()> {
+        self.grpc_client.start_login().await
+    }
+
+    /// Clears local credentials and revokes the refresh token.
+    pub async fn logout(&self) -> Result<()> {
+        self.grpc_client.logout().await
+    }
+
+    /// Opens the auth-state watch stream (current snapshot first, then one per
+    /// session change). Error / end-of-stream means the connection dropped —
+    /// the supervisor re-opens it.
+    pub async fn watch_auth_state(&self) -> Result<AuthStateStream> {
+        self.grpc_client.watch_auth_state().await
+    }
+
+    /// Best-effort resync nudge, driven by [`crate::wake`]; failures are the
+    /// caller's to swallow. See docs/adr/2026-08-09-poke-resync-fanout.md.
+    pub async fn poke(&self) -> Result<()> {
+        self.grpc_client.poke().await
+    }
+
+    /// Graceful shutdown: dropping the [`CommandChild`] closes stdin, and the
+    /// sidecar treats stdin EOF as "parent gone" (cross-platform, unlike POSIX
+    /// signals). Blocks until the process exits or `timeout` lapses — safe from
+    /// the `RunEvent` handler. Returns `false` on timeout (follow up with
+    /// [`SidecarService::kill`]; the pid is retained for that). No-op → `true`
+    /// if already shut down.
+    pub fn graceful_shutdown(&self, timeout: Duration) -> bool {
+        {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if state.exited {
+                return true;
+            }
+
+            // Drops stdin → EOF. `pid` stays. Guard released before blocking so
+            // the drain task can set `exited`.
+            drop(state.child.take());
+        }
+
+        // recv_timeout errs on both timeout and a dropped sender; either way
+        // the process is not known to have exited.
+        let exit_rx = self
+            .exit_rx
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        exit_rx.recv_timeout(timeout).is_ok()
+    }
+
+    /// Force-terminates the sidecar. Kills through the live child handle if
+    /// held, else by retained pid — but only if the process hasn't been
+    /// observed to exit (a reused pid must not be killed). Best-effort and
+    /// idempotent; for a clean exit call
+    /// [`SidecarService::graceful_shutdown`] first.
+    pub fn kill(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        // Prefer the live handle: reaps the child, no pid-reuse race.
+        if let Some(child) = state.child.take() {
+            let _ = child.kill();
+            state.pid = None;
+            return;
+        }
+
+        // Handle gone: pid fallback, unless the process already exited (the
+        // kernel may have reused the number).
+        if state.exited {
+            state.pid = None;
+            return;
+        }
+
+        if let Some(pid) = state.pid.take() {
+            force_kill_by_pid(pid);
+        }
+    }
+}
+
+/// The endpoints the app signs in against. Constants, never read from this
+/// process's environment: the sidecar inherits that environment, so reading
+/// them here would move the redirection risk rather than close it. A dev run
+/// overrides them inside the sidecar's own debug build.
+const CLOUD_URL: &str = "https://api.kstack.sh";
+const OAUTH_ISSUER: &str = "https://oauth.kstack.sh";
+const OAUTH_CLIENT_ID: &str = "kstack-desktop";
+
+/// The OS-keychain service the sidecar stores sign-in under: the product name,
+/// as the entry is user-visible in Keychain Access and Credential Manager.
+/// Renaming it orphans every stored sign-in, so it is its own constant even
+/// though it matches the data-dir leaf today.
+const KEYCHAIN_SERVICE: &str = if cfg!(debug_assertions) {
+    "Kstack-dev"
+} else {
+    "Kstack"
+};
+
+/// The directories the sidecar keeps its files in, by kind: what a user would
+/// lose, what Kstack rebuilds, and what lives for a session.
+struct Dirs {
+    data: std::path::PathBuf,
+    cache: std::path::PathBuf,
+    runtime: std::path::PathBuf,
+}
+
+/// CLI flags for the sidecar; a free function so the contract is unit-testable
+/// without the Tauri runtime.
+///
+/// `--host-pid` is the only process the sidecar's endpoint will serve. We are
+/// its sole client — the webview reaches it through us — so this closes the
+/// endpoint to every other process running as the user.
+///
+/// `log_file` is where the sidecar keeps its own log. `None` leaves the flag
+/// off and the sidecar logs to stderr, which we forward.
+fn cmd_args(socket: &Endpoint, dirs: &Dirs, log_file: Option<&std::path::Path>) -> Vec<String> {
+    let mut args: Vec<String> = [
+        ("--socket", socket.as_arg().to_owned()),
+        ("--data-dir", dirs.data.to_string_lossy().into_owned()),
+        ("--cache-dir", dirs.cache.to_string_lossy().into_owned()),
+        ("--runtime-dir", dirs.runtime.to_string_lossy().into_owned()),
+        ("--host-pid", std::process::id().to_string()),
+        ("--cloud-url", CLOUD_URL.to_owned()),
+        ("--oauth-issuer", OAUTH_ISSUER.to_owned()),
+        ("--oauth-client-id", OAUTH_CLIENT_ID.to_owned()),
+        ("--keychain-service", KEYCHAIN_SERVICE.to_owned()),
+    ]
+    .into_iter()
+    .flat_map(|(flag, value)| [flag.to_owned(), value])
+    .collect();
+
+    if let Some(path) = log_file {
+        args.push("--log-file".to_owned());
+        args.push(path.to_string_lossy().into_owned());
+    }
+    // A developer's terminal wants both processes' records; a release build's
+    // pipes stay quiet so nothing is stored twice.
+    if cfg!(debug_assertions) {
+        args.push("--log-stderr".to_owned());
+    }
+    args
+}
+
+/// Best-effort kill by pid — the fallback once [`SidecarService::graceful_shutdown`]
+/// dropped the child handle. Stale pids are ignored.
+#[cfg(unix)]
+fn force_kill_by_pid(pid: u32) {
+    // SAFETY: kill(2) has no memory effects; a stale pid returns ESRCH.
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+    }
+}
+
+#[cfg(windows)]
+fn force_kill_by_pid(pid: u32) {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+
+    // SAFETY: OpenProcess returns null on failure (checked); TerminateProcess
+    // and CloseHandle are sound on the handle it returns.
+    unsafe {
+        let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
+        if handle.is_null() {
+            return;
+        }
+        TerminateProcess(handle, 1);
+        CloseHandle(handle);
+    }
+}
+
+/// Adapts Tauri's `Channel<String>` to [`FrameSink`]. `send` errors only if
+/// the webview is gone; the frame is safely dropped.
+struct TauriChannelSink(Channel<String>);
+
+impl FrameSink for TauriChannelSink {
+    fn send_frame(&self, frame: String) {
+        let _ = self.0.send(frame);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pins the host↔sidecar CLI contract (`--socket`, the three directories,
+    /// `--host-pid`, and the endpoints); changing it without updating the
+    /// sidecar silently misroutes the cache or the socket, drops the peer
+    /// check, or leaves sign-in on an inherited environment variable.
+    #[test]
+    fn cmd_args_passes_the_directories_host_pid_and_endpoints() {
+        let base = std::env::temp_dir();
+        let path = Endpoint::pick(&base).expect("pick should succeed");
+        let dirs = test_dirs();
+        let log_file = std::path::PathBuf::from("/some/logs/sidecar.log");
+        let mut want = vec![
+            "--socket".to_owned(),
+            path.as_arg().to_owned(),
+            "--data-dir".to_owned(),
+            "/some/app/data".to_owned(),
+            "--cache-dir".to_owned(),
+            "/some/app/cache".to_owned(),
+            "--runtime-dir".to_owned(),
+            "/some/app/run".to_owned(),
+            "--host-pid".to_owned(),
+            std::process::id().to_string(),
+            "--cloud-url".to_owned(),
+            CLOUD_URL.to_owned(),
+            "--oauth-issuer".to_owned(),
+            OAUTH_ISSUER.to_owned(),
+            "--oauth-client-id".to_owned(),
+            OAUTH_CLIENT_ID.to_owned(),
+            "--keychain-service".to_owned(),
+            KEYCHAIN_SERVICE.to_owned(),
+            "--log-file".to_owned(),
+            log_file.to_string_lossy().into_owned(),
+        ];
+        // Debug builds put the sidecar's records on the terminal beside the
+        // host's; a release build's stderr stays quiet.
+        if cfg!(debug_assertions) {
+            want.push("--log-stderr".to_owned());
+        }
+        assert_eq!(cmd_args(&path, &dirs, Some(&log_file)), want);
+    }
+
+    fn test_dirs() -> Dirs {
+        Dirs {
+            data: "/some/app/data".into(),
+            cache: "/some/app/cache".into(),
+            runtime: "/some/app/run".into(),
+        }
+    }
+
+    /// The host resolves the log directory, and it can fail. A sidecar with no
+    /// file logs to stderr, which the host forwards — never a spawn refused
+    /// because a log could not be placed.
+    #[test]
+    fn cmd_args_omits_the_log_file_when_there_is_none() {
+        let base = std::env::temp_dir();
+        let path = Endpoint::pick(&base).expect("pick should succeed");
+        let args = cmd_args(&path, &test_dirs(), None);
+        assert!(!args.iter().any(|a| a == "--log-file"), "got: {args:?}");
+    }
+}

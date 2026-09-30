@@ -1,0 +1,118 @@
+// Copyright 2026 The Kstack Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+import { render, screen, act } from '@testing-library/react';
+import { Provider as UrqlProvider } from 'urql';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+import { flushWatchesSynchronously, mockTauriCore, pushClusters } from '@/test-utils';
+
+// Mocks ---------------------------------------------------------------
+
+// Frames pushed here are asserted on immediately.
+flushWatchesSynchronously();
+
+const { invokeMock, channels, channelFor, factory } = mockTauriCore();
+vi.mock('@tauri-apps/api/core', () => factory());
+
+const { createGraphqlClient } = await import('@/lib/graphql/client');
+const { ClustersProvider } = await import('./clusters');
+const { KubeConfigProvider, useKubeConfig, tlsUnverifiedReason } = await import('./kube-config');
+
+// Helpers -------------------------------------------------------------
+
+const flush = () => act(async () => {});
+
+// A probe that renders the derived kubeconfig so tests can assert on it.
+function Probe() {
+  const { kubeConfig } = useKubeConfig();
+  return <div data-testid="probe">{kubeConfig === null ? 'null' : JSON.stringify(kubeConfig)}</div>;
+}
+
+function renderProvider() {
+  return render(
+    <UrqlProvider value={createGraphqlClient()}>
+      <ClustersProvider>
+        <KubeConfigProvider>
+          <Probe />
+        </KubeConfigProvider>
+      </ClustersProvider>
+    </UrqlProvider>,
+  );
+}
+
+describe('useKubeConfig', () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+    channels.length = 0;
+    let id = 0;
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'graphql_subscribe') {
+        id += 1;
+        return id;
+      }
+      if (cmd === 'graphql_unsubscribe') return undefined;
+      throw new Error(`unexpected ${cmd}`);
+    });
+  });
+
+  it('excludes disabled and orphaned clusters from the context list', async () => {
+    renderProvider();
+    await flush();
+
+    await act(async () => {
+      pushClusters(channelFor, [
+        { id: 'a', name: 'prod', enabled: true, present: true, isDefault: true },
+        { id: 'b', name: 'staging', enabled: false, present: true },
+        { id: 'c', name: 'gone', enabled: true, present: false },
+      ]);
+    });
+
+    const probe = screen.getByTestId('probe');
+    const kubeConfig = JSON.parse(probe.textContent ?? '');
+    expect(kubeConfig.contexts).toEqual([
+      {
+        name: 'prod',
+        cluster: 'prod-cluster',
+        user: 'prod-user',
+        clusterEntry: { server: 'https://prod.example:6443', insecureSkipTLSVerify: false },
+      },
+    ]);
+    expect(kubeConfig.currentContext).toBe('prod');
+  });
+});
+
+describe('tlsUnverifiedReason', () => {
+  it('names skip-verify, which the file states outright', () => {
+    expect(tlsUnverifiedReason({ server: 'https://prod.example:6443', insecureSkipTLSVerify: true })).toBe(
+      'skip-verify',
+    );
+  });
+
+  // No certificate is presented at all, so the entry's own flag says nothing.
+  it('names plain http, whatever the flag says', () => {
+    expect(tlsUnverifiedReason({ server: 'http://localhost:8080', insecureSkipTLSVerify: false })).toBe('plain-http');
+  });
+
+  it('reads the scheme case-insensitively, and does not match https', () => {
+    expect(tlsUnverifiedReason({ server: 'HTTP://localhost:8080', insecureSkipTLSVerify: false })).toBe('plain-http');
+    expect(tlsUnverifiedReason({ server: 'https://prod.example:6443', insecureSkipTLSVerify: false })).toBeNull();
+  });
+
+  // An entry the kubeconfig never defined resolves to nothing, so there is no
+  // connection to call unverified; the record's own isPresent reports that.
+  it('says nothing about a missing entry', () => {
+    expect(tlsUnverifiedReason(null)).toBeNull();
+  });
+});

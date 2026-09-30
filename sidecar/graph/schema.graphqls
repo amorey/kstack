@@ -1,0 +1,1537 @@
+# Copyright 2026 The Kstack Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The app's whole GraphQL surface, grouped by noun: shared vocabulary first, then
+# Cluster, ClusterCache, cluster data, and the cloud account, with the root
+# operation types collected at the end.
+#
+# --- Shared vocabulary ---
+# The scalars and the kind-agnostic projections (Condition, Event, Schedule,
+# DeltaFrameType) every noun's surface reuses. A type only one noun uses belongs in that
+# noun's section, however generic its name reads.
+
+"An ISO-8601 encoded UTC date string."
+scalar Time
+
+"""
+The identity of a persisted object (a cluster, a cluster's cache, …), opaque to
+clients (a decimal-string id on the wire). One scalar for every object kind so
+the same id machinery is reused. Use values returned by the server verbatim; do
+not construct or parse them.
+
+Object ids are unique across kinds, not just within one, so they never collide —
+which is why a lookup handed another kind's id answers null rather than erroring
+or returning the wrong record. `Event.id` reuses this scalar for its wire form
+only: an event run is not an object, its id comes from a separate sequence, and it
+is unique within one timeline rather than across the fleet. Never hand one where
+an object id is expected.
+"""
+scalar ObjectID
+
+"""
+The identity of a cluster record: its row id, opaque text a client uses verbatim.
+Distinct from `ObjectID`, which names a cache or a per-kind record; a cluster is
+never addressed by one.
+"""
+scalar ClusterID
+
+"""
+An arbitrary JSON value carried verbatim. Backs a cached Kubernetes object's full
+native body: the sidecar forwards the stored, decompressed object JSON as-is (no
+per-field GraphQL typing), and the frontend casts it to a typed Kubernetes object.
+"""
+scalar JSON
+
+"A condition's three-valued verdict, Kubernetes-style."
+enum ConditionStatus {
+  "The condition holds."
+  True
+  "The condition does not hold."
+  False
+  "The condition cannot currently be assessed."
+  Unknown
+}
+
+"""
+One Kubernetes-style status condition: an independently-tracked aspect of the
+record's observed state. Connection-controller conditions (on `Cluster.conditions`),
+two aspects with two subjects — whether we reached it, and whether these credentials
+could name it: `Connected` (the last probe reached the API server; reasons
+Connecting/Connected/ResolveFailed/ProbeFailed/Inactive) and `Identified` (the probe
+could tell which cluster answered; reasons Identified/UIDUnreadable/Connecting/
+NoConnection/Inactive). Reaching a server needs no authorization and naming it does, so
+`Identified` fails on its own — and a cluster it fails for never gets a `ClusterCache`,
+which is named for the identity it mirrors. Each points at a different remedy: the
+network or the kubeconfig for one, an RBAC grant for the other.
+Sync-controller conditions: `Synced`, reported at two levels. On
+`ClusterCache.conditions` it is coarse (reasons Syncing/Paused) — the cache states
+only whether it decided to sync. The verdict a UI wants is the one on the cache's
+sync children — the per-kind `ClusterCachedKind` records (reasons
+Syncing/Watching/Paused/NoConnection/SyncFailed/Stale), or their whole-cache rollup
+`clusterCacheHealthWatch`, which speaks the same vocabulary.
+New types/reasons may appear; consumers should treat unknown spellings as a
+degraded/unknown display state.
+"""
+type Condition {
+  "The aspect this condition tracks, e.g. \"Connected\"."
+  type: String!
+  status: ConditionStatus!
+  "CamelCase machine-readable explanation of `status`."
+  reason: String!
+  "Human-readable detail; empty when there is nothing to explain."
+  message: String!
+  """
+  Whether this condition reports process-scoped state (a live connection, a running
+  sync worker) rather than durable truth. A liveness condition written by a previous
+  sidecar process reads as `Unknown` until the controller re-confirms it, so the UI
+  never shows a stale `True` after a restart. `reason` is preserved across that
+  downgrade, so it still says what the last known state was.
+  """
+  liveness: Boolean!
+  """
+  Whether `status` is a downgrade the sidecar derived rather than one a controller
+  wrote: a liveness condition left behind by an earlier process, read as `Unknown`
+  until re-confirmed. When true, `reason`, `message` and the stamps below describe
+  the **last known** status, not this `Unknown` — so a consumer must not present
+  them as current (no "Error" off a pre-restart reason, no "up for 0m").
+  """
+  unconfirmed: Boolean!
+  "When `status` last changed — not when the condition was last refreshed. A downgraded liveness condition keeps the stamp of the write that set it, which predates the current process."
+  transitionedAt: Time!
+  "When the condition was last written, whether or not `status` changed."
+  updatedAt: Time!
+}
+
+"""
+A pointer to another record — today always the owner a child record hangs off, which
+is the key the client folds its streams together on. Kind-agnostic, so the whole
+ownership chain reads the same way rather than naming a differently-spelled id per
+kind.
+"""
+type ObjectRef {
+  "The referenced record's id."
+  id: ObjectID!
+  "Its kind, e.g. `\"Cluster\"` — for a consumer that has to tell owners apart."
+  kind: String!
+}
+
+"An event's severity, mirroring the control plane's event type: Normal (✓) or Warning (✗)."
+enum EventType {
+  Normal
+  Warning
+}
+
+"""
+One coalesced run from an object's control-plane event timeline: consecutive
+occurrences sharing an outcome (category, type, reason) are aggregated, so
+`count`/`firstAt`/`lastAt` describe the run. A generic projection served under
+every kind's events surface — `category` names the timeline (e.g. `"connection"`),
+`reason` is an open, category-specific machine code; consumers should treat
+unknown spellings as a degraded/unknown state. The client upserts a live stream
+by `id` (a re-delivered id is an updated run; a new id is a new run).
+"""
+type Event {
+  "Stable run identity — the client's upsert key on a watch. An opaque int64 id, same wire form as ObjectID, but from the event sequence: unique within this timeline, not across kinds."
+  id: ObjectID!
+  "The timeline this run belongs to, e.g. `\"connection\"`."
+  category: String!
+  type: EventType!
+  "CamelCase machine code, e.g. `Connected` / `ProbeFailed`. Open-ended per category."
+  reason: String!
+  "The latest occurrence's detail; empty when there is nothing to explain."
+  message: String!
+  "Occurrences coalesced into this run (>= 1)."
+  count: Int!
+  "When the run started (first occurrence)."
+  firstAt: Time!
+  "When the run last extended (latest occurrence)."
+  lastAt: Time!
+}
+
+"""
+An object's reconcile-schedule gauge: when the control plane has queued the
+object's next reconcile (a cluster's next backoff retry, for a disconnected one),
+which a UI counts down to. Generic like Event — the watch entrypoints are
+kind-scoped (clusterScheduleWatch) but the value shape is not. A struct (not a
+bare Time) so it can grow. Observed live via a schedule watch — a scheduling
+change fires no object/list watch, so this is the only way to keep the countdown
+moving for an otherwise-idle object.
+"""
+type Schedule {
+  "The scheduled time of the next reconcile, or null while a reconcile is in flight (see `probing`) or nothing is scheduled."
+  nextRequeueAt: Time
+  """
+  Whether a connection probe is running right now. Asserted by the controller for
+  the in-flight window (not inferred from a missing nextRequeueAt), so the UI can
+  show a definite "checking now" while the probe's round-trips are in flight.
+  """
+  probing: Boolean!
+}
+
+"""
+Classifies one frame on a delta watch, mirroring a Kubernetes watch event. On
+subscribe a watch replays the current set as `Added` frames (the snapshot), closes it
+with one `Bookmark`, then streams live changes. A `Deleted` carries the object's
+last-known state; the client keys on its `id`.
+"""
+enum DeltaFrameType {
+  Added
+  Modified
+  Deleted
+  Bookmark
+}
+
+"""
+Classifies one frame on an event-timeline watch. Two values where `DeltaFrameType` has
+four: an event log is a positioned log, not a mirrored set. The server delivers the
+snapshot plus what grows above it and never reports a prune, so a run is only ever
+upserted and there is no `Deleted`.
+"""
+enum EventFrameType {
+  "A run to upsert by `Event.id`."
+  Run
+  "Closes the on-subscribe snapshot; sent once, carrying no run."
+  Bookmark
+}
+
+"""
+One frame on an event-timeline watch (`eventsWatch`, whatever record's id it is given).
+
+The accumulated set is append-only and can outgrow the server's: retention bounds
+each timeline to a fixed number of runs, and a pruned run is not announced. A
+long-lived consumer should cap what it keeps rather than expect the server to
+evict for it.
+"""
+type EventWatchFrame {
+  type: EventFrameType!
+  "The run. Null on `Bookmark`."
+  event: Event
+}
+
+# --- Cluster ---
+# A tracked kube-context: its record, its connection observations, and its own
+# event/schedule surfaces. The cache mirror beneath it is ClusterCache; the data
+# synced into that cache is the cluster-data section.
+
+"""
+A registered cluster connection: a tracked kube-context paired with its on-disk
+cache mirror. Modeled Kubernetes-style so a consumer knows where data comes
+from: `spec` is the user-owned desired state, `status` the observed state. Two
+records may point at the same physical cluster (`status.server.uid` tracks
+physical identity). A cluster stays listed after its context leaves the
+kubeconfig (so its cache can still be inspected or cleared).
+"""
+type Cluster {
+  "Unique identifier for this cluster record."
+  id: ClusterID!
+
+  "When this cluster was first registered."
+  createdAt: Time!
+  "When the user last edited this cluster — a toggle, a rename, the delete. A probe never moves it."
+  updatedAt: Time!
+  "When this cluster's deletion was requested; null unless deletion is pending. The record lingers, marked, until its runtime and chats are torn down, and user-facing collections hide it meanwhile."
+  deletionRequestedAt: Time
+
+  "Desired state: the user-owned fields."
+  spec: ClusterSpec!
+  "Observed connection/health state, discovered by probing."
+  status: ClusterStatus!
+  "The connection controller's conditions (`Connected`, `Identified`)."
+  conditions: [Condition!]!
+
+  """
+  Every cache this cluster has mirrored. Usually one; a UID migration leaves the
+  superseded cache in place until its subtree drains, which is why this is a list.
+
+  **None of them is marked active.** The active cache is the one whose `spec.serverUid`
+  matches this cluster's `status.server.uid` — a comparison the caller makes, and
+  must keep making: the parent's UID is rewritten by a probe, which fires no cache
+  event, so an answer computed once goes stale silently. A consumer that needs to
+  follow that over time reads `clustersWatch` and `clusterCachesWatch` and joins
+  them live rather than reading this field.
+  """
+  caches: [ClusterCache!]!
+
+  """
+  This cluster's control-plane event timeline (newest run first), optionally
+  filtered to one `category` (e.g. `"connection"`) and bounded by `limit`. Empty
+  for a cluster with no events. Resolved on selection and decoupled from the
+  cluster/list watch, so event chatter never re-emits the cluster — and a query
+  that doesn't select it pays nothing.
+  """
+  events(category: String, limit: Int): [Event!]!
+}
+
+"A cluster record's desired state. Every field is user/API-owned; nothing here is observed."
+type ClusterSpec {
+  "User-assigned display name; null if unset."
+  name: String
+  "Whether the user has enabled this cluster in the app: it appears in cluster lists / context pickers and is eligible to connect. Disabled clusters stay tracked but dormant."
+  enabled: Boolean!
+  "Whether cache syncing is enabled. Disabling stops sync and freezes the cache. Only meaningful while enabled."
+  syncEnabled: Boolean!
+  "Whether the background monitor may schedule runs against this cluster. Off by default, since a run spends model calls; stored and served, and nothing runs on it yet."
+  monitoringEnabled: Boolean!
+  "Where this record comes from and how its credentials resolve."
+  source: ClusterSpecSource!
+}
+
+"""
+The discriminated union naming a cluster record's origin: exactly one variant
+is set. Each variant is owned by exactly one creator (the kubeconfig source
+today; manual creation and kstack-cloud sync are future variants).
+"""
+type ClusterSpecSource {
+  "Set when the record tracks a kube-context in the user's kubeconfig."
+  kubeconfig: ClusterSpecSourceKubeconfig
+}
+
+"The kubeconfig-sourced variant of ClusterSpecSource."
+type ClusterSpecSourceKubeconfig {
+  "The kube-context name this record tracks."
+  context: String!
+}
+
+"""
+A cluster record's observed connection/health state, persisted on the Cluster
+record by the connection controller: the probed facts. The conditions that go with
+them sit beside this block on `Cluster.conditions`, not inside it — the consumer
+derives display state from their type/status/reason. Sync status and the on-disk
+cache live on the ClusterCache children, not here.
+"""
+type ClusterStatus {
+  "Per-source observation blocks, mirroring `spec.source`."
+  source: ClusterStatusSource!
+  "Last-known facts about the remote cluster (uid, version), discovered by probing."
+  server: ClusterServer!
+  "The connecting client's identity and effective access on this cluster."
+  principal: ClusterPrincipal!
+}
+
+"""
+The status-side counterpart of ClusterSpecSource: the per-source observation
+blocks, of which exactly the spec source variant's is set. Null blocks mean
+"this record's source has no such observation" — never that an observation
+went away (an orphaned kubeconfig record keeps its block with
+`isPresent: false`).
+"""
+type ClusterStatusSource {
+  "Kubeconfig observation; null unless the record is kubeconfig-sourced."
+  kubeconfig: ClusterStatusSourceKubeconfig
+}
+
+"""
+A kubeconfig-sourced record's last-known kubeconfig observation: the cluster
+and user names its context (`spec.source.kubeconfig.context`) references, and
+whether the context is present. Cached from the last time the context was
+present, so they survive the context leaving the kubeconfig and let the UI
+identify an orphaned record. In a malformed kubeconfig the referenced entries
+may not resolve.
+"""
+type ClusterStatusSourceKubeconfig {
+  "The cluster half of the context: the entry name it references, and that entry; cached."
+  cluster: ClusterStatusSourceKubeconfigCluster!
+  "The user half of the context; cached."
+  user: ClusterStatusSourceKubeconfigUser!
+  "True while the context is currently present in the kubeconfig; false when orphaned."
+  isPresent: Boolean!
+  "True when the context is the kubeconfig's `current-context`; false otherwise."
+  isDefault: Boolean!
+}
+
+"""
+The cluster half of a context. `name` is stated by the context, `entry` by the file,
+so the two go missing independently: a context always names a cluster, and the file
+may define no entry under that name.
+"""
+type ClusterStatusSourceKubeconfigCluster {
+  "Name of the cluster entry the context references."
+  name: String!
+  "The entry `name` resolves to; null when the kubeconfig defines no such entry."
+  entry: ClusterStatusSourceKubeconfigClusterEntry
+}
+
+"""
+The user (authInfo) half of a context. It carries the entry name alone: an authInfo
+entry holds credentials, so anything served from it is a chosen projection, never a
+mirror of the file.
+"""
+type ClusterStatusSourceKubeconfigUser {
+  "Name of the user entry the context references."
+  name: String!
+}
+
+"""
+A kubeconfig cluster entry. Fields are a subset of what the file holds, added as a
+consumer needs them, and each is what the file says — no verdict is drawn here: a
+client asking whether the connection is verified reads `insecureSkipTLSVerify` and
+`server`'s scheme, both stated before anything is dialled.
+"""
+type ClusterStatusSourceKubeconfigClusterEntry {
+  "The entry's `server` URL."
+  server: String!
+  "The entry's `insecure-skip-tls-verify`."
+  insecureSkipTLSVerify: Boolean!
+}
+
+"Last-known facts about the remote cluster, discovered by probing. Fields are null until a successful probe."
+type ClusterServer {
+  "The cluster's `kube-system` namespace UID; stable across context renames."
+  uid: String
+  "Server version, e.g. \"v1.29.3\"."
+  version: String
+  "API server URL that answered; null until probed. Two contexts naming one server share it."
+  endpoint: String
+}
+
+"The connecting client's identity and effective access on this cluster."
+type ClusterPrincipal {
+  "Authenticated username the API server last mapped this cluster's credentials to (SelfSubjectReview); null until probed."
+  username: String
+  "Groups the API server mapped these credentials into; empty until probed. Sorted. Where the principal's access usually comes from, since RBAC binds to groups more often than to users."
+  groups: [String!]!
+  "Effective RBAC in a namespace (live SelfSubjectRulesReview), resolved on demand. Point-in-time, for debugging only — not authoritative for access decisions."
+  permissions(namespace: String!): ClusterPermissions!
+}
+
+"""
+The connecting principal's effective RBAC in one namespace (live
+SelfSubjectRulesReview). Namespace-scoped (the API has no all-namespaces form)
+and point-in-time — for UI/debugging, not authoritative for access decisions.
+"""
+type ClusterPermissions {
+  "The namespace these rules were evaluated for."
+  namespace: String!
+  "Allowed resource rules (verbs × apiGroups × resources)."
+  resourceRules: [ResourceRule!]!
+  "Allowed non-resource rules (verbs × URLs), e.g. /healthz."
+  nonResourceRules: [NonResourceRule!]!
+  "True if some authorizers couldn't be evaluated, so the rule set may be incomplete."
+  incomplete: Boolean!
+}
+
+"A resource-scoped RBAC rule: the verbs the principal may use on the given apiGroups/resources (optionally narrowed to named instances)."
+type ResourceRule {
+  verbs: [String!]!
+  apiGroups: [String!]!
+  resources: [String!]!
+  "Specific resource names this rule is restricted to; empty means all."
+  resourceNames: [String!]!
+}
+
+"A non-resource RBAC rule: the verbs the principal may use against non-resource URLs (e.g. /healthz)."
+type NonResourceRule {
+  verbs: [String!]!
+  nonResourceUrls: [String!]!
+}
+
+"One frame on the `clustersWatch` stream: a change and the cluster it affected, or the `Bookmark` closing the snapshot."
+type ClusterWatchFrame {
+  "Whether this cluster was added (incl. the on-subscribe snapshot), modified, or deleted."
+  type: DeltaFrameType!
+  "The affected cluster. On `Deleted`, its last-known state; the client removes it by `id`. Null on `Bookmark`."
+  cluster: Cluster
+}
+
+# --- ClusterCache ---
+# A cluster's on-disk mirror and the sync machinery under it: the cache record, the
+# per-kind sync children, and the whole-cache verdict folded from them. The data these
+# caches hold is the cluster-data section.
+
+"""
+A cache record, mirroring the beehive ClusterCache kind: a mirror of one physical
+cluster identity. Streamed independently of its parent Cluster via
+`clusterCachesWatch` and joined to it client-side by `clusterID`. Carries its
+identity (`id`, `clusterID`, `spec.serverUid`) and its coarse `Synced` condition — there
+is no status block, for the reason `conditions` gives below. Its live on-disk stats
+ride `clusterCacheStatsWatch`, which stays current where a field here would freeze at
+subscribe time. A cluster owns one per identity it has mirrored; the *active* cache
+— the one a sync engine runs for and a UI shows for the row — is the one whose
+`spec.serverUid` matches the cluster's last-probed `status.server.uid`, a join the
+client derives (it is not a field here, because it depends on the parent's status,
+which changes with no cache event and so cannot be kept fresh on this stream).
+"""
+type ClusterCache {
+  "Unique identifier for this cache record (distinct from its parent cluster's id)."
+  id: ObjectID!
+  "The Cluster this cache belongs to. The client joins caches onto clusters by it."
+  clusterID: ClusterID!
+
+  "The record's spec generation, bumped on every spec write."
+  generation: Int!
+  "When this cache was created — the cluster's identity was first observed."
+  createdAt: Time!
+  "When this cache's deletion was requested (beehive soft-delete tombstone); null unless deletion is pending. The record lingers until its finalizers clear."
+  deletionRequestedAt: Time
+
+  spec: ClusterCacheSpec!
+  "The cache-level `Synced` condition: coarse (`Syncing`/`Paused`) — it reports only what this cache decided, not how its sync is doing. Per-component health and freshness live on the cache's per-kind records (`clusterCachedKindsWatch`) or their rollup (`clusterCacheHealthWatch`), which is also why this record carries no status block of its own."
+  conditions: [Condition!]!
+
+  """
+  The kinds this cache's API server advertises (from `/apis` discovery), read out
+  of the cache's own file — the read behind the dashboard's dynamic resource nav.
+  Content, not control plane: `cachedKinds` below is the record per kind, this is
+  what the store holds. Empty for a cache that has not synced yet. Resolved on
+  selection; the live counterpart is `clusterCachedDataKindsWatch`.
+  """
+  kinds: [ClusterCachedDataKind!]!
+
+  """
+  This cache's per-kind sync records, one per kind it mirrors — so hundreds on a
+  real cluster — in creation order. The control-plane records, where `kinds` above
+  is the mirrored content they describe. Empty until the cache's discovery pass has
+  run.
+
+  Resolved on selection; the live counterpart is `clusterCachedKindsWatch(cacheID)`,
+  which is what a consumer following per-kind health should read.
+  """
+  cachedKinds: [ClusterCachedKind!]!
+
+  """
+  This cache's control-plane event timeline (newest run first), optionally
+  filtered to one `category` (e.g. `"discovery"`, the kind-discovery history) and
+  bounded by `limit`. Carries only what the cache itself records — the per-kind sync
+  history lives on `ClusterCachedKind.events`. Resolved on selection and
+  decoupled from the cache/list watch.
+  """
+  events(category: String, limit: Int): [Event!]!
+}
+
+"""
+A cache's desired state. The identity it mirrors, and nothing else: a cache is
+created for one physical cluster and never repointed, so there is no field here a
+client writes.
+"""
+type ClusterCacheSpec {
+  "The kube-system namespace UID of the physical cluster this cache mirrors — the identity a physical migration turns over. Matches the parent cluster's `status.server.uid` while this is the active cache."
+  serverUid: String!
+}
+
+"Live on-disk cache statistics for a single cluster."
+type ClusterCacheStats {
+  "True when a local cache exists on disk."
+  exists: Boolean!
+  "What the cache costs on disk in bytes — the sqlite file plus its WAL/shm sidecars; 0 when not cached. The headline size: `dbBytes` alone reads low and stale while a sync fills the WAL, since the main file does not grow until a checkpoint lands."
+  bytes: Int!
+  "The sqlite file alone, in bytes. Part of `bytes`, broken out so a reader can tell a cache holding a lot from one whose WAL is not being checkpointed."
+  dbBytes: Int!
+  "The write-ahead log, in bytes. Part of `bytes`. Large or growing relative to `dbBytes` means checkpointing is falling behind."
+  walBytes: Int!
+  "The shared-memory index, in bytes. Part of `bytes`, and present only while the cache is open — a fixed ~32KB, so it is detail rather than news."
+  shmBytes: Int!
+  "Total number of cached objects across every kind (the sum of the kind catalog's per-kind counts; excludes cached events). 0 when not cached."
+  objectCount: Int!
+  "Number of distinct kinds with at least one cached object. 0 when not cached."
+  kindCount: Int!
+  "True when the cache's footprint is over its configured ceiling. Soft by one sweep interval, so a cache can read over before anything acts on it; false for a cache nobody has open, which cannot grow."
+  overSizeLimit: Boolean!
+  "The ceiling in bytes, 0 when unbounded. Sent so a client can render how close a cache is without hardcoding the sidecar's default."
+  sizeLimitBytes: Int!
+}
+
+"One frame on the `clusterCachesWatch` stream: a change and the cache it affected, or the `Bookmark` closing the snapshot."
+type ClusterCacheWatchFrame {
+  "Whether this cache was added (incl. the on-subscribe snapshot), modified, or deleted."
+  type: DeltaFrameType!
+  "The affected cache. On `Deleted`, its last-known state; the client removes it by `id`. Null on `Bookmark`."
+  cache: ClusterCache
+}
+
+"""
+One Kubernetes kind being mirrored into a cache — one record per kind the discovery
+pass found, so a cache has a hundred or more. Streamed by `clusterCachedKindsWatch`,
+which is **cache-scoped** for exactly that reason, and joined onto its cache through
+`owner.id`.
+
+This is where per-kind sync health lives. The cache's own `Synced` condition is
+coarse — it cannot tell you that one CRD's watch is forbidden while the other
+ninety-nine kinds are caught up.
+"""
+type ClusterCachedKind {
+  "Unique identifier for this record."
+  id: ObjectID!
+  "The ClusterCache this kind is mirrored into — the client's join key."
+  owner: ObjectRef!
+
+  "The record's spec generation, bumped on every spec write."
+  generation: Int!
+  "When this kind was first armed for sync."
+  createdAt: Time!
+  "When this record's deletion was requested (beehive soft-delete tombstone); null unless deletion is pending. The record lingers until its finalizers clear."
+  deletionRequestedAt: Time
+
+  spec: ClusterCachedKindSpec!
+  """
+  Beehive object conditions. **Empty in practice**: this kind's verdict is a gauge, not a
+  stored condition — read it from `clusterCacheSyncStatusWatch`, which carries a row per
+  kind, or its cache-wide fold `clusterCacheHealthWatch`. A stored one would serve a dead
+  process's answer until the passes caught up.
+  """
+  conditions: [Condition!]!
+
+  """
+  This kind's sync-transition history (newest run first) — the
+  `SyncStart`/`SyncComplete`/`SyncDegraded`/`SyncStale`/… runs its worker records,
+  optionally filtered to one `category` (e.g. `"sync"`) and bounded by `limit`.
+  This is where the per-kind history lives; the parent cache's timeline carries
+  only what the cache itself records. Resolved on selection.
+  """
+  events(category: String, limit: Int): [Event!]!
+}
+
+"Which kind a per-kind sync mirrors, and whether the user has left it syncing."
+type ClusterCachedKindSpec {
+  "Group/version, e.g. \"apps/v1\", or \"v1\" for the core group."
+  apiVersion: String!
+  "Kind name, e.g. \"Deployment\"."
+  kind: String!
+  "Plural lowercase resource, e.g. \"deployments\" — the identity the objects watch is opened on."
+  resource: String!
+  "Whether objects of this kind are namespaced."
+  namespaced: Boolean!
+  """
+  Whether this one kind is syncing, set by `clusterCachedKindSyncEnabledSet`. False stops
+  the watch and **keeps the cached rows** — they stay listed and readable, and a resume
+  reconciles into them; `clusterCacheClear` is what throws rows away. Independent of the
+  cluster-wide `Cluster.spec.syncEnabled`, which freezes every kind at once.
+  """
+  syncEnabled: Boolean!
+}
+
+"One frame on the `clusterCachedKindsWatch` stream: a change and the record it affected, or the `Bookmark` closing the snapshot."
+type ClusterCachedKindWatchFrame {
+  "Whether this record was added (incl. the on-subscribe snapshot), modified, or deleted."
+  type: DeltaFrameType!
+  "The affected record. On `Deleted`, its last-known state; the client removes it by `id`. Null on `Bookmark`."
+  kind: ClusterCachedKind
+}
+
+"""
+One synced kind, identified exactly. `resource` is what a UI renders, but it does not
+identify a kind on its own: a CRD may reuse a built-in's plural under another api group,
+so anything keying on a kind — looking its sync record up, opening its timeline — needs
+the pair.
+"""
+type SyncedKindRef {
+  apiVersion: String!
+  resource: String!
+}
+
+"""
+One cache's sync verdict, folded from every kind it syncs. Shaped like a `Condition` on
+purpose — same `status`/`reason`/`message` vocabulary as a per-kind record — so a client
+renders a cache exactly as it renders one kind.
+"""
+type ClusterCacheHealth {
+  "The cache this verdict is for. The client keys its map on this and joins onto the cache by it."
+  cacheID: ObjectID!
+  status: ConditionStatus!
+  """
+  A cache-level verdict where there is one, and otherwise the dominant per-kind reason.
+  Two are cache-level: `Paused` when every kind this cache mirrors has been paused (a
+  paused kind is skipped by the fold, so without this arm a fully paused cache would read
+  as healthy), and `StoreFailed` when its file will not open, so nothing under it is
+  syncing and no kind is in a position to say so. Failing those, the per-kind fold — a hard
+  failure beats a stall beats a wait beats a catch-up. `Unknown`/`Syncing` with
+  `totalKinds: 0` means the discovery pass has not landed yet — not a fault, and not health
+  either.
+  """
+  reason: String!
+  """
+  The kinds behind a non-Watching verdict, sorted by plural resource. Empty when healthy.
+  A list rather than a rendered phrase: truncation ("+N more") is a layout decision, and a
+  client that keys a subscription on the first offender must not have to parse it back out
+  of prose — which is also why each entry carries its `apiVersion`, since the plural alone
+  does not identify a kind.
+  """
+  unhealthyKindRefs: [SyncedKindRef!]!
+  "How many kinds this cache syncs."
+  totalKinds: Int!
+  "How many of them are not currently Watching."
+  unhealthyKinds: Int!
+  """
+  How many of `totalKinds` the user has paused. Counted apart rather than subtracted from
+  the census: a paused kind is neither unhealthy nor missing, so without this tally it is
+  invisible in every reading — a summary spending `unhealthyKinds` alone would report five
+  kinds syncing while two of them are switched off.
+  """
+  pausedKinds: Int!
+  """
+  The most recent write across every kind — when data last arrived anywhere in this
+  cache. Null until some kind has written. On a quiet cluster this legitimately reads
+  hours old; `lastLiveAt` is what says that is fine.
+  """
+  lastUpdateAt: Time
+  """
+  The OLDEST proof among the kinds that have one — the weakest link, since a cache is
+  only as verified as its least-recently proven watch. Null before any kind has proved
+  itself.
+  """
+  lastLiveAt: Time
+}
+
+"""
+One cache's sync detail: how discovery is doing, and a row per kind it mirrors.
+
+What `ClusterCacheHealth` folds into one verdict for a fleet view, expanded for the one
+cache a user opened. Nothing else on the wire carries a per-kind verdict.
+"""
+type ClusterCacheSyncStatus {
+  "The cache this detail is for."
+  cacheID: ObjectID!
+  "How the kind-discovery sweep is doing. Its own verdict, and not any kind's: a cluster whose `/apis` document will not load has no kinds to report the failure through."
+  discovery: ClusterCacheDiscoveryStatus!
+  "Every mirrored kind, sorted by `apiVersion` then `resource`, so a rendered list is stable across ticks."
+  kinds: [ClusterCacheKindSyncStatus!]!
+}
+
+"The kind-discovery sweep's standing answer for one cache."
+type ClusterCacheDiscoveryStatus {
+  "`Discovering`/`Discovered`/`Partial`/`DiscoveryFailed`, `NoConnection`/`IdentityMismatch` when nothing has reached the server, or `StoreFailed` when the cache's own file will not open. Empty before any sweep has answered."
+  reason: String!
+  "Human detail behind `reason` — which group-versions did not answer, and why. Empty when there is nothing to add."
+  message: String!
+}
+
+"One mirrored kind's sync detail. Identity, verdict, freshness, and its row count."
+type ClusterCacheKindSyncStatus {
+  "The group/version this kind is served at, e.g. `\"apps/v1\"` — or a bare version for the core group."
+  apiVersion: String!
+  "The singular Kind name, e.g. `\"Deployment\"`."
+  kind: String!
+  "The lowercase plural URL segment, e.g. `\"deployments\"`. With `apiVersion`, the pair that identifies a kind."
+  resource: String!
+  "`Syncing`/`Resyncing`/`Resuming`/`Watching`/`Stale`/`SyncFailed`, `NoConnection`/`IdentityMismatch` when the whole cache is waiting on a connection, or `Paused` when this kind's own `spec.syncEnabled` is off. Empty before this kind's worker has answered."
+  reason: String!
+  "Human detail behind `reason`. Empty when there is nothing to add."
+  message: String!
+  "When `reason` last moved — \"watching since 10:02\", which is what a live stream has instead of a last-attempt stamp. Null before it has."
+  sinceAt: Time
+  "When data last arrived for this kind. Null until something has landed; on a quiet collection this legitimately reads hours old, and `lastLiveAt` is what says that is fine."
+  lastUpdateAt: Time
+  "The last proof the stream is live — a delta OR a bookmark, since bookmarks exist to make an idle watch prove itself. The later of the two stamps, and the only one that tells an idle watch from a wedged one."
+  lastLiveAt: Time
+  "How many times the stream has come back inside the current healthy stretch — the flapping question a retry countdown cannot answer, since a watch that rotates every thirty seconds never fails."
+  restarts: Int!
+  "When a kind that is DOWN will be tried again. Null while its stream is up, which is what makes a non-null value the retry streak."
+  nextRetryAt: Time
+  "How many objects of this kind the cache holds. Read from the store's per-kind counts, so a paused cache still reports what it cached."
+  objectCount: Int!
+}
+
+
+# --- Cluster data ---
+# What a ClusterCache holds: the discovered kind catalog and the cached Kubernetes
+# objects and Events themselves. Every entry point is keyed by
+# parent cluster `id` + `cacheID`, and every frame carries its cache provenance so
+# a client can reject stragglers from a superseded cache.
+
+"""
+One kind a cluster's API server advertises, from `/apis` discovery (built-ins +
+CRDs). The dashboard builds its dynamic resource nav from these: `resource` dedupes
+against the curated catalog and `apiVersion`'s group buckets the kind into a nav
+group.
+"""
+type ClusterCachedDataKind {
+  "Group/version, e.g. \"apps/v1\", or \"v1\" for the core group."
+  apiVersion: String!
+  "Kind name, e.g. \"Deployment\"."
+  kind: String!
+  "Plural lowercase resource name (the URL form), e.g. \"deployments\"."
+  resource: String!
+  "\"Namespaced\" or \"Cluster\"."
+  scope: String!
+  "True when this kind is backed by a CustomResourceDefinition."
+  isCRD: Boolean!
+  "The columns a CRD asks a client to render for this version, in declared order; empty for a built-in and for a CRD declaring none. Descriptors only — the server computes no cell values, the client evaluates `jsonPath` against the object's `rawJSON`."
+  printerColumns: [PrinterColumn!]!
+  "Number of objects of this kind currently in the cache (0 for an advertised-but-empty kind)."
+  count: Int!
+}
+
+"""
+One column from a CRD's `additionalPrinterColumns` — a header and where to read its value
+from. Static per kind, so it rides the kinds watch rather than the objects watch.
+"""
+type PrinterColumn {
+  "Column header, e.g. \"Replicas\"."
+  name: String!
+  "OpenAPI type — integer, number, string, boolean, or date. Drives rendering, not parsing: treat an unrecognized value as a string."
+  type: String!
+  "Path into the object body, e.g. \".spec.replicas\". A restricted JSONPath; a client that cannot evaluate one renders an empty cell rather than failing the row."
+  jsonPath: String!
+  "kubectl hides columns above 0 unless `-o wide`."
+  priority: Int!
+}
+
+"""
+One cached Kubernetes Event from a cluster's synced data (the raw `events.k8s.io`/core
+Event, read from the active cache). Powers the dashboard's events table. Distinct from
+`Event`, which is kstack's own control-plane timeline for a Cluster/ClusterCache — this
+is data synced *from* the cluster. The involved-object identity is flattened onto the
+record; the raw event body is not exposed.
+"""
+type ClusterCachedDataEvent {
+  "The Event's own object UID — the stable identity the watch keys on."
+  uid: String!
+  """
+  Severity — conventionally `Normal` or `Warning`, but an **open string** (not the
+  closed `EventType` enum): Kubernetes does not constrain `Event.type`, so a cluster may
+  omit it (empty) or supply a custom value, which is passed through verbatim.
+  """
+  type: String!
+  "CamelCase machine reason, e.g. \"BackOff\" (empty if the Event carried none)."
+  reason: String!
+  "Human-readable detail (empty if none)."
+  message: String!
+  "How many times the event has fired (coalesced series count; >= 1)."
+  count: Int!
+  "First occurrence time, or null when the source Event carried no timestamp."
+  firstSeen: Time
+  "Latest occurrence time, or null when the source Event carried no timestamp."
+  lastSeen: Time
+  "Kind of the object the event is about, e.g. \"Pod\" (empty if unset)."
+  involvedKind: String!
+  "Namespace of the involved object (empty for a cluster-scoped or name-only reference)."
+  involvedNamespace: String!
+  "Name of the involved object (empty if unset)."
+  involvedName: String!
+}
+
+"""
+One cached Kubernetes object projected for a table row (any kind), read from the
+active cache. Only the universal identity is typed for now (`uid`/`apiVersion`/`kind`/
+`namespace`/`name`/`creationTimestamp`) — enough to key the watch, sort, and render a
+Name/Namespace/Age table. The nested object body (and kind-specific columns computed
+from it) is deferred to a follow-up: see the "ClusterCachedDataObject — native nested body"
+item in `docs/TODO.md`. Distinct from `ClusterCachedDataEvent`, which is one specific kind with its
+own fully-typed shape.
+"""
+type ClusterCachedDataObject {
+  "The object's UID — the stable identity the watch keys on."
+  uid: String!
+  "The object's group/version, e.g. \"apps/v1\", or \"v1\" for the core group."
+  apiVersion: String!
+  "Kind name, e.g. \"Deployment\"."
+  kind: String!
+  "Namespace; empty for a cluster-scoped kind."
+  namespace: String!
+  "Object name."
+  name: String!
+  "creationTimestamp — drives the universal Age column; null when the source object carried none."
+  creationTimestamp: Time
+  "Full native body as JSON, verbatim from the cache (managedFields and the kubectl last-applied annotation stripped). Read only for the rows that become frames, so a watch pays for what it sends rather than for the collection; null on a `Deleted` frame's object, and when the stored body would not load."
+  rawJSON: JSON
+}
+
+"One frame on the `clusterCachedDataKindsWatch` stream: a change and the kind it affected, or the `Bookmark` closing the snapshot. Either way it carries its cache provenance."
+type ClusterCachedDataKindWatchFrame {
+  "Whether this kind was added (incl. the on-subscribe snapshot), modified (chiefly a `count` change), or deleted."
+  type: DeltaFrameType!
+  "The affected kind. On `Deleted`, its last-known row; the client keys on `apiVersion` + `resource`. Null on `Bookmark`."
+  kind: ClusterCachedDataKind
+  """
+  The cache this frame came from — the frame's provenance. A client watching the
+  active cache rejects a late frame from a superseded cache (one still draining
+  after a cache/context switch) by comparing this against the cache it subscribed for.
+  """
+  cacheID: ObjectID!
+}
+
+"One frame on the `clusterCachedDataEventsWatch` stream: a change and the event it affected, or the `Bookmark` closing the snapshot. Either way it carries its cache provenance."
+type ClusterCachedDataEventWatchFrame {
+  "Whether this event was added (incl. the on-subscribe snapshot), modified (chiefly a `count`/`lastSeen` change as it re-fires), or deleted."
+  type: DeltaFrameType!
+  "The affected event. On `Deleted`, its last-known row; the client keys on `uid`. Null on `Bookmark`."
+  event: ClusterCachedDataEvent
+  """
+  The cache this frame came from — the frame's provenance, mirroring
+  `ClusterCachedDataKindWatchFrame.cacheID`. A client watching the active cache rejects a late
+  frame from a superseded cache by comparing this against the cache it subscribed for.
+  """
+  cacheID: ObjectID!
+}
+
+"One frame on the `clusterCachedDataObjectsWatch` stream: a change and the object it affected, or the `Bookmark` closing the snapshot. Either way it carries its (cache, kind) provenance."
+type ClusterCachedDataObjectWatchFrame {
+  "Whether this object was added (incl. the on-subscribe snapshot), modified, or deleted."
+  type: DeltaFrameType!
+  "The affected object. On `Deleted`, its last-known identity with a null `rawJSON` — the client keys the removal on `uid` and never reads the body. Null on `Bookmark`."
+  object: ClusterCachedDataObject
+  """
+  The cache this frame came from — the frame's provenance, mirroring
+  `ClusterCachedDataKindWatchFrame.cacheID`. A client watching the active cache rejects a late
+  frame from a superseded cache by comparing this against the cache it subscribed for.
+  """
+  cacheID: ObjectID!
+  """
+  The kind this frame is for — the watch's `(apiVersion, resource)`. Unlike the kinds/
+  events watches (whose variables carry no kind, so `cacheID` is complete provenance),
+  this watch is keyed by kind too, so a client switching resources *within one cache*
+  uses these to reject a straggler from the previous kind's still-draining subscription.
+  """
+  apiVersion: String!
+  resource: String!
+}
+
+# --- Models ---
+# What the sidecar can answer with. The catalog is whatever had a key at startup; a
+# feature that calls a model names one of these per call. A provider is named by its
+# id, a string rather than an enum: a provider is data, and one added at runtime has
+# no member.
+
+"""
+The providers whose transcripts replay on one another, named for the API that defined the
+shape.
+"""
+enum LLMDialect {
+  "Anthropic's Messages API."
+  Messages
+  "OpenAI's Responses API."
+  Responses
+  "OpenAI Chat Completions: every local runtime's wire, and most cloud vendors'."
+  ChatCompletions
+  "The fake adapter of a debug build."
+  Fake
+}
+
+"A provider the sidecar can send a turn to."
+type Provider {
+  "Stable for the life of the app: what `chatSend` and a stored message name."
+  id: String!
+  "What a picker shows as the group heading."
+  label: String!
+  "The dialect this provider speaks. Null on a provider the sidecar no longer holds — a stored message's, labelled by its id — since nothing but the id is known of it."
+  llmDialect: LLMDialect
+}
+
+"A model the sidecar can answer with."
+type Model {
+  provider: Provider!
+  id: String!
+  label: String!
+  "The effort levels this model accepts, in the provider's own words, least to most. Empty when it has no such knob."
+  efforts: [String!]!
+  "The level a picker starts on. Empty when `efforts` is."
+  defaultEffort: String!
+}
+
+# --- Chat ---
+# The app's own conversations, held in app.db. Sending a message is a save, not a
+# phone call: chatSend returns once the turn is accepted and the answer arrives on
+# chatMessagesWatch. See docs/adr/2026-09-10-the-answer-is-a-record.md.
+
+"""
+The identity of a chat (a UUID string on the wire). Distinct from `ObjectID`: chats
+are not beehive objects and share none of that id machinery. Identity alone: order
+a list by `updatedAt` and a transcript by `seq`. Use values returned by the server
+verbatim; do not construct or parse them.
+"""
+scalar ChatID
+
+"The identity of one message (a UUID string on the wire). Never a `ChatID`."
+scalar MessageID
+
+"""
+Who produced a message, matching the Messages API wire vocabulary. Not a display hint:
+a `User` message carrying only tool results is machinery, not something a person typed.
+What to draw comes from the content blocks.
+"""
+enum ChatMessageRole {
+  User
+  Assistant
+}
+
+"How far along an assistant's turn is. A user message is always `Complete`."
+enum ChatMessageStatus {
+  "Still being written. Reconciled to `Failed` if the sidecar restarts."
+  Streaming
+  "Stopped on a command the user has not decided: in flight, drawn with the approval request."
+  WaitingApproval
+  Complete
+  "Ended badly; `error` says how. Never retried automatically."
+  Failed
+  "Stopped by `chatCancel` or by shutdown. The partial text is kept."
+  Cancelled
+}
+
+"""
+Which of the app's two modes a chat belongs to. Set when the chat is created and never
+changed. Each mode lists only its own chats.
+"""
+enum ChatMode {
+  Chat
+  Dashboard
+}
+
+type Chat {
+  id: ChatID!
+  "Taken from the first user message, in the transaction that creates the chat. Renameable."
+  title: String!
+  "Where this chat is listed. Fixed at creation."
+  mode: ChatMode!
+  "The cluster this chat was started under. Fixed at creation. Each cluster lists only its own chats."
+  clusterID: ClusterID!
+  createdAt: Time!
+  "Last activity: a message created or settled, or a rename. What the recent list sorts by."
+  updatedAt: Time!
+  "Whether any run of the chat waits on the user: its answers' own, or an agent's under one of them."
+  awaitingApproval: Boolean!
+}
+
+"""
+One message. An assistant message is also the record of its turn: while `status` is
+`Streaming` its `content` grows, re-sent whole on every frame — so any one frame is
+disposable.
+"""
+type ChatMessage {
+  id: MessageID!
+  "The chat this belongs to — the client's join key."
+  chatID: ChatID!
+  "Position in the chat. Order by this, never by `createdAt`."
+  seq: Int!
+  role: ChatMessageRole!
+  """
+  The content blocks as they went over the wire. Partial while `Streaming`. A reader may find
+  `text` (what a person reads), `thinking` (the summary of an answer's thinking), `native` (a
+  provider's own block, kept for it alone), `context` (the cluster card the app attached to a
+  question), `tool_use` (the model asking for a tool: `id`, `name`, `input`), `tool_result`
+  (the sidecar's answer to one, by `id`, with `isError` when it refused) and `server_use` (a
+  call the provider ran, in a `tool_use`'s fields; its row is in `toolCalls`). Each has a
+  `type`; `text`, `thinking`, `context` and `tool_result` carry their `text`.
+  """
+  content: JSON!
+  "The summary of the model's thinking, read off the blocks whatever shape holds it. Empty where none was kept."
+  thinking: String!
+  status: ChatMessageStatus!
+  """
+  Whether a run of the answer waits on the user: its own, or an agent's under one of its `Agent`
+  calls. An agent can wait under an answer that has settled, so this, not `status`, says whether a
+  request is live.
+  """
+  awaitingApproval: Boolean!
+  "Why the turn failed; empty otherwise. Never a raw provider error."
+  error: String!
+
+  "The model this send asked for — the catalog id it named, not what the provider answered as. Empty on a user message."
+  model: String!
+  """
+  The provider whose model it was. Null on a user message, which no provider wrote. A
+  message outlives its provider: one the sidecar no longer holds is labelled by its id.
+  """
+  provider: Provider
+  "How hard it was asked to think, in the provider's own words. Empty where the model has no such knob, and on a user message."
+  effort: String!
+  "The last model call's."
+  finishReason: String!
+
+  createdAt: Time!
+  "When the turn settled, whatever its status; null while it runs and on a user message, which has no turn."
+  finishedAt: Time
+  "The turn's tool calls, off their rows, in the order the model asked. Empty on a user message."
+  toolCalls: [ToolCall!]!
+  "What the answer's text cites, in order, read by its run's dialect. Empty where it cites nothing."
+  citations: [Citation!]!
+}
+
+"One citation an answer's text makes. Every field is text the provider sent: read as data, drawn as text."
+type Citation {
+  "The provider's word for the kind: `web_search_result_location`, `page_location`, …"
+  type: String!
+  "The source's address. Empty for a source with none, a document the model was given."
+  url: String!
+  "The page's or the document's title. Empty where it had none."
+  title: String!
+  "The passage the text rests on."
+  citedText: String!
+}
+
+"An approvals row's id. Opaque text, like every other id."
+scalar ApprovalID
+
+"A tool call row's id. Opaque text, like every other id."
+scalar ToolCallID
+
+"One call of a tool in an answer's turn, off its `tool_calls` row."
+type ToolCall {
+  id: ToolCallID!
+  "The provider's id of the block it answers: a `tool_use`, or a provider call's `server_use`."
+  toolUseID: String!
+  "The tool's name in the box: a tool of ours by the name it is offered under, a vendor's by its own name."
+  name: String!
+  "The vendor's own identifier for the shape the call uses (`web_search_20260318`). Empty for a tool of ours."
+  contract: String!
+  "The call's input, as the model sent it."
+  arguments: JSON!
+  "What kind of thing the call did, whoever ran it. Null for a call of a tool this build does not know."
+  actionKind: ToolActionKind
+  "Where the call is. Null on a `Provider` call: the app ran nothing, so it has no status to report."
+  status: ToolCallStatus
+  "Who ran it. A `Provider` call ran on the model's provider: never asked about, and with no output of its own."
+  runsOn: ToolCallRunsOn!
+  "What the call does, read from its arguments by its own tool. Null when the tool has no way to show a call, or refuses the arguments."
+  action: ToolAction
+  "The user's decision on the call; null on a call no one is asked about. Decide it while the call is `AwaitingApproval`."
+  approval: ToolCallApproval
+  "What the model read: the tool's text, or the refusal object. Empty until the call is over."
+  output: String!
+  isError: Boolean!
+  "The background task the call started; null on every call that started none."
+  background: BackgroundTask
+  "The `Agent` call a subagent's call ran under; null on the answer's own calls."
+  agentCallID: ToolCallID
+  "Every request the call's sandboxed command sent to change the cluster, in the order asked. Empty on every call but a sandboxed command's."
+  clusterWrites: [ClusterWrite!]!
+}
+
+"""
+A request a sandboxed command sent to change the cluster, held for the user. It waits while its
+approval is `Pending` and its call `Running`.
+"""
+type ClusterWrite {
+  approval: ToolCallApproval!
+  "The HTTP method: POST, PUT, PATCH or DELETE."
+  method: String!
+  "The path and query, exactly as sent."
+  path: String!
+  "The path's subresource, as the proxy parsed it; empty for none."
+  subresource: String!
+  "The media type, while the write waits; empty otherwise."
+  contentType: String!
+  "The body, exactly as sent, while the write waits; empty otherwise, and for a DELETE with none. The record keeps it."
+  body: String!
+  "Whether the request asks for a dry run: a POST, PUT or PATCH whose every `dryRun` is `All`. Never a DELETE."
+  dryRun: Boolean!
+}
+
+"What a call does, from the tool that made it. Never read from the call's arguments."
+enum ToolActionKind {
+  Command
+  Read
+  Write
+  Edit
+  Search
+  Fetch
+  Stop
+  Memory
+  Delegate
+  KubeQuery
+}
+
+"A command started with `run_in_background`, or an agent an `Agent` call launched, off its `background_tasks` row."
+type BackgroundTask {
+  status: BackgroundTaskStatus!
+  "Set on an `Exited` task whose code could be read."
+  exitCode: Int
+  "A `Completed` agent's report, cut to the inline limit. Empty for a command, and until the agent completes."
+  report: String!
+}
+
+"""
+Where a background task is. A command ends `Exited`; an agent `Completed` (it answered) or
+`Failed` (it could not). `Stopped` was ended by the model, the user, the app's quit, or an agent's
+request that went unanswered; `Lost` was running when the sidecar stopped unexpectedly, and a
+command may still be running.
+"""
+enum BackgroundTaskStatus {
+  Running
+  Exited
+  Completed
+  Failed
+  Stopped
+  Lost
+}
+
+"What a call does: the model's description, and exactly one kind."
+type ToolAction {
+  "The model's own account of the call. Empty when it gave none."
+  description: String!
+  command: CommandAction
+  read: ReadAction
+  write: WriteAction
+  edit: EditAction
+  search: SearchAction
+  fetch: FetchAction
+  memory: MemoryAction
+  delegate: DelegateAction
+  kubeQuery: KubeQueryAction
+}
+
+"A statement over the chat's cluster's cache. The model wrote it, so draw it as text."
+type KubeQueryAction {
+  "The statement as it runs, without a trailing semicolon."
+  sql: String!
+  "The most rows the call asked for: 200 unless it named a number, at most 2000."
+  limit: Int!
+}
+
+"A task handed to a subagent. Every field is the parent model's text."
+type DelegateAction {
+  "The brief the parent wrote: the subagent's whole task."
+  prompt: String!
+  "The kind of agent: `general-purpose`."
+  agentType: String!
+  "The model the subagent runs on, by its id. Empty when it runs on the parent's."
+  model: String!
+}
+
+"A web search: what left the machine."
+type SearchAction {
+  "The query. Empty for a call that sent none."
+  query: String!
+}
+
+"A page fetched: the URL as the sidecar fetches it, and the host it dials."
+type FetchAction {
+  "The URL, upgraded to https, its host in ASCII."
+  url: String!
+  "The host, in ASCII, with the port when it is not 443."
+  host: String!
+}
+
+"""
+A call of the Memory tool as its arguments name it. The model may have written it
+from cluster data, so draw every field as text.
+"""
+type MemoryAction {
+  "`save` or `forget`."
+  op: String!
+  name: String!
+  "Empty on a forget."
+  body: String!
+  "`cluster` or `everywhere`: who the note reaches. `cluster` when the call names none."
+  scope: String!
+}
+
+"Who ran a tool call: the sidecar, on the user's machine, or the model's provider, on its own servers."
+enum ToolCallRunsOn {
+  Sidecar
+  Provider
+}
+
+"A command, exactly as the shell receives it."
+type CommandAction {
+  "What runs, byte for byte."
+  text: String!
+  "Where it started, exactly as the shell starts there. Empty when the call never reached the gate."
+  cwd: String!
+  "Whether it keeps running after its call answers, until it exits or is stopped."
+  background: Boolean!
+  "Whether a sandbox confined the command."
+  sandboxed: Boolean!
+  "Whether the call asked to run outside the sandbox."
+  outsideSandbox: Boolean!
+}
+
+"A read of a file, as the call named it."
+type ReadAction {
+  path: String!
+}
+
+"A file written whole, as the call named it."
+type WriteAction {
+  path: String!
+  "The file's new content, byte for byte."
+  content: String!
+}
+
+"A replacement in a file, as the call named it."
+type EditAction {
+  path: String!
+  "The text that goes, byte for byte."
+  oldString: String!
+  "The text that replaces it, byte for byte."
+  newString: String!
+  "Every occurrence, not one."
+  replaceAll: Boolean!
+}
+
+"The user's decision on a gated call, off its `approvals` row."
+type ToolCallApproval {
+  id: ApprovalID!
+  status: ApprovalStatus!
+}
+
+"""
+Where the user's decision is. `Pending` until it commits, and after, when the call's turn ended
+before anyone answered: the record of a question nobody answered. An `Approved` call whose status
+is `NotRun` was approved and never started. `Abandoned` is a cluster write whose wait ended with no
+decision while its call ran on; a call's own approval never takes it.
+"""
+enum ApprovalStatus {
+  Pending
+  Approved
+  Denied
+  Abandoned
+}
+
+"""
+Where a tool call is. `NotRun` never started; `Interrupted` started and was cut off with no
+answer from its tool (a cancel, the loop's deadline, a crash), so it may have run; `Failed` is a
+tool's own error.
+"""
+enum ToolCallStatus {
+  NotRun
+  AwaitingApproval
+  Denied
+  Running
+  Succeeded
+  Failed
+  Interrupted
+}
+
+type ChatWatchFrame {
+  type: DeltaFrameType!
+  "The affected chat. On `Deleted`, its last-known state; remove by `id`. Null on `Bookmark`."
+  chat: Chat
+}
+
+type ChatMessageWatchFrame {
+  type: DeltaFrameType!
+  "The affected message. On `Deleted`, its last-known state; remove by `id`. Null on `Bookmark`."
+  message: ChatMessage
+}
+
+# --- Memory ---
+
+"""
+The identity of a memory (a UUID string on the wire). Like `ChatID`, not an
+`ObjectID`: a memory is a row, not a beehive object. Use values returned by the
+server verbatim.
+"""
+scalar MemoryID
+
+"Who last wrote a memory."
+enum MemoryAuthor {
+  Model
+  User
+}
+
+"""
+A note kept for later chats, one fact each: for one cluster, or for every cluster.
+The model may have written it from cluster data, so it is text to draw as text.
+"""
+type Memory {
+  id: MemoryID!
+  "The cluster it is for. Null is every cluster."
+  clusterID: ClusterID
+  name: String!
+  body: String!
+  writtenBy: MemoryAuthor!
+  updatedAt: Time!
+}
+
+type MemoryWatchFrame {
+  type: DeltaFrameType!
+  "The affected memory. On `Deleted`, its last-known state; remove by `id`. Null on `Bookmark`."
+  memory: Memory
+}
+
+input MemorySaveInput {
+  "The memory to rewrite. Null creates one."
+  id: MemoryID
+  "The cluster it is for. Null is every cluster."
+  clusterID: ClusterID
+  name: String!
+  body: String!
+}
+
+# --- Cloud account ---
+# The sidecar-owned sign-in and display identity. Tokens never appear here.
+# Login verifies claims; startup restores display claims without re-verification.
+
+"Display identity from OIDC ID-token claims. Verified at login, restored without verification at startup; never an authorization input."
+type Identity {
+  sub: String!
+  email: String!
+  name: String!
+}
+
+"Local session state. `authenticated` means a refresh token is stored, not that the server has just validated it. `identity` is display-only and non-null only when authenticated."
+type AuthState {
+  authenticated: Boolean!
+  identity: Identity
+}
+
+# --- Root operations ---
+# Every root field, grouped by the noun it belongs to.
+
+type Query {
+  # --- Model ---
+  "Every model the sidecar can answer with, in catalog order — the first entry is what a picker starts on. Fixed for the process's life, so this is a query and not a watch."
+  models: [Model!]!
+
+  # --- Cluster ---
+  "A single cluster by id; null if not tracked."
+  cluster(id: ClusterID!): Cluster
+
+  "Every tracked cluster — those in the kubeconfig plus any with a leftover cache. Sorted by `spec.name`, falling back to the kube-context for a cluster the user has not named."
+  clusters: [Cluster!]!
+
+  # --- ClusterCache ---
+  "A single cache by its own id, not its cluster's; null if unknown."
+  clusterCache(id: ObjectID!): ClusterCache
+
+  "Every cache, or one cluster's when `clusterID` is given — the set `Cluster.caches` serves."
+  clusterCaches(clusterID: ClusterID): [ClusterCache!]!
+
+  "A single synced-kind record by its own id, not its cache's; null if unknown."
+  clusterCachedKind(id: ObjectID!): ClusterCachedKind
+
+  "Every per-kind sync record — hundreds unscoped — or one cache's when `cacheID` is given; the set `ClusterCache.cachedKinds` serves."
+  clusterCachedKinds(cacheID: ObjectID): [ClusterCachedKind!]!
+
+  # --- Cloud account ---
+  "Current authentication state. Signed-out when no cloud account is configured; live updates via authStateWatch."
+  authState: AuthState!
+}
+
+type Mutation {
+  # --- Cluster ---
+  "Enable or disable a cluster in the app. Disabling keeps the record tracked but dormant (no connection, hidden from context pickers). Returns the updated cluster."
+  clusterEnabledSet(id: ClusterID!, enabled: Boolean!): Cluster!
+
+  "Enable or disable syncing for a cluster. Disabling stops sync and freezes the cache. Returns the updated cluster."
+  clusterSyncEnabledSet(id: ClusterID!, syncEnabled: Boolean!): Cluster!
+
+  "Let the background monitor run against this cluster, or stop it. Returns the updated record."
+  clusterMonitoringEnabledSet(id: ClusterID!, monitoringEnabled: Boolean!): Cluster!
+
+  "Force an immediate reconnection attempt, resetting any backoff. Resolves once the probe it asked for has finished — not when it was scheduled — so a caller can show the retry as busy for exactly that long. What the probe found arrives on the cluster's conditions. Returns true."
+  clusterConnectionRetry(id: ClusterID!): Boolean!
+
+  "Delete an orphaned cluster. Returns true as soon as the deletion is requested: the record then carries `deletionRequestedAt` while its runtime, its caches and its chats are torn down, and leaves `clustersWatch` once they are gone. Refused for a cluster its source still declares — the discovery pass would re-import it under a fresh id, losing the user's toggles; stop tracking it at the source, or disable it. Deleting a record already gone, or already deleting, is not an error."
+  clusterDelete(id: ClusterID!): Boolean!
+
+  # --- ClusterCache ---
+  "Clear one cache's on-disk file but keep its record. Its sync workers are restarted onto the emptied file, so a present, enabled cluster re-syncs from scratch. Takes the cache's own id, not its cluster's: a UID migration leaves a cluster owning more than one. Returns the cleared cache."
+  clusterCacheClear(id: ObjectID!): ClusterCache!
+
+  # --- ClusterCachedKind ---
+  "Stop or resume syncing ONE kind, leaving the rest of the cache alone. Pausing keeps the cached rows — they stay listed and readable throughout, and a resume reconciles into them rather than starting from nothing (off the watch cookie if the pause was short enough for the server to still serve it, otherwise by relisting). A discovery sweep will not undo it: the sweep owns the kind's identity, the user owns this switch. Returns the updated record."
+  clusterCachedKindSyncEnabledSet(id: ObjectID!, syncEnabled: Boolean!): ClusterCachedKind!
+
+  # --- Chat ---
+  "Save a user message and start the assistant's turn. Returns the assistant's message as accepted, not as finished — the answer arrives on chatMessagesWatch. A null `chatID` creates the chat; a chat already running a turn is refused. `requestID` makes the send idempotent for as long as its chat lives, and a repeat is answered by that id alone: this call's `chatID`, `model`, `effort` and `content` are ignored. The key goes with the chat, so a repeat after its delete is a new send. A null `chatID` creates the chat in `mode` and under `clusterID`, which must name an existing cluster; otherwise both are ignored, and on a `requestID` replay they are ignored like `chatID` and `content`."
+  chatSend(chatID: ChatID, mode: ChatMode!, clusterID: ClusterID!, providerID: String!, modelID: String!, effort: String!, requestID: String!, content: String!): ChatMessage!
+
+  "Stop the in-flight turn, keeping the partial answer. Returns true; a no-op when nothing is running."
+  chatCancel(chatID: ChatID!): Boolean!
+
+  "Decide a waiting command. Returns true when a turn was waiting on it; that says the decision reached the turn, not that it was recorded, since a cancel landing in the same moment can still win and leave the approval pending. A decision nothing waits on — the turn cancelled, stranded or already decided — returns false and changes nothing."
+  approvalDecide(id: ApprovalID!, approve: Boolean!): Boolean!
+
+  "The user's stop of the background task a call started: SIGTERM, then SIGKILL after a grace. Returns true when a task of that call was running; false, changing nothing, when none is."
+  backgroundTaskStop(id: ToolCallID!): Boolean!
+
+  "Retitle a chat. Returns the record it committed, whose `updatedAt` the rename moves."
+  chatRename(id: ChatID!, title: String!): Chat!
+
+  "Delete a chat and its messages. Instant and permanent — every window watching it sees the rows go. Deleting one already gone is not an error. Returns true."
+  chatDelete(id: ChatID!): Boolean!
+
+  # --- Memory ---
+  "Create a memory, or rewrite one by `id`; a rewrite can rename it and move it between one cluster and every cluster. Written by the user. Refused `KSTACK_MEMORY_NAME_TAKEN` for a name the target scope holds, `KSTACK_MEMORY_FULL` for a scope with no room for the memory, `KSTACK_MEMORY_SECRET` for a credential, `KSTACK_VALIDATION_ERROR` for a note out of shape, and `KSTACK_RECORD_NOT_FOUND` for an unknown id or a missing cluster."
+  memorySave(input: MemorySaveInput!): Memory!
+
+  "Delete a memory. Refused `KSTACK_RECORD_NOT_FOUND` for an unknown id. Returns true."
+  memoryDelete(id: MemoryID!): Boolean!
+
+  # --- Cloud account ---
+  "Start the sidecar-owned browser sign-in (OAuth). Setup (loopback bind + browser open) runs synchronously, so a setup failure — or no cloud account — returns an error. Returns true once the browser opens; the token exchange then completes in the background, with the signed-in state delivered via authStateWatch."
+  authLoginStart: Boolean!
+
+  "Sign out: clear local credentials, broadcast signed-out, and revoke the token server-side (best-effort). Returns true; no-op without a cloud account."
+  authLogout: Boolean!
+}
+
+type Subscription {
+  # Two live shapes, named in every description below. A DELTA WATCH replays the current
+  # set, closes that snapshot with one Bookmark, then streams changes (DeltaFrameType) —
+  # so a consumer renders an empty state only after the Bookmark. A GAUGE is
+  # current-on-subscribe: its first value IS the snapshot, and no Bookmark rides it.
+  # Every subscription here is endless.
+
+  # --- Any object ---
+  "A cache's or a per-kind record's event timeline — `ClusterCache`, `ClusterCachedKind` — as an event log: runs upserted by `Event.id`, the snapshot closed by one `Bookmark` (`EventFrameType`). Optionally one `category`. The point read is that record's own `events` field; a cluster's timeline is `clusterEventsWatch`."
+  eventsWatch(id: ObjectID!, category: String): EventWatchFrame!
+
+  # --- Cluster ---
+  "The cluster list as a delta watch, keyed by `cluster.id`. Cache sync status is not here — it streams on `clusterCachesWatch`."
+  clustersWatch: ClusterWatchFrame!
+
+  "A cluster's event timeline as an event log, the same shape as `eventsWatch`. Bookmark-only for an id naming nothing."
+  clusterEventsWatch(id: ClusterID!, category: String): EventWatchFrame!
+
+  "A cluster's next reconcile as a gauge — what keeps a disconnected cluster's countdown live, since scheduling fires no object watch."
+  clusterScheduleWatch(id: ClusterID!): Schedule!
+
+  # --- ClusterCache ---
+  "Cache records as a delta watch, keyed by `cache.id` and joined onto clusters by `clusterID`. Carries no ordering guarantee against `clustersWatch`."
+  clusterCachesWatch: ClusterCacheWatchFrame!
+
+  "Every cache's folded sync verdict as a gauge, keyed by `cacheID`. No deletes — a verdict's lifetime is its cache's, so the client drops one when its cache leaves `clusterCachesWatch`."
+  clusterCacheHealthWatch: ClusterCacheHealth!
+
+  "One cache's per-kind sync records as a delta watch, keyed by `kind.id`. Cache-scoped, since there is one record per synced kind."
+  clusterCachedKindsWatch(cacheID: ObjectID!): ClusterCachedKindWatchFrame!
+
+  "One cache's on-disk contents as a gauge. A subscription, not a `ClusterCache` field, which would freeze at subscribe time."
+  clusterCacheStatsWatch(id: ClusterID!, cacheID: ObjectID!): ClusterCacheStats!
+
+  "One cache's sync detail as a gauge — the discovery verdict and a row per mirrored kind. Re-read on a cadence rather than on a signal: its counts and freshness stamps move while every record under it sits still. Holds silent for a pair naming no live cache."
+  clusterCacheSyncStatusWatch(id: ClusterID!, cacheID: ObjectID!): ClusterCacheSyncStatus!
+
+  # --- Cluster data ---
+  "One cache's discovered kind catalog as a delta watch, keyed by `apiVersion` + `resource`. Counts are live, so an object write re-emits its kind. The live counterpart of `ClusterCache.kinds`."
+  clusterCachedDataKindsWatch(
+    id: ClusterID!
+    cacheID: ObjectID!
+  ): ClusterCachedDataKindWatchFrame!
+
+  "One cache's cached Kubernetes Events as a delta watch, newest first, keyed by `uid`; an event the server dropped surfaces as `Deleted`. Distinct from `eventsWatch`, which streams kstack's own timeline."
+  clusterCachedDataEventsWatch(
+    id: ClusterID!
+    cacheID: ObjectID!
+  ): ClusterCachedDataEventWatchFrame!
+
+  "One kind's cached objects from a cache as a delta watch, keyed by `uid`. Scoped by `apiVersion` + `resource`, e.g. `\"apps/v1\"` + `\"deployments\"`."
+  clusterCachedDataObjectsWatch(
+    id: ClusterID!
+    cacheID: ObjectID!
+    apiVersion: String!
+    resource: String!
+  ): ClusterCachedDataObjectWatchFrame!
+
+  # --- Chat ---
+  "DELTA WATCH. The chat list, keyed by `chat.id` — what the sidebar renders."
+  chatsWatch: ChatWatchFrame!
+
+  """
+  DELTA WATCH. One chat's messages, keyed by `message.id`. A streaming answer arrives
+  as repeated `Modified` frames carrying the whole text so far, so any one frame is
+  disposable. Nothing orders this against chatsWatch: on a delete, the chat's `Deleted`
+  and its messages' come from two pumps and land in either order.
+  """
+  chatMessagesWatch(chatID: ChatID!): ChatMessageWatchFrame!
+
+  # --- Memory ---
+  "DELTA WATCH. What one cluster's chats see, keyed by `memory.id`: its own memories and every cluster's. A move between scopes arrives as `Added` or `Deleted` on each cluster it enters or leaves."
+  memoriesWatch(clusterID: ClusterID!): MemoryWatchFrame!
+
+  # --- Cloud account ---
+  "Authentication state as a gauge: a fresh snapshot on every sign-in, sign-out, and refresh failure."
+  authStateWatch: AuthState!
+}

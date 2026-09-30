@@ -1,0 +1,83 @@
+// Copyright 2026 The Kstack Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package chatsvc
+
+import (
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/kstackhq/kstack/sidecar/internal/testutil"
+)
+
+// A notice turn makes every check a send makes, the length check included: a
+// task that exits in a chat past the ceiling starts no turn, files nothing, and
+// its notice waits for a question on a model that can read the chat.
+func TestAFullChatStartsNoNoticeTurn(t *testing.T) {
+	tt := newTaskTool()
+	s, f := windowed(t, 200_000, 64_000, 0, tt)
+	f.SetToolCalls(taskCall())
+	f.SetUsage(reads(10), reads(150_000))
+	first := converse(t, s, nil, "fake", "fake", "start it")
+	ft := testutil.Recv(t, tt.ready, "the task to start")
+	done := taskDoneOf(t, s, first.ChatID, ft)
+
+	ft.exit(0)
+	testutil.Wait(t, done, "the row")
+
+	assert.Nil(t, s.turnOf(first.ChatID), "no turn started")
+	msgs, err := s.transcript(t.Context(), first.ChatID)
+	require.NoError(t, err)
+	assert.Len(t, msgs, 2, "nothing filed")
+	assert.Equal(t, 1, tableCount(t, s.db, "agent_runs"))
+	assert.False(t, taskRows(t, s.db)[0].notified, "the notice waits")
+}
+
+// A notice names its task in one short line, whatever the model wrote: the first
+// line with anything on it, cut to 200 characters, the transcript's rule.
+func TestANoticeHoldsOneLine(t *testing.T) {
+	assert.Equal(t, "List files…", noticeLine("List files\nthen delete them"))
+	assert.Equal(t, strings.Repeat("é", 200)+"…", noticeLine(strings.Repeat("é", 300)))
+	assert.Equal(t, "List files", noticeLine("List files"))
+	assert.Equal(t, "List files", noticeLine("List files  \n \n"), "no mark for whitespace alone")
+	assert.Equal(t, "List files", noticeLine("\n  \nList files"))
+	assert.Empty(t, noticeLine(" \n\t "))
+
+	n := noticeOf(waitingNotice{
+		id: "t1", toolUseID: "call-1", path: "/p", status: taskExited,
+		description: "Serve the site\nand watch it", command: "make serve && " + strings.Repeat("x", 250),
+	})
+	assert.Equal(t, "Serve the site…", n.Description)
+	assert.Equal(t, "make serve && "+strings.Repeat("x", 186)+"…", n.Command)
+}
+
+// An agent whose run succeeded with no report could not answer, and its notice
+// says so in place of an error.
+func TestAnAgentWithNothingToSayIsTold(t *testing.T) {
+	n := noticeOf(waitingNotice{id: "t1", path: "/p", status: taskFailed, agent: true, description: "look"})
+	assert.Equal(t, "it had nothing to say", n.Error)
+	assert.Empty(t, n.OutputFile, "a failed agent's file is empty")
+}
+
+// A stopped or lost agent's file is empty, so its notice names none.
+func TestAStoppedAgentsNoticeNamesNoFile(t *testing.T) {
+	for _, status := range []string{taskStopped, taskLost} {
+		n := noticeOf(waitingNotice{id: "t1", path: "/p", status: status, agent: true, description: "look"})
+		assert.Empty(t, n.OutputFile, status)
+		assert.Empty(t, n.Error, status)
+	}
+}

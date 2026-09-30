@@ -1,0 +1,338 @@
+name: ci
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    branches:
+      - "**"
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ##############################
+  # Pre-flight jobs
+  ##############################
+
+  go-lint:
+    name: Go · Lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-environment
+        with:
+          setup-go: "true"
+      - name: Run linter
+        working-directory: ./sidecar
+        run: test -z "$(gofmt -l .)"
+
+  go-vet:
+    name: Go · Vet
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-environment
+        with:
+          setup-go: "true"
+      - name: Run vetter
+        working-directory: ./sidecar
+        run: go vet ./...
+      # The Windows runners run tests alone, so this is the one place the
+      # _windows.go files are vetted.
+      - name: Run vetter (GOOS=windows)
+        working-directory: ./sidecar
+        run: GOOS=windows go vet ./...
+
+  rust-lint:
+    name: Rust · Lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-environment
+        with:
+          setup-rust: "true"
+      - name: Run format check
+        working-directory: ./src-tauri
+        run: cargo fmt --all -- --check
+
+  rust-vet:
+    name: Rust · Vet
+    strategy:
+      fail-fast: false
+      matrix: &full-matrix
+        os:
+          - linux
+          - macos-15
+          - macos-26
+          - windows
+        arch:
+          - amd64
+          - arm64
+        include:
+          - os: linux
+            arch: amd64
+            runner: ubuntu-24.04
+          - os: linux
+            arch: arm64
+            runner: ubuntu-24.04-arm
+          - os: macos-15
+            arch: amd64
+            runner: macos-15-intel
+          - os: macos-15
+            arch: arm64
+            runner: macos-15
+          - os: macos-26
+            arch: arm64
+            runner: macos-26
+          - os: macos-26
+            arch: amd64
+            runner: macos-26-intel
+          - os: windows
+            arch: amd64
+            runner: windows-2025-vs2026
+          - os: windows
+            arch: arm64
+            runner: windows-11-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-environment
+        with:
+          setup-rust: "true"
+      - name: Stub sidecar binary
+        shell: bash
+        run: |
+          TRIPLE="$(rustc -vV | sed -n 's/^host: //p')"
+          EXT=""
+          case "$TRIPLE" in *windows*) EXT=".exe" ;; esac
+          mkdir -p src-tauri/binaries
+          touch "src-tauri/binaries/kstack-sidecar-$TRIPLE$EXT"
+      - name: Run clippy
+        working-directory: ./src-tauri
+        run: cargo clippy --all -- -D warnings
+
+  shell-lint:
+    name: Shell · Lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+      - name: Run shellcheck
+        run: shellcheck scripts/*.sh src-tauri/linux/*.sh
+
+  typescript-lint:
+    name: TypeScript · Lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-environment
+        with:
+          setup-node: "true"
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Lint
+        run: pnpm lint
+
+  ###########################
+  # Audit jobs
+  ###########################
+
+  go-audit:
+    name: Go · Audit
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-environment
+        with:
+          setup-go: "true"
+      - name: Run govulncheck
+        working-directory: ./sidecar
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 ./...
+
+  rust-audit:
+    name: Rust · Audit
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-environment
+        with:
+          setup-rust: "true"
+      - name: Install cargo-audit
+        run: cargo install --locked cargo-audit --version 0.22.2
+      - name: Run cargo audit
+        working-directory: ./src-tauri
+        run: cargo audit --deny unsound --deny unmaintained
+
+  typescript-audit:
+    name: TypeScript · Audit
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-environment
+        with:
+          setup-node: "true"
+      - name: Run pnpm audit
+        run: pnpm audit --audit-level moderate
+
+  ###########################
+  # Test jobs
+  ###########################
+
+  go-test:
+    name: Go · Test
+    needs:
+      - go-lint
+      - go-vet
+    strategy:
+      fail-fast: false
+      matrix: *full-matrix
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-environment
+        with:
+          setup-go: "true"
+          setup-sandbox: "true"
+      - name: Run tests
+        working-directory: ./sidecar
+        run: go test ./...
+      - name: Run race tests
+        if: ${{ !(matrix.os == 'windows' && matrix.arch == 'arm64') }}
+        working-directory: ./sidecar
+        run: go test -race ./...
+
+  go-coverage:
+    name: Go · Coverage
+    needs:
+      - go-lint
+      - go-vet
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-environment
+        with:
+          setup-go: "true"
+          setup-sandbox: "true"
+      - name: Check coverage against the threshold
+        working-directory: ./sidecar
+        run: go run scripts/coverage.go -report
+
+  typescript-coverage:
+    name: TypeScript · Coverage
+    needs:
+      - typescript-lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-environment
+        with:
+          setup-node: "true"
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Check coverage against the threshold
+        run: make cover-js
+
+  rust-test:
+    name: Rust · Test
+    needs:
+      - rust-lint
+      - rust-vet
+    strategy:
+      fail-fast: false
+      matrix: *full-matrix
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-environment
+        with:
+          setup-go: "true"
+          setup-rust: "true"
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build sidecar
+        shell: bash
+        run: go run scripts/build-sidecar.go
+      - name: Run tests
+        working-directory: ./src-tauri
+        run: cargo test
+
+  typescript-test:
+    name: TypeScript · Test
+    needs:
+      - typescript-lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-environment
+        with:
+          setup-node: "true"
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Test
+        run: pnpm test run
+
+  ###########################
+  # Build jobs
+  ###########################
+
+  go-build:
+    name: Go · Build
+    needs:
+      - go-lint
+      - go-vet
+    strategy:
+      fail-fast: false
+      matrix: *full-matrix
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-environment
+        with:
+          setup-go: "true"
+      - name: Build
+        working-directory: ./sidecar
+        run: go build
+
+  rust-build:
+    name: Rust · Build
+    needs:
+      - rust-lint
+      - rust-vet
+    strategy:
+      fail-fast: false
+      matrix: *full-matrix
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-environment
+        with:
+          setup-go: "true"
+          setup-rust: "true"
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build sidecar
+        shell: bash
+        run: go run scripts/build-sidecar.go
+      - name: Build
+        working-directory: ./src-tauri
+        run: cargo build
+
+  typescript-build:
+    name: TypeScript · Build
+    needs:
+      - typescript-lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-environment
+        with:
+          setup-node: "true"
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Build
+        run: pnpm build

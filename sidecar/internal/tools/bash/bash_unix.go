@@ -1,0 +1,151 @@
+// Copyright 2026 The Kstack Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//go:build !windows
+
+package bash
+
+import (
+	"context"
+	"errors"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"syscall"
+	"time"
+
+	"github.com/kstackhq/kstack/sidecar/internal/loginshell"
+	"github.com/kstackhq/kstack/sidecar/internal/sandbox"
+)
+
+// pipeGrace bounds the wait for the output pipe to close once the group has
+// been killed: a descendant that left the group can still hold it, and the
+// call must end without it.
+const pipeGrace = time.Second
+
+// hooks order a race in a test; production runs with none.
+type hooks struct {
+	after      func(d time.Duration) <-chan time.Time // the call's deadline; time.After when nil
+	beforeReap func(ctx context.Context)
+	onStop     func(s stop)
+	afterReap  func(ctx context.Context)
+}
+
+// hideWindow is Windows' concern alone.
+func hideWindow(*exec.Cmd) {}
+
+// findShell is the login shell when it is zsh or bash, since the model writes
+// bash and the wrapper is written for those two alone; anything else is bash on
+// PATH.
+func findShell() (path, kind string, ok bool) {
+	if shell, ok := loginshell.Find(); ok {
+		if base := filepath.Base(shell); base == "zsh" || base == "bash" {
+			return shell, base, true
+		}
+	}
+	path, err := exec.LookPath("bash")
+	return path, "bash", err == nil
+}
+
+// run runs one command under parent. The call's own deadline stops it with
+// SIGTERM to its group and SIGKILL after the grace; parent ending stops it with
+// SIGKILL at once. The stop is recorded as it is sent, under a lock the reap
+// closes, so an exit reaped before the stop is never relabelled.
+func run(parent context.Context, s spec) result {
+	// The pipe is the package's own so Wait returns the moment bash exits
+	// rather than when the last holder of the pipe does — a process bash
+	// left behind is killed right after, and its hold ends then.
+	r, w, err := os.Pipe()
+	if err != nil {
+		return result{Error: err.Error()}
+	}
+	ctx, cancel := s.hooks.deadline(parent, s.timeout)
+	defer cancel()
+	g := newGuard(s.hooks)
+	cmd := shellCmd(ctx, s, w)
+	cmd.Cancel = func() error { return stopBash(parent, cmd, g, s.killGrace) }
+	if err := cmd.Start(); err != nil {
+		_ = w.Close()
+		_ = r.Close()
+		return result{Error: err.Error()}
+	}
+	_ = w.Close()
+
+	out := &captureWriter{limit: s.capture}
+	read := copyOutput(out, r)
+
+	s.hooks.waitBeforeReap(ctx)
+	_ = cmd.Wait() // the verdict is ProcessState's; Wait's error can be the context's
+	res := result{Stop: g.reap()}
+	_ = signalGroup(cmd, syscall.SIGKILL)
+	s.hooks.waitAfterReap(ctx)
+	awaitCopy(read, r, s.pipeGrace)
+	_ = r.Close()
+
+	res.Output, res.Discarded = string(out.buf), out.discarded
+	if cmd.ProcessState == nil {
+		res.CodeUnknown = true // Wait could not reap bash, which happens only if the OS failed us
+	} else {
+		res.ExitCode = sandbox.ExitCode(cmd.ProcessState)
+	}
+	return res
+}
+
+// shellCmd is bash on s.command in s.dir, through the sandbox when s has one, in
+// a process group of its own, its stdout and stderr on w. ctx is what exec
+// kills it on; a task passes none.
+//
+// A sandboxed run also leads a session of its own, so it has no controlling
+// terminal: input pushed into one (TIOCSTI) is run by whatever reads it,
+// outside the sandbox. The sidecar has one when started from a terminal.
+func shellCmd(ctx context.Context, s spec, w *os.File) *exec.Cmd {
+	var cmd *exec.Cmd
+	attr := &syscall.SysProcAttr{Setpgid: true}
+	if s.sandboxedRun != nil {
+		r := s.sandboxedRun.run
+		r.Shell, r.Args, r.Dir = s.shell, []string{"-c", s.command}, s.dir
+		cmd = s.sandboxedRun.boxer.Command(ctx, r)
+		attr = &syscall.SysProcAttr{Setsid: true}
+	} else {
+		cmd = exec.CommandContext(ctx, s.shell, "-c", s.command)
+		cmd.Dir, cmd.Env = s.dir, outsideEnv(os.Environ(), s.env, s.dir)
+	}
+	cmd.Stdout, cmd.Stderr = w, w
+	cmd.SysProcAttr = attr
+	return cmd
+}
+
+// stopBash is cmd.Cancel. exec can run it after the OS has reaped bash and
+// before Wait returns, so a bash already collected exited on its own: nothing is
+// recorded and nothing is sent to a group id that may be free by now.
+func stopBash(parent context.Context, cmd *exec.Cmd, g *guard, killGrace time.Duration) error {
+	if errors.Is(cmd.Process.Signal(syscall.Signal(0)), os.ErrProcessDone) {
+		return os.ErrProcessDone
+	}
+	why := stopFor(parent)
+	if !g.record(why) {
+		return nil
+	}
+	if why == stopCancel {
+		return signalGroup(cmd, syscall.SIGKILL)
+	}
+	go g.escalate(parent, killGrace, func() { _ = signalGroup(cmd, syscall.SIGKILL) })
+	return signalGroup(cmd, syscall.SIGTERM)
+}
+
+// signalGroup sends sig to the command's process group: bash and everything it
+// started that stayed in it. Called only once Start has succeeded.
+func signalGroup(cmd *exec.Cmd, sig syscall.Signal) error {
+	return syscall.Kill(-cmd.Process.Pid, sig)
+}

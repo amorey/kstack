@@ -1,0 +1,179 @@
+@import 'tailwindcss';
+
+@import '@kubetail/ui';
+@source '../node_modules/@kubetail/ui/dist/**/*.js';
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+:root,
+.light {
+  --background: #ffffff;
+  --foreground: #1e2530;
+  --card: #f6f8fb;
+  --card-foreground: #1e2530;
+  --popover: #ffffff;
+  --popover-foreground: #1e2530;
+  --primary: #9f5436;
+  --primary-foreground: #ffffff;
+  --secondary: #eaeef4;
+  --secondary-foreground: #414c5c;
+  --muted: #eaeef4;
+  --muted-foreground: #5c6779;
+  --accent: #e7d2c9;
+  --accent-foreground: #402318;
+  --destructive: #d32f2f;
+  --destructive-foreground: #ffffff;
+  --border: #dbe2ec;
+  --input: #8c94a0;
+  --ring: #9f5436;
+  --chart-1: #8fc6ff;
+  --chart-2: #297eff;
+  --chart-3: #155dfc;
+  --chart-4: #1447e6;
+  --chart-5: #193cb8;
+  --sidebar: #f1f4f9;
+  --sidebar-foreground: #414c5c;
+  --sidebar-primary: #9f5436;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #ecdcd4;
+  --sidebar-accent-foreground: #402318;
+  --sidebar-border: #ccd5e2;
+  --sidebar-ring: #9f5436;
+}
+
+.dark {
+  --background: #14171d;
+  --foreground: #c2c8d2;
+  --card: #1c2028;
+  --card-foreground: #c2c8d2;
+  --popover: #1c2028;
+  --popover-foreground: #c2c8d2;
+  --primary: #dec1b7;
+  --primary-foreground: #331e16;
+  --secondary: #2a303b;
+  --secondary-foreground: #a3abb9;
+  --muted: #2a303b;
+  --muted-foreground: #9198a6;
+  --accent: #3d2a20;
+  --accent-foreground: #e7d2c9;
+  --destructive: #f87171;
+  --destructive-foreground: #14171d;
+  --border: #2c333f;
+  --input: #5e6572;
+  --ring: #dec1b7;
+  --chart-1: #8fc6ff;
+  --chart-2: #297eff;
+  --chart-3: #155dfc;
+  --chart-4: #1447e6;
+  --chart-5: #193cb8;
+  --sidebar: #1c2028;
+  --sidebar-foreground: #c2c8d2;
+  --sidebar-primary: #dec1b7;
+  --sidebar-primary-foreground: #331e16;
+  --sidebar-accent: #3d2a20;
+  --sidebar-accent-foreground: #e7d2c9;
+  --sidebar-border: #353d4a;
+  --sidebar-ring: #5f6b7d;
+}
+
+@theme {
+  --font-sans: 'Roboto Flex Variable', Arial, Helvetica, sans-serif;
+}
+
+@layer base {
+  html,
+  body {
+    /* Kill the webview rubber-band / overscroll "bounce" at the document edges. */
+    overscroll-behavior: none;
+  }
+
+  /*
+   * The app's full-height reference. macOS is full-bleed (no `WindowFrame` box),
+   * so height is measured against the window viewport (`100svh`). Off macOS the
+   * app lives inside `WindowFrame` — a `position: fixed`, inset, `overflow-hidden`
+   * box — so `100svh` (the *window*) overflows the frame by its gutter and gets
+   * clipped at the bottom. There the reference is `100%` of that frame instead,
+   * which tracks the frame as it switches between the inset gutter and the
+   * full-bleed `inset-0` it uses while maximized. Consumed via
+   * `min-h-[var(--app-min-h)]` wherever a screen would otherwise use `min-h-svh`.
+   */
+  :root {
+    --app-min-h: 100svh;
+  }
+
+  html.frameless {
+    --app-min-h: 100%;
+  }
+
+  body {
+    @apply antialiased;
+    font-feature-settings:
+      'rlig' 1,
+      'calt' 1;
+    font-synthesis: none;
+    text-rendering: optimizeLegibility;
+    position: relative;
+    /*
+     * Paint the document itself from the resolved scheme's token, so a window's
+     * first frame is themed before React mounts any `bg-background` surface —
+     * otherwise a dark-scheme window flashes the webview's default white until the
+     * app renders. The pre-paint `.dark` class comes from the inline script in
+     * `index.html`. Linux is frameless+transparent, so `html.frameless body` below
+     * overrides this back to transparent (the gutter must show through).
+     */
+    background-color: var(--background);
+  }
+
+  #root {
+    isolation: isolate;
+  }
+
+  /*
+   * Frameless Linux/Windows windows (see `WindowFrame`): the window is
+   * transparent, so the document itself must be transparent to expose the small
+   * gutter around the frame where its drop shadow paints. The `frameless` class
+   * is set on <html> at startup off macOS (see `main.tsx`); macOS keeps its
+   * native decorations, so its document stays opaque.
+   */
+  html.frameless,
+  html.frameless body,
+  html.frameless #root {
+    background: transparent;
+  }
+}
+
+/*
+ * Chrome the app portals outside itself — the dialog scrim. These rules must stay
+ * OUT of `@layer base`: base loses to `utilities`, so from in there they never beat
+ * the utility classes on the overlay they are reshaping.
+ */
+
+/*
+ * Blur the app behind an open dialog so the scrim reads as depth rather than a
+ * flat dim. Applies on every platform (the scrim itself does too); the frameless
+ * inset rules below only reshape where the scrim/blur is clipped.
+ */
+
+[data-slot='dialog-overlay'] {
+  backdrop-filter: blur(2px);
+}
+
+/*
+ * Dialog scrim clipped to the frame. base-ui portals the overlay to <body>,
+ * outside `WindowFrame`, so its default `inset-0` darkens the transparent gutter
+ * the frame leaves around the app — the scrim spills past the rounded window
+ * edge. Inset it to match the frame instead. Kept in step with `WindowFrame`'s
+ * `inset-4`/`rounded-lg` by hand. macOS (no `.frameless`) and a maximized frameless
+ * window (the frame is full-bleed `inset-0` then, flagged by `.frame-maximized` from
+ * `WindowFrame`) keep the full-window scrim.
+ */
+
+html.frameless [data-slot='dialog-overlay'] {
+  inset: 1rem;
+  border-radius: 0.5rem;
+}
+
+html.frameless.frame-maximized [data-slot='dialog-overlay'] {
+  inset: 0;
+  border-radius: 0;
+}

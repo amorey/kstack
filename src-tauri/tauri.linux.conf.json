@@ -1,0 +1,34 @@
+{
+  "bundle": {
+    "linux": {
+      "deb": {
+        "depends": [
+          "libcap2"
+        ],
+        "files": {
+          "/usr/lib/kstack/bwrap": "linux/bwrap",
+          "/usr/share/doc/kstack/bubblewrap-COPYING": "linux/bubblewrap-COPYING",
+          "/usr/lib/kstack/apparmor/kstack-bwrap": "linux/kstack-bwrap",
+          "/usr/share/doc/kstack/apparmor-COPYING": "linux/apparmor-COPYING"
+        },
+        "postInstallScript": "linux/postinst.sh",
+        "preRemoveScript": "linux/prerm.sh"
+      },
+      "rpm": {
+        "depends": [
+          "libcap"
+        ],
+        "files": {
+          "/usr/lib/kstack/bwrap": "linux/bwrap",
+          "/usr/share/doc/kstack/bubblewrap-COPYING": "linux/bubblewrap-COPYING"
+        }
+      },
+      "appimage": {
+        "files": {
+          "/usr/lib/kstack/bwrap": "linux/bwrap",
+          "/usr/share/doc/kstack/bubblewrap-COPYING": "linux/bubblewrap-COPYING"
+        }
+      }
+    }
+  }
+}
