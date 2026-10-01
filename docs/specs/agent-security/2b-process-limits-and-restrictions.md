@@ -25,7 +25,7 @@ After this step the note's three remaining bullets are true of the code:
 - *"Resource limits per command: CPU time, memory, open files, process count, and a wall-clock
   timeout."* A run carries **`Policy.Limits`**, set by Bash's Workspace policy: 600 s of CPU
   time, 8 GiB of address space (Linux), 4096 open files, and the user's own process count plus
-  256. The run's first process, `sandbox-init`, sets them with `setrlimit` before it starts the
+  256, counted as the kernel counts it: threads on Linux, processes on macOS. The run's first process, `sandbox-init`, sets them with `setrlimit` before it starts the
   shell, so they hold the shell and everything under it and never the sidecar. On macOS the
   forwarder becomes every run's first process, as it is on Linux.
 - *"No privilege escalation: `no_new_privs` on Linux; deny execution of `sudo` and other setuid
@@ -60,16 +60,17 @@ of [the sandbox, credentials and permissions note](../../notes/sandbox-credentia
 ```go
 // Limits bounds what a run's processes may use. Zero is the platform's
 // default for that resource. Each holds per process, as the kernel counts
-// it, but Processes, which counts every process of the user.
+// it, but Processes, which counts everything the user's real uid runs:
+// every thread on Linux, every process on macOS.
 type Limits struct {
 	CPUSeconds  int // CPU time per process
 	MemoryBytes int // address space per process; Linux alone
 	OpenFiles   int // open descriptors per process
-	Processes   int // the user's processes, all told
+	Processes   int // the user's threads (Linux) or processes (macOS), all told
 }
 ```
 
-`Policy` gains `Limits Limits`, the field step 1A reserves. `Check` refuses a negative limit.
+`Policy` gains `Limits Limits`. `Check` refuses a negative limit.
 
 Each limit is one resource limit, set soft and hard so a process cannot raise it back:
 
@@ -86,17 +87,22 @@ whose child was killed by `SIGXCPU` exits 152 (`ExitCode`: 128 plus the signal).
 
 `MemoryBytes` is Linux's alone: macOS accepts `RLIMIT_AS` and enforces nothing, so the macOS
 compiler passes it to nothing (§8). `RLIMIT_NPROC` counts the user's processes on the whole
-machine, not the run's, so `Processes` is an absolute count and Bash computes it (§2).
+machine, not the run's, so `Processes` is an absolute count and Bash computes it (§2). Linux
+counts tasks, so every thread of a process is one against the limit; macOS counts processes.
+Both count by the real uid.
 
-**`sandbox.UserProcesses() (int, error)`** answers how many processes the user runs now:
-`procs_linux.go` counts the entries of `/proc` whose owner is `os.Getuid()`, `procs_darwin.go`
-reads `kern.proc.uid.<uid>` through `unix.SysctlKinfoProcSlice`, `procs_windows.go` answers
+**`sandbox.UserProcesses() (int, error)`** answers the count the kernel holds the limit against:
+`procs_linux.go` reads `/proc/<pid>/status` for each process and sums the `Threads:` line of
+those whose `Uid:` line starts with `os.Getuid()`, the real uid. It never reads the owner of
+`/proc/<pid>`, which is the effective uid, and root for a non-dumpable process such as the
+forwarder. A process that exits between the listing and the read is skipped. `procs_darwin.go`
+reads `kern.proc.ruid.<uid>` through `unix.SysctlKinfoProcSlice`, `procs_windows.go` answers
 `errNone`. It is read outside the sandbox: inside, Linux's `/proc` shows the run's own processes
 alone.
 
 ### 2. The Workspace policy's limits
 
-`sandboxedRunFor` in `tools/bash/bash.go` sets `Limits` on the policy it builds (step 1A §6):
+`sandboxedRunFor` in `tools/bash/bash.go` sets `Limits` on the policy it builds (`workspacePolicy`):
 
 | Limit | Value | Why |
 | --- | --- | --- |
@@ -152,7 +158,7 @@ Linux is done: `sandbox-shell` sets `PR_SET_NO_NEW_PRIVS` before it execs the sh
 bit under it grants nothing, and `sudo` says so and exits 1.
 
 macOS gains one fixed rule in `profile_darwin.sb`, after `(allow process-exec)` and before the
-policy's rules, so no rule of a policy undoes it (step 1A §3):
+policy's rules, so no rule of a policy undoes it, like everything else the compiler holds fixed:
 
 ```scheme
 ;; No privilege escalation. Seatbelt cannot name "setuid", so this names the
@@ -205,8 +211,10 @@ memory is bounded by the timeout and the group kill, and the macOS compiler pass
 record it in the ADR.
 
 **The process limit is the user's count plus 256, read when the run is built.** `RLIMIT_NPROC`
-counts every process of the user, so a fixed value would either refuse the shell on a busy
-machine or allow a fork loop thousands of processes on a quiet one. A margin over the count at
+counts every process of the user, and on Linux every thread, so a fixed value would either
+refuse the shell on a busy machine or allow a fork loop thousands of processes on a quiet one.
+A desktop's browsers and editors run thousands of threads, so the count is read the kernel's
+way; a count of processes alone would set the limit below what the user already runs. A margin over the count at
 the run's start does neither. The count can move between the read and the shell's start; the
 margin covers it, and a fork that fails anyway is *cannot start*, exit 125, which the model
 reads. The alternative, a cgroup's `pids.max`, needs a cgroup delegated to the app, which
@@ -246,6 +254,9 @@ outside the sandbox, to prove the sandbox is what refuses it, skips when that ch
 - `TestLimitsAreChecked`: a negative limit fails `Check`; zero passes.
 - `TestUserProcessesCountsTheUsers`, in `procs_unix_test.go`: with a `sleep` child running, the
   count is at least two, the test and its child.
+- `TestUserProcessesCountsThreads`, in `procs_linux_test.go`: a helper in the test binary that
+  holds 64 threads and makes itself non-dumpable raises the count by at least 64, though
+  `/proc/<its pid>` is owned by root.
 - `TestForwarderArgsWriteTheLimits`: `--limits` is written with every key when any limit is set,
   and left out when none is; `TestForwarderArgsRoundTrip` covers the new flag.
 - `TestInitArgsReadTheLimits`: the value parses; an unknown key, a missing key, a negative value
@@ -291,7 +302,7 @@ outside the sandbox, to prove the sandbox is what refuses it, skips when that ch
 - `TestSudoCannotGainRoot`, in `policy_unix_test.go`: `sudo -n id -u` prints `0` outside the
   sandbox (else skipped), and inside it exits nonzero and prints no `0`, on both platforms.
 - `TestTheCompiledArgumentsMatchTheGolden` (Linux) and `TestTheCompiledProfileMatchesTheGolden`
-  (macOS), step 1A's goldens updated: the argument list gains `--limits` on `sandbox-init` and
+  (macOS), their goldens updated: the argument list gains `--limits` on `sandbox-init` and
   `--memory` on `sandbox-shell`; the profile gains the one `deny process-exec` rule. The
   reviewer reads the diff, and nothing else may change.
 
@@ -342,7 +353,7 @@ Run the [verification commands](../README.md#verification-commands), with the sa
 Linux and in CI's macOS job, `-race` included.
 
 By hand, `pnpm tauri dev` on macOS and on Linux. Ask for `ulimit -t; ulimit -n; ulimit -u`, which
-should print 600, 4096 and a number past your own process count, and on Linux `ulimit -v`, which
+should print 600, 4096 and a number past your own process count (thread count, on Linux), and on Linux `ulimit -v`, which
 should print 8388608. Ask for `sudo -n id -u`, which should fail on both, with *Operation not
 permitted* on macOS. On Linux ask for `strace -p 1`, which should fail with *Operation not
 permitted*; on macOS ask for `sample $KSTACK_SIDECAR_PID 1`, which should fail. A sandboxed
