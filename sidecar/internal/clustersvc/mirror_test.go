@@ -111,7 +111,8 @@ func TestMirrorWakesOnAnInsertedRow(t *testing.T) {
 }
 
 // An object with no row is a leftover — a row removed while the process was down, or
-// a crash between the two — and is torn down.
+// a crash between the two — and is torn down. The running controllers can finish the
+// teardown before the read, so an object already gone passes too.
 func TestMirrorDeletesAnOrphanObject(t *testing.T) {
 	d := newRunningDeps(t)
 	_, _, err := d.clusterClient.CreateOrUpdate(context.Background(), "no-such-row", kubeconfigRuntimeSpec("prod"))
@@ -120,9 +121,9 @@ func TestMirrorDeletesAnOrphanObject(t *testing.T) {
 	_, passed := startMirror(t, d)
 	testutil.Recv(t, passed, "the first pass")
 
-	obj, err := d.clusterClient.GetByName(context.Background(), "no-such-row")
-	require.NoError(t, err)
-	assert.NotNil(t, obj.DeletionRequestedAt)
+	if obj := runtimeObjectOf(t, d, "no-such-row"); obj != nil {
+		assert.NotNil(t, obj.DeletionRequestedAt)
+	}
 }
 
 // The mirror never touches updated_at: a reconcile is not a user edit.
@@ -313,7 +314,8 @@ func TestMirrorSkipsARowTheRuntimeStoreRefuses(t *testing.T) {
 
 // A pass that failed is retried on the pass-retry delay, since no signal follows a
 // failure: a row the runtime store refuses fails the first pass, and a later pass
-// finds it gone without a notification.
+// mirrors a row added with no notification. The row goes in before the refused
+// one leaves, so every pass that could miss it still fails and retries.
 func TestMirrorRetriesAPassThatFailed(t *testing.T) {
 	d := newRunningDeps(t)
 	_, err := d.db.Write.Exec(`INSERT INTO clusters (id, source, source_key, created_at, updated_at) VALUES ('', 'kubeconfig', 'blank', 0, 0)`)
@@ -325,9 +327,9 @@ func TestMirrorRetriesAPassThatFailed(t *testing.T) {
 	t.Cleanup(func() { require.NoError(t, stop(context.Background())) })
 	testutil.Recv(t, m.passed, "the first pass")
 
+	row := importCluster(t, d, "prod")
 	_, err = d.db.Write.Exec(`DELETE FROM clusters WHERE id = ''`)
 	require.NoError(t, err)
-	row := importCluster(t, d, "prod")
 
 	awaitPass(t, m.passed, func() bool { return runtimeObjectOf(t, d, row.ID) != nil })
 }
@@ -356,7 +358,9 @@ func TestMirrorReportsATeardownWriteThatFailed(t *testing.T) {
 
 // scriptedWatches is the cluster client with its WatchList driven by the test: each
 // call takes the next answer — an error fails it, nil hands back a stream whose
-// changes are the test's to send or close. Everything else is the real client's.
+// changes are the test's to send or close — and a call with none queued fails, as
+// against a store that is down. It never blocks, since the mirror's loop waits on
+// it. Everything else is the real client's.
 type scriptedWatches struct {
 	beehive.Client[ClusterRuntimeSpec, ClusterStatus]
 	answers chan error
@@ -370,8 +374,13 @@ func scriptWatches(d *deps) *scriptedWatches {
 }
 
 func (s *scriptedWatches) WatchList(context.Context, ...beehive.WatchOption) (*beehive.ObjectListStream[ClusterRuntimeSpec, ClusterStatus], error) {
-	if err := <-s.answers; err != nil {
-		return nil, err
+	select {
+	case err := <-s.answers:
+		if err != nil {
+			return nil, err
+		}
+	default:
+		return nil, errors.New("store down")
 	}
 	ch := make(chan beehive.ObjectChange[ClusterRuntimeSpec, ClusterStatus])
 	s.opened <- ch
@@ -389,8 +398,8 @@ func TestMirrorReopensARuntimeWatchThatEnded(t *testing.T) {
 	testutil.Recv(t, passed, "the first pass")
 	first := testutil.Recv(t, watches.opened, "the first watch")
 
-	close(first)
 	watches.answers <- nil
+	close(first)
 	second := testutil.Recv(t, watches.opened, "the reopened watch")
 	testutil.Recv(t, passed, "the pass covering the gap")
 
@@ -417,8 +426,7 @@ func TestMirrorRetriesAReopenThatFailed(t *testing.T) {
 	testutil.Recv(t, m.passed, "the first pass")
 	first := testutil.Recv(t, watches.opened, "the first watch")
 
-	close(first)
-	watches.answers <- errors.New("store down")
+	close(first) // nothing queued: the reopen fails until the test answers nil
 	row := importCluster(t, d, "prod")
 	d.db.Notify(appdb.KeyClusters)
 	testutil.Recv(t, m.passed, "the pass the row signal woke while the watch is down")

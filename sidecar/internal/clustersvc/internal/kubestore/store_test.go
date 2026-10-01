@@ -19,6 +19,7 @@ import (
 	"database/sql"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -154,6 +155,70 @@ func countRows(t *testing.T, s *Store, q string, args ...any) int {
 
 // A delta lands the row, its edges, and the position that would replay it — in one
 // transaction, so no restart resumes from a position the rows do not back.
+// The last release closes the file under the manager's lock, so a Clear or Remove never
+// finds the entry gone while its file is still open — Windows refuses to unlink one.
+func TestTheLastReleaseClosesTheFileUnderTheLock(t *testing.T) {
+	var m *Manager
+	underLock := make(chan bool, 1)
+	m = newManagerWithOptions(t.TempDir(), withCloseFile(func(f *file) error {
+		held := !m.mu.TryLock()
+		if !held {
+			m.mu.Unlock()
+		}
+		underLock <- held
+		return f.close()
+	}))
+	t.Cleanup(func() { require.NoError(t, m.Close()) })
+
+	store, err := m.OpenOrCreate(1)
+	require.NoError(t, err)
+	store.Release()
+
+	assert.True(t, testutil.Recv(t, underLock, "the release to close the file"))
+}
+
+// A remove waits for an operation on the file to end before it deletes it: sql.DB.Close
+// leaves a connection in use open, and Windows refuses to delete a file one holds.
+func TestARemoveWaitsForAnOperationInFlight(t *testing.T) {
+	m := NewManager(t.TempDir(), Retention{})
+	t.Cleanup(func() { require.NoError(t, m.Close()) })
+	s, err := m.OpenOrCreate(1)
+	require.NoError(t, err)
+	t.Cleanup(s.Release)
+	_, done, err := s.use()
+	require.NoError(t, err)
+
+	removed := make(chan error, 1)
+	go func() { removed <- m.Remove(1) }()
+
+	// A negative assertion: nothing marks the moment a remove would wrongly return, so it
+	// is given a window, and fails the instant the remove returns inside it.
+	testutil.NoRecv(t, removed, 100*time.Millisecond, "the remove, while an operation is in flight")
+	done()
+
+	require.NoError(t, testutil.Recv(t, removed, "the remove"))
+	assert.NoFileExists(t, m.path(1))
+}
+
+// A replace session holds its file across pages, so one outliving a clear answers ErrClosed
+// rather than writing into a file the clear closed.
+func TestAReplaceSessionAfterAClearIsClosed(t *testing.T) {
+	m := NewManager(t.TempDir(), Retention{})
+	t.Cleanup(func() { require.NoError(t, m.Close()) })
+	s, err := m.OpenOrCreate(1)
+	require.NoError(t, err)
+	t.Cleanup(s.Release)
+	r, err := s.BeginReplace(podKind)
+	require.NoError(t, err)
+
+	require.NoError(t, m.Clear(1))
+
+	ctx := context.Background()
+	require.ErrorIs(t, r.WritePage(ctx, []*unstructured.Unstructured{pod("uid-1", "one", "1")}), ErrClosed)
+	_, err = r.Commit(ctx, "1")
+	require.ErrorIs(t, err, ErrClosed)
+}
+
 func TestApplyChangeWritesTheObjectAndAdvancesTheCookie(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t)

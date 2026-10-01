@@ -159,10 +159,11 @@ func newHolder(t *testing.T) *holder {
 	return h
 }
 
-// command opens the FIFO in the foreground and says "started" before the
-// sleep starts holding it, so the greeting is written before bash can exit.
+// command opens the FIFO, starts the sleep in the background, then says
+// "started" in the foreground, so the sleep is in bash's group before the
+// greeting and the greeting is written before bash can exit. tail follows.
 func (h *holder) command(tail string) string {
-	return "exec 3>" + h.path + "; echo started >&3; sleep 60 " + tail
+	return "exec 3>" + h.path + "; sleep 60 & echo started >&3" + tail
 }
 
 // awaitStarted reads the sleep's greeting.
@@ -185,7 +186,7 @@ func TestRunKillsTheGroupOnCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	res := make(chan result, 1)
-	go func() { res <- run(ctx, tl.spec(h.command("& wait"), 1024)) }()
+	go func() { res <- run(ctx, tl.spec(h.command("; wait"), 1024)) }()
 	h.awaitStarted(t)
 	cancel()
 	r := testutil.Recv(t, res, "the run to end")
@@ -199,7 +200,7 @@ func TestRunKillsTheGroupOnCancel(t *testing.T) {
 func TestRunKillsWhatACommandLeftBehind(t *testing.T) {
 	tl := tool(t)
 	h := newHolder(t)
-	r := run(t.Context(), tl.spec(h.command("&"), 1024))
+	r := run(t.Context(), tl.spec(h.command(""), 1024))
 	assert.Zero(t, r.ExitCode)
 	assert.Equal(t, stopNone, r.Stop)
 	h.awaitStarted(t)
@@ -349,7 +350,7 @@ func startStop(t *testing.T, trap string, killGrace time.Duration, before func(s
 	ctx, cancel := context.WithCancel(t.Context())
 	t.Cleanup(cancel)
 	st.cancel = cancel
-	s := tl.spec(trap+"; "+st.h.command("& wait"), 1024)
+	s := tl.spec(trap+"; "+st.h.command("; wait"), 1024)
 	s.killGrace = killGrace
 	s.hooks = hooks{
 		after:  st.clock.after,
@@ -528,6 +529,57 @@ func TestAPipeHeldPastTheGraceIsLetGo(t *testing.T) {
 	assert.Equal(t, stopNone, r.Stop)
 	assert.Equal(t, 0, r.ExitCode)
 	assert.Equal(t, "done\n", r.Output)
+}
+
+// A copy cut short by its deadline still takes what the pipe holds, though a
+// process outside the group keeps the write end open.
+func TestADrainTakesWhatThePipeHolds(t *testing.T) {
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = r.Close(); _ = w.Close() })
+	_, err = w.WriteString("left in the pipe\n")
+	require.NoError(t, err)
+	require.NoError(t, r.SetReadDeadline(time.Now()))
+
+	var out strings.Builder
+	drainPipe(&out, r)
+
+	assert.Equal(t, "left in the pipe\n", out.String())
+}
+
+// A file that takes no deadline is not drained.
+func TestADrainOfAFileWithNoDeadlineTakesNothing(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "out")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = f.Close() })
+	_, err = f.WriteString("not a pipe\n")
+	require.NoError(t, err)
+	_, err = f.Seek(0, io.SeekStart)
+	require.NoError(t, err)
+
+	var out strings.Builder
+	drainPipe(&out, f)
+
+	assert.Empty(t, out.String())
+}
+
+// A copy of a file that takes no deadline is cut short by closing the file.
+func TestACutCopyClosesAFileWithNoDeadline(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "out")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = f.Close() })
+	read, done := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(done)
+		awaitCopy(read, f, 0)
+	}()
+
+	require.Eventually(t, func() bool {
+		_, err := f.Stat()
+		return errors.Is(err, os.ErrClosed)
+	}, testutil.Timeout, time.Millisecond, "the cut to close the file")
+	close(read)
+	testutil.Wait(t, done, "the wait to end once the copy does")
 }
 
 // A stop that finds bash already collected by the OS, before the runner's own
