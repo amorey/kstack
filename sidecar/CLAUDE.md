@@ -17,6 +17,7 @@ sweeps it and removes it:
 ```
 <data>/                                what a user would lose
   app.db                               app
+  security.json                        app: the security settings
   beehive.db                           clustersvc
   settings.json, settings-queue.json   cloud
   chats/<chat id>/                     chatsvc: results/, tasks/, workspace/
@@ -80,12 +81,12 @@ that is what keeps cluster-controlled text from forging a line (`TestInitWritesO
 host](../docs/adr/2026-09-08-json-logs-rendered-by-the-host.md), [ADR: two processes, two log
 files](../docs/adr/2026-09-08-two-processes-two-log-files.md).
 
-- `internal/app/` builds `poke`, `kubeconfig`, opens `app.db`, builds `clustersvc`, `memorysvc` and `chatsvc` over it, `auth`, `cloud`, wires `graph.NewServer` + `grpcserver.NewServer`, and multiplexes both onto one h2c handler. `App.parts` is start order (app.db → poke → kubeconfig → cluster → cloud → memory → chat, then the shell snapshot when `ShellSnapshot` is set); stop and close reverse it. **kubeconfig before cluster is load-bearing** (`app_test.go` pins it). The transports stay out of the slice; `grpcServer.Stop()` runs first in `Close`.
+- `internal/app/` builds `poke`, `kubeconfig`, opens the security settings (`securityconfig.Open`, before `app.db`, since the store holds no handle) and `app.db`, builds `clustersvc`, `memorysvc` and `chatsvc` over it, `auth`, `cloud`, wires `graph.NewServer` + `grpcserver.NewServer`, and multiplexes both onto one h2c handler. `App.parts` is start order (app.db → poke → kubeconfig → cluster → cloud → memory → chat, then the shell snapshot when `ShellSnapshot` is set); stop and close reverse it. **kubeconfig before cluster is load-bearing** (`app_test.go` pins it). The transports stay out of the slice; `grpcServer.Stop()` runs first in `Close`.
 
   **`READY` promises a socket, not a finished startup.** `run` prints it after the bind and before `Start`; the first request is answered after `Start`, and every part completes its startup work inside `Start`. Everything that reads the environment does so after `main`'s shell import, which finishes before `run` — nothing sends before it, and `net/http` reads the proxy variables once per process on the first request.
-- `graph/` — `schema.graphqls`, generated code, resolvers, `server.go`. Resolver deps are non-nil; tests wire fakes.
+- `graph/` — `schema.graphqls`, generated code, resolvers, `server.go`. Resolver deps are non-nil; tests wire fakes. `Resolver.SecurityCfg` is the security settings store, named for what it holds since it is not a service; its one resolver is `securityRefused`.
 - `grpc/` — `AuthService`, `PokeService`, committed protoc output in `authpb/`, `pokepb/`. Regenerate with `make proto`; **never hand-edit `*.pb.go`**. `IsGRPCRequest` lives here.
-- `internal/` — `ipc`, `atomicjson`, `logging`, `safe` (an error rendered for a log line, and a command's output redacted: `Redact` line by line, `RedactJSON` a JSON text by its structure, for text that is one line with its newlines escaped; the field and flag rules read a credential's name off `credentialNames`, with or without the separator inside it, so camelCase keys match), `sqlitemigrate` (the migration runner, `Apply`), `sqlitepool` (the one home of the SQLite open contract: `OpenWriter` a store's one writer connection, `OpenReader` a reader pool, `OpenQuery` read-only connections through a caller's driver with none kept idle), `sqlstmt` (a store's statement table, prepared once on a file's writer and reader pools and routed per call: a `[]sqlstmt.Statement` indexed by the store's own id type, each entry its text and pool — `OnWriter`, `OnReader`, or `OnBoth` for a read some caller runs inside a write transaction; `Prepare[ID]` compiles it at open, since modernc caches nothing and a text handed to a pool at a call site is compiled every time; `Set.Stmts()` issues on the pools, `Set.InTx` inside one write transaction, `Set.InReadTx` inside one read-only transaction on the reader, always rolled back; inside a transaction the copy rebound, once per id, is the one prepared on that transaction's pool, and an id its pool does not hold panics; `Set.Close` finalizes the statements alone, and a closed set refuses `InTx`/`InReadTx` with `ErrClosed`, since `Tx.StmtContext` would quietly re-prepare a closed statement; imports nothing of ours; → [ADR: one statement set](../docs/adr/2026-09-16-sqlstmt-prepares-a-services-statements.md)), `appdb`, `rawjson`, `apimeta` (wire vocabulary no service owns — the delta-frame type, `ObjectID`, `ClusterID`, which `clustersvc` aliases, and `ChatID`, which `chatsvc` aliases and `memorysvc` and `tools.Runtime` name), `deltafold` (a watch's memory: `Snapshot`/`Diff`/`Upsert`/`Has` over a caller's key, equality and frame, plus `Send`; imports `apimeta` alone), `version` (`Version` is `dev` unless the linker stamped it: `scripts/build-sidecar.go` passes `-X …/internal/version.Version=$SIDECAR_VERSION` when set, `release.yml` sets it to the release version, and `main` logs it on the `sidecar starting` line; nothing reads a version from the environment or a file), `poke`, `kubeconfig`, `drain`, `lifecycle`, `loginshell`, `workqueue`, `supervisor`, `clustercard` (the cluster card a chat send will carry), `rootdir` (a directory opened and removed through an `os.Root`, under *Tools*), `sandbox` (the machine's sandbox and a run's forwarder, under *Tools*), `kubeproxy` (the cluster proxy a sandboxed run reaches its cluster through, under *Tools*), `memorysvc` (the notes a chat's cluster sees, below), `catalog` (the providers and the tools each is offered, below), `testutil` (test-only, imported by no production code), plus the subsystems below.
+- `internal/` — `ipc`, `atomicjson`, `logging`, `safe` (an error rendered for a log line, and a command's output redacted: `Redact` line by line, `RedactJSON` a JSON text by its structure, for text that is one line with its newlines escaped; the field and flag rules read a credential's name off `credentialNames`, with or without the separator inside it, so camelCase keys match), `sqlitemigrate` (the migration runner, `Apply`), `sqlitepool` (the one home of the SQLite open contract: `OpenWriter` a store's one writer connection, `OpenReader` a reader pool, `OpenQuery` read-only connections through a caller's driver with none kept idle), `sqlstmt` (a store's statement table, prepared once on a file's writer and reader pools and routed per call: a `[]sqlstmt.Statement` indexed by the store's own id type, each entry its text and pool — `OnWriter`, `OnReader`, or `OnBoth` for a read some caller runs inside a write transaction; `Prepare[ID]` compiles it at open, since modernc caches nothing and a text handed to a pool at a call site is compiled every time; `Set.Stmts()` issues on the pools, `Set.InTx` inside one write transaction, `Set.InReadTx` inside one read-only transaction on the reader, always rolled back; inside a transaction the copy rebound, once per id, is the one prepared on that transaction's pool, and an id its pool does not hold panics; `Set.Close` finalizes the statements alone, and a closed set refuses `InTx`/`InReadTx` with `ErrClosed`, since `Tx.StmtContext` would quietly re-prepare a closed statement; imports nothing of ours; → [ADR: one statement set](../docs/adr/2026-09-16-sqlstmt-prepares-a-services-statements.md)), `appdb`, `rawjson`, `apimeta` (wire vocabulary no service owns — the delta-frame type, `ObjectID`, `ClusterID`, which `clustersvc` aliases, and `ChatID`, which `chatsvc` aliases and `memorysvc` and `tools.Runtime` name), `deltafold` (a watch's memory: `Snapshot`/`Diff`/`Upsert`/`Has` over a caller's key, equality and frame, plus `Send`; imports `apimeta` alone), `version` (`Version` is `dev` unless the linker stamped it: `scripts/build-sidecar.go` passes `-X …/internal/version.Version=$SIDECAR_VERSION` when set, `release.yml` sets it to the release version, and `main` logs it on the `sidecar starting` line; nothing reads a version from the environment or a file), `poke`, `kubeconfig`, `drain`, `lifecycle`, `loginshell`, `workqueue`, `supervisor`, `clustercard` (the cluster card a chat send will carry), `rootdir` (a directory opened and removed through an `os.Root`, under *Tools*), `sandbox` (the machine's sandbox and a run's forwarder, under *Tools*), `kubeproxy` (the cluster proxy a sandboxed run reaches its cluster through, under *Tools*), `memorysvc` (the notes a chat's cluster sees, below), `securityconfig` (the security settings, below), `catalog` (the providers and the tools each is offered, below), `testutil` (test-only, imported by no production code), plus the subsystems below.
 
 ## gRPC + GraphQL over one socket (h2c)
 
@@ -3003,6 +3004,44 @@ it concurrently.
 | `ErrChatContextFull` | `ErrChatContextFull` | `KSTACK_CHAT_CONTEXT_FULL` |
 | `llm.ErrBadRequest` | `ErrValidationError` | `KSTACK_VALIDATION_ERROR` |
 | `llm.ErrModelUnavailable` | `ErrConflict` | `KSTACK_CONFLICT` |
+
+## Security settings (`internal/securityconfig`)
+
+**`<data>/security.json` is the security settings**, 0600 through `atomicjson`, in the data
+directory no sandboxed command reads, and never synced. `app.New` opens it on every platform;
+`Store` has `Get`, `Update`, `Subscribe` (a `gochan/watch` receiver, current on subscribe) and
+`Refused`. `Settings` has no fields yet: each step of the agent-security sequence adds its own,
+`omitempty` (`omitzero` for a struct), and names it in its spec.
+
+- **Every value crosses a JSON copy** (`clone`): `Get` and each send are copies, so a caller
+  never reaches the store's value; receivers share one delivery and treat it as read-only.
+- **Equal means the same file.** An `Update` that leaves the file's JSON as it is writes and
+  publishes nothing, so a nil slice swapped for an empty one is no change. The first write
+  that changes something creates the file; `Open` writes nothing.
+- **Decoding is per field, and a list per element.** `Open` reads the file as a JSON object and
+  decodes each key into the field `encoding/json` writes under it. One bad list element is refused
+  alone; any other value of the wrong type is refused whole, and the other fields load. A key no
+  field names is ignored and kept: every write puts it back as read, so an older Kstack's write
+  keeps a newer one's setting. Only a file that is not a JSON object, `null` included, fails
+  `Open`, naming the file.
+- **Every write stamps `schemaVersion`**: `schemaVersion` in `store.go`, or the file's own when a
+  newer Kstack wrote it, since this build cannot upgrade what it does not know. A step that
+  changes a field's layout bumps it and upgrades an older file in `Open`.
+- **A hand edit may cost a permission, never a restriction.** `strictest` (`check.go`) maps each
+  field that restricts to what sets it to its most restrictive state. A refusal on such a field
+  sets that state, never the zero value, and the store keeps the field's raw JSON, which every
+  `Update` writes back until one changes the field or names it in `fields` (its JSON key). The fix
+  can be the strictest state the field already answers, which changes nothing in memory, so a
+  Settings section's mutation names the field it writes. A field not listed only grants, and a
+  refused value of it is dropped.
+- **The read-back is `checks`** (`check.go`), one per field, each added by its field's step. A
+  check reads the value alone, removes what it refuses, and answers a `Refusal` (field, value,
+  reason in the user's words) for each. On `Open` every refused value is logged and kept for the
+  store's life in `Refused()`, which the `securityRefused` query serves. On `Update` a refusal is
+  the error (`Refusal` is an `error`), and nothing is written. `WithChecks` is the test seam that
+  swaps the list.
+- **The core is generic** (`store[T]`), so the tests run it over their own settings type before
+  `Settings` has a field.
 
 ## Auth / identity (`internal/auth`)
 

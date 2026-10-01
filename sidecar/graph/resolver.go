@@ -11,6 +11,7 @@ import (
 	"github.com/kstackhq/kstack/sidecar/internal/llm"
 	"github.com/kstackhq/kstack/sidecar/internal/memorysvc"
 	"github.com/kstackhq/kstack/sidecar/internal/sandbox"
+	"github.com/kstackhq/kstack/sidecar/internal/securityconfig"
 )
 
 // Resolver carries every operation's dependencies. Each field MUST be non-nil — the
@@ -35,4 +36,6 @@ type Resolver struct {
 	// Auth backs the authState query/watch and the login/logout mutations; it degrades
 	// internally when no cloud account is configured.
 	Auth auth.Service
+	// SecurityCfg is the security settings file.
+	SecurityCfg *securityconfig.Store
 }

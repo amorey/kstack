@@ -39,6 +39,7 @@ import (
 	"github.com/kstackhq/kstack/sidecar/internal/memorysvc"
 	"github.com/kstackhq/kstack/sidecar/internal/poke"
 	"github.com/kstackhq/kstack/sidecar/internal/sandbox"
+	"github.com/kstackhq/kstack/sidecar/internal/securityconfig"
 	"github.com/kstackhq/kstack/sidecar/internal/tools"
 	agenttool "github.com/kstackhq/kstack/sidecar/internal/tools/agent"
 	"github.com/kstackhq/kstack/sidecar/internal/tools/anthropicwebsearch"
@@ -134,10 +135,16 @@ func New(cfg Config) (*App, error) {
 	// context. Closing it ends every subscription, so it is the app's alone.
 	kubeconfigSvc := kubeconfig.New(cfg.KubeconfigPath, pokeSvc)
 
+	p := pathsOf(cfg)
+	// The security settings hold no handle, so a failure leaves nothing to close.
+	securityCfg, err := securityconfig.Open(p.SecurityFile)
+	if err != nil {
+		return nil, err
+	}
+
 	// The app owns app.db and hands it to every service that writes or watches it.
 	// The file opens right before the first of them, so an earlier constructor
 	// failing leaves nothing to close.
-	p := pathsOf(cfg)
 	db, err := appdb.Open(p.AppDBFile, appdb.DefaultSweepInterval)
 	if err != nil {
 		return nil, fmt.Errorf("open app database: %w", err)
@@ -204,6 +211,7 @@ func New(cfg Config) (*App, error) {
 		LLMSvc:        llmSvc,
 		SandboxStatus: sandboxStatus,
 		Auth:          authSvc,
+		SecurityCfg:   securityCfg,
 	})
 
 	grpcServer := grpcserver.NewServer(authSvc, pokeSvc)
