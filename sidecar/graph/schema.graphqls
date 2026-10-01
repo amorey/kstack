@@ -989,6 +989,15 @@ type Chat {
   updatedAt: Time!
   "Whether any run of the chat waits on the user: its answers' own, or an agent's under one of them."
   awaitingApproval: Boolean!
+  "Whether the user disabled the sandbox for this chat: its commands run outside it, each asking first."
+  sandboxDisabled: Boolean!
+}
+
+"Whether sandboxed Bash is offered on this machine. It is fixed for the sidecar's life, so this is a query and not a watch."
+type SandboxStatus {
+  available: Boolean!
+  "What the probe found, such as Seatbelt or bwrap at /usr/bin/bwrap, or why there is none, in the sidecar's words."
+  reason: String!
 }
 
 """
@@ -1231,8 +1240,6 @@ type CommandAction {
   background: Boolean!
   "Whether a sandbox confined the command."
   sandboxed: Boolean!
-  "Whether the call asked to run outside the sandbox."
-  outsideSandbox: Boolean!
 }
 
 "A read of a file, as the call named it."
@@ -1373,6 +1380,10 @@ type Query {
   "Every model the sidecar can answer with, in catalog order — the first entry is what a picker starts on. Fixed for the process's life, so this is a query and not a watch."
   models: [Model!]!
 
+  # --- Sandbox ---
+  "Whether this machine offers sandboxed Bash, and why."
+  sandbox: SandboxStatus!
+
   # --- Cluster ---
   "A single cluster by id; null if not tracked."
   cluster(id: ClusterID!): Cluster
@@ -1424,8 +1435,8 @@ type Mutation {
   clusterCachedKindSyncEnabledSet(id: ObjectID!, syncEnabled: Boolean!): ClusterCachedKind!
 
   # --- Chat ---
-  "Save a user message and start the assistant's turn. Returns the assistant's message as accepted, not as finished — the answer arrives on chatMessagesWatch. A null `chatID` creates the chat; a chat already running a turn is refused. `requestID` makes the send idempotent for as long as its chat lives, and a repeat is answered by that id alone: this call's `chatID`, `model`, `effort` and `content` are ignored. The key goes with the chat, so a repeat after its delete is a new send. A null `chatID` creates the chat in `mode` and under `clusterID`, which must name an existing cluster; otherwise both are ignored, and on a `requestID` replay they are ignored like `chatID` and `content`."
-  chatSend(chatID: ChatID, mode: ChatMode!, clusterID: ClusterID!, providerID: String!, modelID: String!, effort: String!, requestID: String!, content: String!): ChatMessage!
+  "Save a user message and start the assistant's turn. Returns the assistant's message as accepted, not as finished — the answer arrives on chatMessagesWatch. A null `chatID` creates the chat; a chat already running a turn is refused. `requestID` makes the send idempotent for as long as its chat lives, and a repeat is answered by that id alone: this call's `chatID`, `model`, `effort` and `content` are ignored. The key goes with the chat, so a repeat after its delete is a new send. A null `chatID` creates the chat in `mode` and under `clusterID`, which must name an existing cluster; otherwise both are ignored, and on a `requestID` replay they are ignored like `chatID` and `content`. `sandboxDisabled` is the chat's switch as the sender saw it, `false` for a chat the send creates; a send whose switch differs from the chat's is refused with `KSTACK_CHAT_SANDBOX_CHANGED`, and a replay ignores it too."
+  chatSend(chatID: ChatID, mode: ChatMode!, clusterID: ClusterID!, sandboxDisabled: Boolean!, providerID: String!, modelID: String!, effort: String!, requestID: String!, content: String!): ChatMessage!
 
   "Stop the in-flight turn, keeping the partial answer. Returns true; a no-op when nothing is running."
   chatCancel(chatID: ChatID!): Boolean!
@@ -1438,6 +1449,9 @@ type Mutation {
 
   "Retitle a chat. Returns the record it committed, whose `updatedAt` the rename moves."
   chatRename(id: ChatID!, title: String!): Chat!
+
+  "Switch a chat to run its commands outside the sandbox, each asking first, or back in it. Takes effect from the chat's next turn; what already started keeps running as it started. Leaves `updatedAt` alone. Refused with `KSTACK_VALIDATION_ERROR` on a machine with no sandbox. Returns the record it committed."
+  chatSandboxDisabledSet(id: ChatID!, sandboxDisabled: Boolean!): Chat!
 
   "Delete a chat and its messages. Instant and permanent — every window watching it sees the rows go. Deleting one already gone is not an error. Returns true."
   chatDelete(id: ChatID!): Boolean!

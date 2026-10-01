@@ -33,6 +33,7 @@ import (
 	"github.com/kstackhq/kstack/sidecar/internal/llm"
 	"github.com/kstackhq/kstack/sidecar/internal/rawjson"
 	"github.com/kstackhq/kstack/sidecar/internal/rootdir"
+	"github.com/kstackhq/kstack/sidecar/internal/sandbox"
 	"github.com/kstackhq/kstack/sidecar/internal/testutil"
 	"github.com/kstackhq/kstack/sidecar/internal/tools"
 )
@@ -929,7 +930,7 @@ func TestTheStartSweepMarksRunningTasksLost(t *testing.T) {
 	}
 	require.NoError(t, db.Close())
 
-	s, err := newService(openTestDB(t, dir), chatsDirIn(dir), fakeLLM(), noClusterCards, nil, testReaders, noLists)
+	s, err := newService(openTestDB(t, dir), chatsDirIn(dir), fakeLLM(), noClusterCards, nil, testReaders, noLists, sandbox.Status{})
 	require.NoError(t, err)
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
@@ -1108,7 +1109,7 @@ func TestASendThatCannotTakeItsNoticesIsRefused(t *testing.T) {
 	testutil.Wait(t, tk.done, "the row")
 	refuse(t, s, "UPDATE", "background_tasks")
 
-	_, err = s.Send(t.Context(), &first.ChatID, ModeChat, "1", "fake", "fake", "high", reqID("2"), "and?")
+	_, err = s.Send(t.Context(), &first.ChatID, ModeChat, "1", false, "fake", "fake", "high", reqID("2"), "and?")
 	require.ErrorContains(t, err, "mark notified")
 	msgs, err := s.transcript(t.Context(), first.ChatID)
 	require.NoError(t, err)

@@ -36,6 +36,7 @@ const ChatsWatchSubscription = graphql(`
         createdAt
         updatedAt
         awaitingApproval
+        sandboxDisabled
       }
     }
   }
@@ -75,7 +76,6 @@ const ChatMessagesWatchSubscription = graphql(`
               cwd
               background
               sandboxed
-              outsideSandbox
             }
             read {
               path

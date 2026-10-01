@@ -57,6 +57,7 @@ function Harness({ replaced = false, ...props }: Props & { replaced?: boolean })
         phase="live"
         last={null}
         onCreated={onCreated}
+        sandboxDisabled={false}
         {...props}
       />
       {/* The entry the composer writes into, which the transcript's Ask again reads. */}
@@ -135,6 +136,49 @@ beforeEach(() => {
 });
 
 describe('ChatComposer', () => {
+  const sandboxButton = () => screen.queryByRole('button', { name: /sandbox/i });
+
+  // The switch is the open chat's, and only where there is a sandbox to leave.
+  it('draws the sandbox switch for an open chat on a machine with a sandbox', () => {
+    const view = renderComposer({ sandboxAvailable: true, sandboxDisabled: true });
+    expect(sandboxButton()).toHaveTextContent('Outside the sandbox');
+
+    view.rerender({ sandboxAvailable: true, sandboxDisabled: undefined });
+    expect(sandboxButton()).toHaveTextContent('Sandboxed');
+    expect(sandboxButton()).toBeDisabled();
+
+    view.rerender({ sandboxAvailable: false, sandboxDisabled: false });
+    expect(sandboxButton()).toBeNull();
+    view.rerender({ sandboxAvailable: undefined, sandboxDisabled: false });
+    expect(sandboxButton()).toBeNull();
+  });
+
+  // A send reserves its turn under the switch as it is, so it waits for a switch
+  // in flight to land, and the switch holds still meanwhile.
+  it('holds Send while the sandbox switch is in flight', async () => {
+    renderComposer({ sandboxAvailable: true, sandboxDisabled: true, switching: true });
+    type('hello');
+    expect(button('Send')).toBeDisabled();
+    expect(sandboxButton()).toBeDisabled();
+    fireEvent.keyDown(box(), { key: 'Enter' });
+    expect(sendMock).not.toHaveBeenCalled();
+  });
+
+  it('hands a press of the switch to the pane', async () => {
+    const onSwitchSandbox = vi.fn();
+    renderComposer({ sandboxAvailable: true, sandboxDisabled: true, onSwitchSandbox });
+    await act(async () => {
+      fireEvent.click(sandboxButton()!);
+    });
+    expect(onSwitchSandbox).toHaveBeenCalledWith(false);
+  });
+
+  // A chat that has not started has no row to switch: it starts sandboxed.
+  it('draws no sandbox switch for a chat that has not started', () => {
+    renderComposer({ chatID: null, sandboxAvailable: true });
+    expect(sandboxButton()).toBeNull();
+  });
+
   it('sends the draft and clears the box', async () => {
     renderComposer();
     type('hello');
@@ -371,6 +415,38 @@ describe('ChatComposer', () => {
     expect(sendMock).toHaveBeenCalledTimes(2);
     expect(sendMock.mock.calls[1][0]).toEqual(sendMock.mock.calls[0][0]);
     expect(box()).toHaveValue('');
+  });
+
+  // The sidecar refuses a send whose switch differs from the chat's, so the send
+  // says which one the composer showed.
+  it('sends the switch it shows', async () => {
+    renderComposer({ sandboxAvailable: true, sandboxDisabled: true });
+    type('hello');
+    await click('Send');
+    expect(sendMock.mock.calls[0][0]).toMatchObject({ sandboxDisabled: true });
+  });
+
+  it('holds Send for an open chat until the list delivers its switch', () => {
+    renderComposer({ sandboxAvailable: true, sandboxDisabled: undefined });
+    type('hello');
+    expect(button('Send')).toBeDisabled();
+  });
+
+  it('starts a chat sandboxed', async () => {
+    renderComposer({ chatID: null, sandboxDisabled: undefined });
+    type('hello');
+    await click('Send');
+    expect(sendMock.mock.calls[0][0]).toMatchObject({ sandboxDisabled: false });
+  });
+
+  it('says when the switch changed under a send, and keeps the draft', async () => {
+    sendMock.mockResolvedValue(refused('KSTACK_CHAT_SANDBOX_CHANGED'));
+    renderComposer({ sandboxAvailable: true });
+    type('hello');
+    await click('Send');
+    expect(screen.getByText("This chat's sandbox switch changed. Check it, then send again.")).toBeInTheDocument();
+    expect(box()).toHaveValue('hello');
+    expect(button('Send')).toBeEnabled();
   });
 
   it('follows a retry that created the chat', async () => {

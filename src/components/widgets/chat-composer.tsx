@@ -33,8 +33,10 @@ import {
   DropdownMenuTrigger,
 } from '@kubetail/ui/elements/dropdown-menu';
 
+import { SandboxSwitch } from '@/components/widgets/sandbox-switch';
 import { graphql } from '@/gql';
 import type { AppMode } from '@/lib/app-mode';
+import { useAskAgainWhenLive } from '@/lib/ask-again-when-live';
 import type { Created } from '@/lib/chat-outbox';
 import { useChatOutbox } from '@/lib/chat-outbox';
 import { inFlight } from '@/lib/chats';
@@ -78,6 +80,13 @@ type ChatComposerProps = {
   onShowWaiting?: () => void;
   /** The first send from a null `chatID` created this chat. */
   onCreated?: (chatID: string) => void;
+  /** Whether the machine offers a sandbox. Undefined until the sidecar says. */
+  sandboxAvailable?: boolean;
+  /** The open chat's switch. Undefined until the list watch delivers the chat. */
+  sandboxDisabled?: boolean;
+  /** A switch is in flight. Send waits for it rather than send a switch about to change. */
+  switching?: boolean;
+  onSwitchSandbox?: (disabled: boolean) => void;
 };
 
 type Option = { value: string; label: string };
@@ -152,26 +161,14 @@ export function ChatComposer({
   lastAnswer,
   onShowWaiting,
   onCreated,
+  sandboxAvailable,
+  sandboxDisabled,
+  switching = false,
+  onSwitchSandbox = () => {},
 }: ChatComposerProps) {
   const { models, loaded, failed, retry: askAgainForModels } = useModels();
-  // The catalog is a query: nothing re-runs it when a sidecar that was unreachable
-  // comes back, and without a catalog there is no pick and nothing can be sent. So a
-  // failure is asked again for once per live watch — bounded, because asking clears
-  // the failure and the answer sets it, which unbounded is a request loop. Each time
-  // the watch goes live the chance comes back, that being the evidence the sidecar is
-  // answering again.
-  const live = phase === 'live';
-  const asked = useRef(false);
-  useEffect(() => {
-    if (!live) {
-      asked.current = false;
-      return;
-    }
-    if (failed && !asked.current) {
-      asked.current = true;
-      askAgainForModels();
-    }
-  }, [failed, live, askAgainForModels]);
+  // Without a catalog there is no pick and nothing can be sent.
+  useAskAgainWhenLive(failed, phase === 'live', askAgainForModels);
   // Seeded only once both things it depends on have answered: before the messages
   // watch's Bookmark the last answer is whichever row arrived first, and before the
   // catalog there is nothing to check a pick against.
@@ -226,6 +223,9 @@ export function ChatComposer({
   // A turn waiting on a command is as busy as one streaming: one turn per chat.
   const streaming = last !== null && inFlight(last.status);
   const settled = send.status === 'idle';
+  // What a send says the user saw. A chat that has not started has no row, and
+  // starts sandboxed.
+  const shownDisabled = chatID === null ? false : sandboxDisabled;
   // `streaming` is checked here as well as behind the Cancel button, so Enter refuses
   // for the same reason the button is not a Send: one turn per chat.
   // `picked` is the entry's own pick checked against the list, never a fallback
@@ -236,6 +236,8 @@ export function ChatComposer({
     picked !== null &&
     phase !== 'connecting' &&
     !streaming &&
+    !switching &&
+    shownDisabled !== undefined &&
     draft.trim() !== '';
   // All only once the watch they wait on has answered: a window at startup has not
   // failed to pick anything, and a catalog still in flight is not an empty one.
@@ -256,7 +258,7 @@ export function ChatComposer({
   };
 
   const onSend = () => {
-    if (canSend) follow(submit());
+    if (canSend && shownDisabled !== undefined) follow(submit(shownDisabled));
   };
 
   let action;
@@ -296,11 +298,14 @@ export function ChatComposer({
       }}
     >
       {/* Named for the model that refused, since another may still take the chat: the draft stays and Send stays open. */}
-      {refusal && (
+      {refusal?.kind === 'context-full' && (
         <p className="text-xs text-destructive">
           This chat is longer than {modelOf(models, refusal.model)?.label ?? refusal.model.id} can read. Pick a model
           that reads more, or start a new chat.
         </p>
+      )}
+      {refusal?.kind === 'sandbox-changed' && (
+        <p className="text-xs text-destructive">This chat&apos;s sandbox switch changed. Check it, then send again.</p>
       )}
       {onShowWaiting && (
         <p className="flex items-center gap-2 text-xs text-muted-foreground">
@@ -327,6 +332,10 @@ export function ChatComposer({
       />
       <div className="flex items-center justify-between gap-2">
         <div className="flex min-w-0 items-center gap-1">
+          {/* A chat that has not started has no row to switch: it starts sandboxed. */}
+          {chatID !== null && sandboxAvailable === true && (
+            <SandboxSwitch sandboxDisabled={sandboxDisabled} switching={switching} onSwitch={onSwitchSandbox} />
+          )}
           {pick && picked && (
             <>
               <Segment

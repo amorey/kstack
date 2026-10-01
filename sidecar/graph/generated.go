@@ -25,6 +25,7 @@ import (
 	"github.com/kstackhq/kstack/sidecar/internal/llm"
 	"github.com/kstackhq/kstack/sidecar/internal/memorysvc"
 	"github.com/kstackhq/kstack/sidecar/internal/rawjson"
+	"github.com/kstackhq/kstack/sidecar/internal/sandbox"
 	"github.com/kstackhq/kstack/sidecar/internal/tools"
 	gqlparser "github.com/vektah/gqlparser/v2"
 	"github.com/vektah/gqlparser/v2/ast"
@@ -73,6 +74,7 @@ type ComplexityRoot struct {
 		CreatedAt        func(childComplexity int) int
 		ID               func(childComplexity int) int
 		Mode             func(childComplexity int) int
+		SandboxDisabled  func(childComplexity int) int
 		Title            func(childComplexity int) int
 		UpdatedAt        func(childComplexity int) int
 	}
@@ -356,11 +358,10 @@ type ComplexityRoot struct {
 	}
 
 	CommandAction struct {
-		Background     func(childComplexity int) int
-		Cwd            func(childComplexity int) int
-		OutsideSandbox func(childComplexity int) int
-		Sandboxed      func(childComplexity int) int
-		Text           func(childComplexity int) int
+		Background func(childComplexity int) int
+		Cwd        func(childComplexity int) int
+		Sandboxed  func(childComplexity int) int
+		Text       func(childComplexity int) int
 	}
 
 	Condition struct {
@@ -456,7 +457,8 @@ type ComplexityRoot struct {
 		ChatCancel                      func(childComplexity int, chatID apimeta.ChatID) int
 		ChatDelete                      func(childComplexity int, id apimeta.ChatID) int
 		ChatRename                      func(childComplexity int, id apimeta.ChatID, title string) int
-		ChatSend                        func(childComplexity int, chatID *apimeta.ChatID, mode chatsvc.Mode, clusterID apimeta.ClusterID, providerID string, modelID string, effort string, requestID string, content string) int
+		ChatSandboxDisabledSet          func(childComplexity int, id apimeta.ChatID, sandboxDisabled bool) int
+		ChatSend                        func(childComplexity int, chatID *apimeta.ChatID, mode chatsvc.Mode, clusterID apimeta.ClusterID, sandboxDisabled bool, providerID string, modelID string, effort string, requestID string, content string) int
 		ClusterCacheClear               func(childComplexity int, id apimeta.ObjectID) int
 		ClusterCachedKindSyncEnabledSet func(childComplexity int, id apimeta.ObjectID, syncEnabled bool) int
 		ClusterConnectionRetry          func(childComplexity int, id apimeta.ClusterID) int
@@ -500,6 +502,7 @@ type ComplexityRoot struct {
 		ClusterCaches      func(childComplexity int, clusterID *apimeta.ClusterID) int
 		Clusters           func(childComplexity int) int
 		Models             func(childComplexity int) int
+		Sandbox            func(childComplexity int) int
 	}
 
 	ReadAction struct {
@@ -511,6 +514,11 @@ type ComplexityRoot struct {
 		ResourceNames func(childComplexity int) int
 		Resources     func(childComplexity int) int
 		Verbs         func(childComplexity int) int
+	}
+
+	SandboxStatus struct {
+		Available func(childComplexity int) int
+		Reason    func(childComplexity int) int
 	}
 
 	Schedule struct {
@@ -627,11 +635,12 @@ type MutationResolver interface {
 	ClusterDelete(ctx context.Context, id apimeta.ClusterID) (bool, error)
 	ClusterCacheClear(ctx context.Context, id apimeta.ObjectID) (*clustersvc.ClusterCache, error)
 	ClusterCachedKindSyncEnabledSet(ctx context.Context, id apimeta.ObjectID, syncEnabled bool) (*clustersvc.ClusterCachedKind, error)
-	ChatSend(ctx context.Context, chatID *apimeta.ChatID, mode chatsvc.Mode, clusterID apimeta.ClusterID, providerID string, modelID string, effort string, requestID string, content string) (*chatsvc.ChatMessage, error)
+	ChatSend(ctx context.Context, chatID *apimeta.ChatID, mode chatsvc.Mode, clusterID apimeta.ClusterID, sandboxDisabled bool, providerID string, modelID string, effort string, requestID string, content string) (*chatsvc.ChatMessage, error)
 	ChatCancel(ctx context.Context, chatID apimeta.ChatID) (bool, error)
 	ApprovalDecide(ctx context.Context, id chatsvc.ApprovalID, approve bool) (bool, error)
 	BackgroundTaskStop(ctx context.Context, id chatsvc.ToolCallID) (bool, error)
 	ChatRename(ctx context.Context, id apimeta.ChatID, title string) (*chatsvc.Chat, error)
+	ChatSandboxDisabledSet(ctx context.Context, id apimeta.ChatID, sandboxDisabled bool) (*chatsvc.Chat, error)
 	ChatDelete(ctx context.Context, id apimeta.ChatID) (bool, error)
 	MemorySave(ctx context.Context, input model.MemorySaveInput) (*memorysvc.Memory, error)
 	MemoryDelete(ctx context.Context, id memorysvc.MemoryID) (bool, error)
@@ -640,6 +649,7 @@ type MutationResolver interface {
 }
 type QueryResolver interface {
 	Models(ctx context.Context) ([]*model.Model, error)
+	Sandbox(ctx context.Context) (*sandbox.Status, error)
 	Cluster(ctx context.Context, id apimeta.ClusterID) (*clustersvc.Cluster, error)
 	Clusters(ctx context.Context) ([]*clustersvc.Cluster, error)
 	ClusterCache(ctx context.Context, id apimeta.ObjectID) (*clustersvc.ClusterCache, error)
@@ -750,6 +760,12 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 		}
 
 		return e.ComplexityRoot.Chat.Mode(childComplexity), true
+	case "Chat.sandboxDisabled":
+		if e.ComplexityRoot.Chat.SandboxDisabled == nil {
+			break
+		}
+
+		return e.ComplexityRoot.Chat.SandboxDisabled(childComplexity), true
 	case "Chat.title":
 		if e.ComplexityRoot.Chat.Title == nil {
 			break
@@ -1851,12 +1867,6 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 		}
 
 		return e.ComplexityRoot.CommandAction.Cwd(childComplexity), true
-	case "CommandAction.outsideSandbox":
-		if e.ComplexityRoot.CommandAction.OutsideSandbox == nil {
-			break
-		}
-
-		return e.ComplexityRoot.CommandAction.OutsideSandbox(childComplexity), true
 	case "CommandAction.sandboxed":
 		if e.ComplexityRoot.CommandAction.Sandboxed == nil {
 			break
@@ -2243,6 +2253,17 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 		}
 
 		return e.ComplexityRoot.Mutation.ChatRename(childComplexity, args["id"].(apimeta.ChatID), args["title"].(string)), true
+	case "Mutation.chatSandboxDisabledSet":
+		if e.ComplexityRoot.Mutation.ChatSandboxDisabledSet == nil {
+			break
+		}
+
+		args, err := ec.field_Mutation_chatSandboxDisabledSet_args(ctx, rawArgs)
+		if err != nil {
+			return 0, false
+		}
+
+		return e.ComplexityRoot.Mutation.ChatSandboxDisabledSet(childComplexity, args["id"].(apimeta.ChatID), args["sandboxDisabled"].(bool)), true
 	case "Mutation.chatSend":
 		if e.ComplexityRoot.Mutation.ChatSend == nil {
 			break
@@ -2253,7 +2274,7 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 			return 0, false
 		}
 
-		return e.ComplexityRoot.Mutation.ChatSend(childComplexity, args["chatID"].(*apimeta.ChatID), args["mode"].(chatsvc.Mode), args["clusterID"].(apimeta.ClusterID), args["providerID"].(string), args["modelID"].(string), args["effort"].(string), args["requestID"].(string), args["content"].(string)), true
+		return e.ComplexityRoot.Mutation.ChatSend(childComplexity, args["chatID"].(*apimeta.ChatID), args["mode"].(chatsvc.Mode), args["clusterID"].(apimeta.ClusterID), args["sandboxDisabled"].(bool), args["providerID"].(string), args["modelID"].(string), args["effort"].(string), args["requestID"].(string), args["content"].(string)), true
 	case "Mutation.clusterCacheClear":
 		if e.ComplexityRoot.Mutation.ClusterCacheClear == nil {
 			break
@@ -2498,6 +2519,12 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 		}
 
 		return e.ComplexityRoot.Query.Models(childComplexity), true
+	case "Query.sandbox":
+		if e.ComplexityRoot.Query.Sandbox == nil {
+			break
+		}
+
+		return e.ComplexityRoot.Query.Sandbox(childComplexity), true
 
 	case "ReadAction.path":
 		if e.ComplexityRoot.ReadAction.Path == nil {
@@ -2530,6 +2557,19 @@ func (e *executableSchema) Complexity(ctx context.Context, typeName, field strin
 		}
 
 		return e.ComplexityRoot.ResourceRule.Verbs(childComplexity), true
+
+	case "SandboxStatus.available":
+		if e.ComplexityRoot.SandboxStatus.Available == nil {
+			break
+		}
+
+		return e.ComplexityRoot.SandboxStatus.Available(childComplexity), true
+	case "SandboxStatus.reason":
+		if e.ComplexityRoot.SandboxStatus.Reason == nil {
+			break
+		}
+
+		return e.ComplexityRoot.SandboxStatus.Reason(childComplexity), true
 
 	case "Schedule.nextRequeueAt":
 		if e.ComplexityRoot.Schedule.NextRequeueAt == nil {
@@ -3052,6 +3092,8 @@ func (ec *executionContext) childFields_Chat(ctx context.Context, field graphql.
 		return ec.fieldContext_Chat_updatedAt(ctx, field)
 	case "awaitingApproval":
 		return ec.fieldContext_Chat_awaitingApproval(ctx, field)
+	case "sandboxDisabled":
+		return ec.fieldContext_Chat_sandboxDisabled(ctx, field)
 	}
 	return nil, fmt.Errorf("no field named %q was found under type Chat", field.Name)
 }
@@ -3622,8 +3664,6 @@ func (ec *executionContext) childFields_CommandAction(ctx context.Context, field
 		return ec.fieldContext_CommandAction_background(ctx, field)
 	case "sandboxed":
 		return ec.fieldContext_CommandAction_sandboxed(ctx, field)
-	case "outsideSandbox":
-		return ec.fieldContext_CommandAction_outsideSandbox(ctx, field)
 	}
 	return nil, fmt.Errorf("no field named %q was found under type CommandAction", field.Name)
 }
@@ -3864,6 +3904,16 @@ func (ec *executionContext) childFields_ResourceRule(ctx context.Context, field 
 		return ec.fieldContext_ResourceRule_resourceNames(ctx, field)
 	}
 	return nil, fmt.Errorf("no field named %q was found under type ResourceRule", field.Name)
+}
+
+func (ec *executionContext) childFields_SandboxStatus(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+	switch field.Name {
+	case "available":
+		return ec.fieldContext_SandboxStatus_available(ctx, field)
+	case "reason":
+		return ec.fieldContext_SandboxStatus_reason(ctx, field)
+	}
+	return nil, fmt.Errorf("no field named %q was found under type SandboxStatus", field.Name)
 }
 
 func (ec *executionContext) childFields_Schedule(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
@@ -4258,6 +4308,28 @@ func (ec *executionContext) field_Mutation_chatRename_args(ctx context.Context, 
 	return args, nil
 }
 
+func (ec *executionContext) field_Mutation_chatSandboxDisabledSet_args(ctx context.Context, rawArgs map[string]any) (map[string]any, error) {
+	var err error
+	args := map[string]any{}
+	arg0, err := graphql.ProcessArgField(ctx, rawArgs, "id",
+		func(ctx context.Context, v any) (apimeta.ChatID, error) {
+			return ec.unmarshalNChatID2githubᚗcomᚋkstackhqᚋkstackᚋsidecarᚋinternalᚋapimetaᚐChatID(ctx, v)
+		})
+	if err != nil {
+		return nil, err
+	}
+	args["id"] = arg0
+	arg1, err := graphql.ProcessArgField(ctx, rawArgs, "sandboxDisabled",
+		func(ctx context.Context, v any) (bool, error) {
+			return ec.unmarshalNBoolean2bool(ctx, v)
+		})
+	if err != nil {
+		return nil, err
+	}
+	args["sandboxDisabled"] = arg1
+	return args, nil
+}
+
 func (ec *executionContext) field_Mutation_chatSend_args(ctx context.Context, rawArgs map[string]any) (map[string]any, error) {
 	var err error
 	args := map[string]any{}
@@ -4285,46 +4357,54 @@ func (ec *executionContext) field_Mutation_chatSend_args(ctx context.Context, ra
 		return nil, err
 	}
 	args["clusterID"] = arg2
-	arg3, err := graphql.ProcessArgField(ctx, rawArgs, "providerID",
+	arg3, err := graphql.ProcessArgField(ctx, rawArgs, "sandboxDisabled",
+		func(ctx context.Context, v any) (bool, error) {
+			return ec.unmarshalNBoolean2bool(ctx, v)
+		})
+	if err != nil {
+		return nil, err
+	}
+	args["sandboxDisabled"] = arg3
+	arg4, err := graphql.ProcessArgField(ctx, rawArgs, "providerID",
 		func(ctx context.Context, v any) (string, error) {
 			return ec.unmarshalNString2string(ctx, v)
 		})
 	if err != nil {
 		return nil, err
 	}
-	args["providerID"] = arg3
-	arg4, err := graphql.ProcessArgField(ctx, rawArgs, "modelID",
+	args["providerID"] = arg4
+	arg5, err := graphql.ProcessArgField(ctx, rawArgs, "modelID",
 		func(ctx context.Context, v any) (string, error) {
 			return ec.unmarshalNString2string(ctx, v)
 		})
 	if err != nil {
 		return nil, err
 	}
-	args["modelID"] = arg4
-	arg5, err := graphql.ProcessArgField(ctx, rawArgs, "effort",
+	args["modelID"] = arg5
+	arg6, err := graphql.ProcessArgField(ctx, rawArgs, "effort",
 		func(ctx context.Context, v any) (string, error) {
 			return ec.unmarshalNString2string(ctx, v)
 		})
 	if err != nil {
 		return nil, err
 	}
-	args["effort"] = arg5
-	arg6, err := graphql.ProcessArgField(ctx, rawArgs, "requestID",
+	args["effort"] = arg6
+	arg7, err := graphql.ProcessArgField(ctx, rawArgs, "requestID",
 		func(ctx context.Context, v any) (string, error) {
 			return ec.unmarshalNString2string(ctx, v)
 		})
 	if err != nil {
 		return nil, err
 	}
-	args["requestID"] = arg6
-	arg7, err := graphql.ProcessArgField(ctx, rawArgs, "content",
+	args["requestID"] = arg7
+	arg8, err := graphql.ProcessArgField(ctx, rawArgs, "content",
 		func(ctx context.Context, v any) (string, error) {
 			return ec.unmarshalNString2string(ctx, v)
 		})
 	if err != nil {
 		return nil, err
 	}
-	args["content"] = arg7
+	args["content"] = arg8
 	return args, nil
 }
 
@@ -5138,6 +5218,29 @@ func (ec *executionContext) _Chat_awaitingApproval(ctx context.Context, field gr
 	)
 }
 func (ec *executionContext) fieldContext_Chat_awaitingApproval(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("Chat", field, false, false, errors.New("field of type Boolean does not have child fields"))
+}
+
+func (ec *executionContext) _Chat_sandboxDisabled(ctx context.Context, field graphql.CollectedField, obj *chatsvc.Chat) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_Chat_sandboxDisabled(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.SandboxDisabled, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v bool) graphql.Marshaler {
+			return ec.marshalNBoolean2bool(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_Chat_sandboxDisabled(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
 	return graphql.NewScalarFieldContext("Chat", field, false, false, errors.New("field of type Boolean does not have child fields"))
 }
 
@@ -9569,29 +9672,6 @@ func (ec *executionContext) fieldContext_CommandAction_sandboxed(_ context.Conte
 	return graphql.NewScalarFieldContext("CommandAction", field, false, false, errors.New("field of type Boolean does not have child fields"))
 }
 
-func (ec *executionContext) _CommandAction_outsideSandbox(ctx context.Context, field graphql.CollectedField, obj *tools.CommandAction) (ret graphql.Marshaler) {
-	return graphql.ResolveField(
-		ctx,
-		ec.OperationContext,
-		field,
-		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
-			return ec.fieldContext_CommandAction_outsideSandbox(ctx, field)
-		},
-		func(ctx context.Context) (any, error) {
-			return obj.OutsideSandbox, nil
-		},
-		nil,
-		func(ctx context.Context, selections ast.SelectionSet, v bool) graphql.Marshaler {
-			return ec.marshalNBoolean2bool(ctx, selections, v)
-		},
-		true,
-		true,
-	)
-}
-func (ec *executionContext) fieldContext_CommandAction_outsideSandbox(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
-	return graphql.NewScalarFieldContext("CommandAction", field, false, false, errors.New("field of type Boolean does not have child fields"))
-}
-
 func (ec *executionContext) _Condition_type(ctx context.Context, field graphql.CollectedField, obj *beehive.Condition) (ret graphql.Marshaler) {
 	return graphql.ResolveField(
 		ctx,
@@ -11064,7 +11144,7 @@ func (ec *executionContext) _Mutation_chatSend(ctx context.Context, field graphq
 		},
 		func(ctx context.Context) (any, error) {
 			fc := graphql.GetFieldContext(ctx)
-			return ec.Resolvers.Mutation().ChatSend(ctx, fc.Args["chatID"].(*apimeta.ChatID), fc.Args["mode"].(chatsvc.Mode), fc.Args["clusterID"].(apimeta.ClusterID), fc.Args["providerID"].(string), fc.Args["modelID"].(string), fc.Args["effort"].(string), fc.Args["requestID"].(string), fc.Args["content"].(string))
+			return ec.Resolvers.Mutation().ChatSend(ctx, fc.Args["chatID"].(*apimeta.ChatID), fc.Args["mode"].(chatsvc.Mode), fc.Args["clusterID"].(apimeta.ClusterID), fc.Args["sandboxDisabled"].(bool), fc.Args["providerID"].(string), fc.Args["modelID"].(string), fc.Args["effort"].(string), fc.Args["requestID"].(string), fc.Args["content"].(string))
 		},
 		nil,
 		func(ctx context.Context, selections ast.SelectionSet, v *chatsvc.ChatMessage) graphql.Marshaler {
@@ -11268,6 +11348,50 @@ func (ec *executionContext) fieldContext_Mutation_chatRename(ctx context.Context
 	}()
 	ctx = graphql.WithFieldContext(ctx, fc)
 	if fc.Args, err = ec.field_Mutation_chatRename_args(ctx, field.ArgumentMap(ec.Variables)); err != nil {
+		ec.Error(ctx, err)
+		return fc, err
+	}
+	return fc, nil
+}
+
+func (ec *executionContext) _Mutation_chatSandboxDisabledSet(ctx context.Context, field graphql.CollectedField) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_Mutation_chatSandboxDisabledSet(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			fc := graphql.GetFieldContext(ctx)
+			return ec.Resolvers.Mutation().ChatSandboxDisabledSet(ctx, fc.Args["id"].(apimeta.ChatID), fc.Args["sandboxDisabled"].(bool))
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v *chatsvc.Chat) graphql.Marshaler {
+			return ec.marshalNChat2ᚖgithubᚗcomᚋkstackhqᚋkstackᚋsidecarᚋinternalᚋchatsvcᚐChat(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_Mutation_chatSandboxDisabledSet(ctx context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	fc = &graphql.FieldContext{
+		Object:     "Mutation",
+		Field:      field,
+		IsMethod:   true,
+		IsResolver: true,
+		Child: func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.childFields_Chat(ctx, field)
+		},
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			err = ec.Recover(ctx, r)
+			ec.Error(ctx, err)
+		}
+	}()
+	ctx = graphql.WithFieldContext(ctx, fc)
+	if fc.Args, err = ec.field_Mutation_chatSandboxDisabledSet_args(ctx, field.ArgumentMap(ec.Variables)); err != nil {
 		ec.Error(ctx, err)
 		return fc, err
 	}
@@ -11732,6 +11856,38 @@ func (ec *executionContext) fieldContext_Query_models(_ context.Context, field g
 		IsResolver: true,
 		Child: func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
 			return ec.childFields_Model(ctx, field)
+		},
+	}
+	return fc, nil
+}
+
+func (ec *executionContext) _Query_sandbox(ctx context.Context, field graphql.CollectedField) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_Query_sandbox(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return ec.Resolvers.Query().Sandbox(ctx)
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v *sandbox.Status) graphql.Marshaler {
+			return ec.marshalNSandboxStatus2ᚖgithubᚗcomᚋkstackhqᚋkstackᚋsidecarᚋinternalᚋsandboxᚐStatus(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_Query_sandbox(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	fc = &graphql.FieldContext{
+		Object:     "Query",
+		Field:      field,
+		IsMethod:   true,
+		IsResolver: true,
+		Child: func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.childFields_SandboxStatus(ctx, field)
 		},
 	}
 	return fc, nil
@@ -12210,6 +12366,52 @@ func (ec *executionContext) _ResourceRule_resourceNames(ctx context.Context, fie
 }
 func (ec *executionContext) fieldContext_ResourceRule_resourceNames(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
 	return graphql.NewScalarFieldContext("ResourceRule", field, false, false, errors.New("field of type String does not have child fields"))
+}
+
+func (ec *executionContext) _SandboxStatus_available(ctx context.Context, field graphql.CollectedField, obj *sandbox.Status) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_SandboxStatus_available(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.Available, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v bool) graphql.Marshaler {
+			return ec.marshalNBoolean2bool(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_SandboxStatus_available(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("SandboxStatus", field, false, false, errors.New("field of type Boolean does not have child fields"))
+}
+
+func (ec *executionContext) _SandboxStatus_reason(ctx context.Context, field graphql.CollectedField, obj *sandbox.Status) (ret graphql.Marshaler) {
+	return graphql.ResolveField(
+		ctx,
+		ec.OperationContext,
+		field,
+		func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+			return ec.fieldContext_SandboxStatus_reason(ctx, field)
+		},
+		func(ctx context.Context) (any, error) {
+			return obj.Reason, nil
+		},
+		nil,
+		func(ctx context.Context, selections ast.SelectionSet, v string) graphql.Marshaler {
+			return ec.marshalNString2string(ctx, selections, v)
+		},
+		true,
+		true,
+	)
+}
+func (ec *executionContext) fieldContext_SandboxStatus_reason(_ context.Context, field graphql.CollectedField) (fc *graphql.FieldContext, err error) {
+	return graphql.NewScalarFieldContext("SandboxStatus", field, false, false, errors.New("field of type String does not have child fields"))
 }
 
 func (ec *executionContext) _Schedule_nextRequeueAt(ctx context.Context, field graphql.CollectedField, obj *clustersvc.Schedule) (ret graphql.Marshaler) {
@@ -15011,6 +15213,11 @@ func (ec *executionContext) _Chat(ctx context.Context, sel ast.SelectionSet, obj
 			if out.Values[i] == graphql.Null {
 				out.Invalids++
 			}
+		case "sandboxDisabled":
+			out.Values[i] = ec._Chat_sandboxDisabled(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				out.Invalids++
+			}
 		default:
 			panic("unknown field " + strconv.Quote(field.Name))
 		}
@@ -17531,11 +17738,6 @@ func (ec *executionContext) _CommandAction(ctx context.Context, sel ast.Selectio
 			if out.Values[i] == graphql.Null {
 				out.Invalids++
 			}
-		case "outsideSandbox":
-			out.Values[i] = ec._CommandAction_outsideSandbox(ctx, field, obj)
-			if out.Values[i] == graphql.Null {
-				out.Invalids++
-			}
 		default:
 			panic("unknown field " + strconv.Quote(field.Name))
 		}
@@ -18302,6 +18504,13 @@ func (ec *executionContext) _Mutation(ctx context.Context, sel ast.SelectionSet)
 			if out.Values[i] == graphql.Null {
 				out.Invalids++
 			}
+		case "chatSandboxDisabledSet":
+			out.Values[i] = ec.OperationContext.RootResolverMiddleware(innerCtx, func(ctx context.Context) (res graphql.Marshaler) {
+				return ec._Mutation_chatSandboxDisabledSet(ctx, field)
+			})
+			if out.Values[i] == graphql.Null {
+				out.Invalids++
+			}
 		case "chatDelete":
 			out.Values[i] = ec.OperationContext.RootResolverMiddleware(innerCtx, func(ctx context.Context) (res graphql.Marshaler) {
 				return ec._Mutation_chatDelete(ctx, field)
@@ -18587,6 +18796,28 @@ func (ec *executionContext) _Query(ctx context.Context, sel ast.SelectionSet) gr
 			}
 
 			out.Concurrently(i, func(ctx context.Context) graphql.Marshaler { return rrm(innerCtx) })
+		case "sandbox":
+			field := field
+
+			innerFunc := func(ctx context.Context, fs *graphql.FieldSet) (res graphql.Marshaler) {
+				defer func() {
+					if r := recover(); r != nil {
+						ec.Error(ctx, ec.Recover(ctx, r))
+					}
+				}()
+				res = ec._Query_sandbox(ctx, field)
+				if res == graphql.Null {
+					atomic.AddUint32(&fs.Invalids, 1)
+				}
+				return res
+			}
+
+			rrm := func(ctx context.Context) graphql.Marshaler {
+				return ec.OperationContext.RootResolverMiddleware(ctx,
+					func(ctx context.Context) graphql.Marshaler { return innerFunc(ctx, out) })
+			}
+
+			out.Concurrently(i, func(ctx context.Context) graphql.Marshaler { return rrm(innerCtx) })
 		case "cluster":
 			field := field
 
@@ -18843,6 +19074,49 @@ func (ec *executionContext) _ResourceRule(ctx context.Context, sel ast.Selection
 			}
 		case "resourceNames":
 			out.Values[i] = ec._ResourceRule_resourceNames(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				out.Invalids++
+			}
+		default:
+			panic("unknown field " + strconv.Quote(field.Name))
+		}
+	}
+	out.Dispatch(ctx)
+	if out.Invalids > 0 {
+		return graphql.Null
+	}
+
+	atomic.AddInt32(&ec.Deferred, int32(min(len(deferLabelToView), math.MaxInt32)))
+
+	ec.ProcessDeferredGroup(graphql.DeferredGroup{
+		Defers:   deferLabelToView,
+		Path:     graphql.GetPath(ctx),
+		FieldSet: deferredFieldSet,
+		Context:  ctx,
+	})
+
+	return out
+}
+
+var sandboxStatusImplementors = []string{"SandboxStatus"}
+
+func (ec *executionContext) _SandboxStatus(ctx context.Context, sel ast.SelectionSet, obj *sandbox.Status) graphql.Marshaler {
+	fields := graphql.CollectFields(ec.OperationContext, sel, sandboxStatusImplementors)
+
+	out := graphql.NewFieldSet(fields)
+	deferredFieldSet := graphql.NewFieldSet(nil)
+	deferLabelToView := make(map[string]*graphql.FieldSetView)
+	for i, field := range fields {
+		switch field.Name {
+		case "__typename":
+			out.Values[i] = graphql.MarshalString("SandboxStatus")
+		case "available":
+			out.Values[i] = ec._SandboxStatus_available(ctx, field, obj)
+			if out.Values[i] == graphql.Null {
+				out.Invalids++
+			}
+		case "reason":
+			out.Values[i] = ec._SandboxStatus_reason(ctx, field, obj)
 			if out.Values[i] == graphql.Null {
 				out.Invalids++
 			}
@@ -20705,6 +20979,16 @@ func (ec *executionContext) marshalNResourceRule2ᚖgithubᚗcomᚋkstackhqᚋks
 		return graphql.Null
 	}
 	return ec._ResourceRule(ctx, sel, v)
+}
+
+func (ec *executionContext) marshalNSandboxStatus2ᚖgithubᚗcomᚋkstackhqᚋkstackᚋsidecarᚋinternalᚋsandboxᚐStatus(ctx context.Context, sel ast.SelectionSet, v *sandbox.Status) graphql.Marshaler {
+	if v == nil {
+		if !graphql.HasFieldError(ctx, graphql.GetFieldContext(ctx)) {
+			graphql.AddErrorf(ctx, "the requested element is null which the schema does not allow")
+		}
+		return graphql.Null
+	}
+	return ec._SandboxStatus(ctx, sel, v)
 }
 
 func (ec *executionContext) marshalNSchedule2ᚖgithubᚗcomᚋkstackhqᚋkstackᚋsidecarᚋinternalᚋclustersvcᚐSchedule(ctx context.Context, sel ast.SelectionSet, v *clustersvc.Schedule) graphql.Marshaler {

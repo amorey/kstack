@@ -17,6 +17,7 @@ import (
 	"github.com/kstackhq/kstack/sidecar/internal/clustersvc"
 	"github.com/kstackhq/kstack/sidecar/internal/llm"
 	"github.com/kstackhq/kstack/sidecar/internal/memorysvc"
+	"github.com/kstackhq/kstack/sidecar/internal/sandbox"
 )
 
 // Thinking is the resolver for the thinking field: what the message's blocks hold
@@ -180,8 +181,8 @@ func (r *mutationResolver) ClusterCachedKindSyncEnabledSet(ctx context.Context, 
 // ChatSend is the resolver for the chatSend field. The cluster is the chat service's
 // to check, inside the send's transaction, so a send and a cluster delete are
 // serialized where they meet.
-func (r *mutationResolver) ChatSend(ctx context.Context, chatID *apimeta.ChatID, mode chatsvc.Mode, clusterID apimeta.ClusterID, providerID string, modelID string, effort string, requestID string, content string) (*chatsvc.ChatMessage, error) {
-	msg, err := r.ChatSvc.Send(ctx, chatID, mode, clusterID, providerID, modelID, effort, requestID, content)
+func (r *mutationResolver) ChatSend(ctx context.Context, chatID *apimeta.ChatID, mode chatsvc.Mode, clusterID apimeta.ClusterID, sandboxDisabled bool, providerID string, modelID string, effort string, requestID string, content string) (*chatsvc.ChatMessage, error) {
+	msg, err := r.ChatSvc.Send(ctx, chatID, mode, clusterID, sandboxDisabled, providerID, modelID, effort, requestID, content)
 	if err != nil {
 		return nil, chatErr(err)
 	}
@@ -217,6 +218,15 @@ func (r *mutationResolver) BackgroundTaskStop(ctx context.Context, id chatsvc.To
 // ChatRename is the resolver for the chatRename field.
 func (r *mutationResolver) ChatRename(ctx context.Context, id apimeta.ChatID, title string) (*chatsvc.Chat, error) {
 	chat, err := r.ChatSvc.Rename(ctx, id, title)
+	if err != nil {
+		return nil, chatErr(err)
+	}
+	return &chat, nil
+}
+
+// ChatSandboxDisabledSet is the resolver for the chatSandboxDisabledSet field.
+func (r *mutationResolver) ChatSandboxDisabledSet(ctx context.Context, id apimeta.ChatID, sandboxDisabled bool) (*chatsvc.Chat, error) {
+	chat, err := r.ChatSvc.SetSandboxDisabled(ctx, id, sandboxDisabled)
 	if err != nil {
 		return nil, chatErr(err)
 	}
@@ -293,6 +303,11 @@ func (r *queryResolver) Models(ctx context.Context) ([]*model.Model, error) {
 		}
 	}
 	return out, nil
+}
+
+// Sandbox is the resolver for the sandbox field.
+func (r *queryResolver) Sandbox(ctx context.Context) (*sandbox.Status, error) {
+	return &r.Resolver.SandboxStatus, nil
 }
 
 // Cluster is the resolver for the cluster field. An id naming nothing is null per the

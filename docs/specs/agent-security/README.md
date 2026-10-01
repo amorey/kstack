@@ -107,12 +107,12 @@ it holds; a later spec uses it by name. Go paths are under `sidecar/internal/`.
 **The record.** `approvals` is the one table a prompt writes: a call's own (`kind: call`) and,
 from step 4B, any classified action (`kind: action`, carried to the user as a
 `tools.ActionRequest` through the runtime's `ActionAsker`), with the decision's duration.
-`tool_calls.sandboxed` stays what it is. `conversations.outside_sandbox` is step 1B's switch.
+`tool_calls.sandboxed` stays what it is. `conversations.sandbox_disabled` is step 1B's switch.
 
 **The wire.** `approvalDecide` takes the decision. Settings are read and written through
 queries and mutations named `sandbox…`, `permission…`, `credential…`, `network…`, `folder…`,
 `egress…`, `monitor…` and `proposal…`, each introduced by the step that needs it; the chat's
-switch is `chatOutsideSandboxSet`. An enum's members are spelled as the schema's are, in
+switch is `chatSandboxDisabledSet`. An enum's members are spelled as the schema's are, in
 PascalCase (`Pending`, `Bookmark`).
 
 **The webview.** The request is `ApprovalRequest` in `chat-transcript.tsx`. The Settings dialog
@@ -126,7 +126,7 @@ gains one section per step that has settings, each its own component beside
 | Spec | Step | After it |
 | --- | --- | --- |
 | 1A | **The sandbox policy.** What a run may read and write becomes one `Policy`: Read, Write and Deny rules, and an `Always` part for the denied-always list and Kstack's directories, which no rule opens. Linux and macOS each compile it, and one table of cases pins that both answer alike. No behavior changes. **Landed**; `sidecar/CLAUDE.md` describes it. | Any access decision can be explained from the policy, and granting `~` cannot expose `~/.ssh`. |
-| [1B](1b-outside-the-sandbox-is-the-users-choice.md) | **Outside the sandbox is the user's choice.** The model's `dangerouslyDisableSandbox` flag goes. A per-chat switch, off by default, runs that chat's commands outside the sandbox, each asking as today. | No chain of approvals leaves the sandbox; the user does, for one chat, on purpose. |
+| 1B | **Outside the sandbox is the user's choice.** The model's `dangerouslyDisableSandbox` flag goes. A per-chat switch, off by default, runs that chat's commands outside the sandbox, each asking as today. **Landed**; the root and `sidecar/` `CLAUDE.md` describe it. | No chain of approvals leaves the sandbox; the user does, for one chat, on purpose. |
 | [1C](1c-the-settings-file.md) | **The settings file.** `sandboxconfig` and `<data>/sandbox.json`: the store every later setting lives in, with no fields yet, opened on every platform. | Every setting of the sandbox, the proxies and the permissions has one home no sandboxed command reads. |
 | [1D](1d-credentials-from-the-users-tools.md) | **Credentials from the user's tools.** The `credentials` package: each provider's credential borrowed through the tool's own command on the host, cached in memory to expiry, never written to disk; what was discovered; each provider's status. | Every proxy has one place to borrow a credential from, and the sandbox never sees one. |
 

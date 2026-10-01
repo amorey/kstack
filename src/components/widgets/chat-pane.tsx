@@ -24,10 +24,13 @@ import { ChatTranscript } from '@/components/widgets/chat-transcript';
 import { useActiveCluster } from '@/lib/active-cluster';
 import { useActiveKubeContext } from '@/lib/active-kube-context';
 import type { AppMode } from '@/lib/app-mode';
+import { useAskAgainWhenLive } from '@/lib/ask-again-when-live';
 import { useChatOutbox } from '@/lib/chat-outbox';
 import { useChatMessages, useChats, waitingRequestsOf } from '@/lib/chats';
 import type { ChatMessage } from '@/lib/chats';
 import { useClusters } from '@/lib/clusters';
+import { useSandbox } from '@/lib/sandbox';
+import { useSandboxSwitch } from '@/lib/sandbox-switch';
 
 type NewChatPaneProps = {
   mode: AppMode;
@@ -105,10 +108,16 @@ function OpenChat({ chatID, mode, onGone }: ChatPaneProps) {
   const { messages, phase: messagesPhase } = useChatMessages(chatID);
   const { moveDraft } = useChatOutbox(mode, chatID);
   const { clusterID, phase: clusterPhase } = useActiveCluster();
+  const sandbox = useSandbox();
   // The clusters watch is one more thing the pane waits on: the window's cluster is
   // what says whether this chat is in scope, and an unanswered watch names none.
   const phase = listPhase === 'connecting' || clusterPhase === 'connecting' ? 'connecting' : messagesPhase;
+  // Without the answer the switch stays hidden.
+  useAskAgainWhenLive(sandbox.failed, phase === 'live', sandbox.retry);
   const chat = chats.find((c) => c.id === chatID);
+  // Held here, since the composer's Send and the transcript's Ask again both wait
+  // for a switch in flight.
+  const { switching, setSandboxDisabled } = useSandboxSwitch(chatID, chat?.sandboxDisabled);
   const waiting = firstWaitingEarlier(messages);
 
   // Absence is gated on the list's Bookmark: before it, an id the map does not hold
@@ -137,7 +146,16 @@ function OpenChat({ chatID, mode, onGone }: ChatPaneProps) {
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      <ChatTranscript messages={messages} phase={phase} chatID={chatID} mode={mode} clusterID={chat?.clusterID} />
+      <ChatTranscript
+        messages={messages}
+        phase={phase}
+        chatID={chatID}
+        mode={mode}
+        clusterID={chat?.clusterID}
+        sandboxAvailable={sandbox.available}
+        sandboxDisabled={chat?.sandboxDisabled}
+        switching={switching}
+      />
       {/* The chat's own cluster, so a send into it needs no active one. */}
       <ChatComposer
         chatID={chatID}
@@ -146,6 +164,10 @@ function OpenChat({ chatID, mode, onGone }: ChatPaneProps) {
         phase={phase}
         last={messages.at(-1) ?? null}
         lastAnswer={messages.filter((m) => m.role === 'Assistant').at(-1) ?? null}
+        sandboxAvailable={sandbox.available}
+        sandboxDisabled={chat?.sandboxDisabled}
+        switching={switching}
+        onSwitchSandbox={setSandboxDisabled}
         onShowWaiting={
           waiting
             ? () => document.getElementById(approvalAnchor(waiting))?.scrollIntoView({ block: 'center' })
