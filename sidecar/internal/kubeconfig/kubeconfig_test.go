@@ -282,8 +282,11 @@ func TestRepointedSymlinkFollowsToTheNewTarget(t *testing.T) {
 	moved := filepath.Join(elsewhere, "config")
 	writeKubeconfig(t, moved, "work")
 
-	require.NoError(t, os.Remove(link))
-	require.NoError(t, os.Symlink(moved, link))
+	// Swapped in by rename: a remove-then-link leaves a moment with no kubeconfig,
+	// and a poll landing in it publishes the empty config ahead of "work".
+	tmp := link + ".tmp"
+	require.NoError(t, os.Symlink(moved, tmp))
+	require.NoError(t, os.Rename(tmp, link))
 	require.Contains(t, testutil.Recv(t, sub.Chan(), "the config after re-pointing").Contexts, "work")
 
 	// The claim: the new target is followed from here on, not just at the moment of the
@@ -418,8 +421,12 @@ func TestKubeconfigEnvChainIsMergedAndWatched(t *testing.T) {
 	require.Contains(t, cfg.Contexts, "laptop", "both files merge")
 
 	// The second file lives in its own directory, so this only arrives if the whole
-	// chain is watched rather than the first entry.
-	writeKubeconfig(t, personal, "laptop", "staging")
+	// chain is watched rather than the first entry. Replaced by rename: written in
+	// place, the file is empty for a moment, and with the first file's contexts beside
+	// it that window publishes as a config without "laptop".
+	tmp := personal + ".tmp"
+	writeKubeconfig(t, tmp, "laptop", "staging")
+	require.NoError(t, os.Rename(tmp, personal))
 
 	assert.Contains(t, testutil.Recv(t, sub.Chan(), "the config after editing the second file").Contexts, "staging")
 }
