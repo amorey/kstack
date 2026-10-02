@@ -14,7 +14,16 @@
 
 package bash
 
-import "strings"
+import (
+	"io"
+	"os"
+	"path/filepath"
+	"regexp"
+	"runtime"
+	"strings"
+
+	"github.com/kstackhq/kstack/sidecar/internal/tools/internal/fileguard"
+)
 
 // outsideEnv is a run's environment outside the sandbox: the process's whole,
 // then what Kstack adds, then PWD. exec sets PWD from Dir only when Env is nil;
@@ -28,34 +37,104 @@ func outsideEnv(environ, kstack []string, dir string) []string {
 	return append(env, "PWD="+dir)
 }
 
-// sandboxedRunEnv is a sandboxed run's environment, built rather than inherited,
-// so no credential rides in: PATH, LANG and every LC_* from the process's;
-// HOME the workspace and PWD the start directory; ZDOTDIR the run's directory,
-// made for the run and so holding no startup file, so zsh -c never sources a
-// .zshenv a command left in the workspace; TMPDIR the run's own, in the cache;
-// KUBECONFIG and KUBECACHEDIR for a run with a cluster (cluster not nil);
-// TERM=dumb; and what Kstack adds.
-func sandboxedRunEnv(environ, kstack []string, workspace, dir string, rd *runDir, cluster *target) []string {
-	var path string
-	var locale []string
+// sandboxedRunEnv is a sandboxed run's environment, built from one table so
+// nothing of the sidecar's rides in but PATH, LANG and TZ: HOME the workspace
+// and PWD the start directory; TMPDIR the run's own, in the cache; ZDOTDIR
+// the run's directory, made for the run and so holding no startup file, so
+// zsh -c never sources a .zshenv a command left in the workspace; KUBECONFIG
+// and KUBECACHEDIR for a run with a cluster (cluster not nil); LANG the
+// sidecar's or the platform's default; TERM=dumb; then the variables that
+// point each tool into toolHome; then toolchain, each found location's
+// variables and asdf's versions; then what Kstack adds.
+func sandboxedRunEnv(environ, kstack []string, workspace, dir string, rd *runDir, cluster *target, toolHome string, toolchain []string) []string {
+	var path, lang, tz string
 	for _, kv := range environ {
-		name, _, _ := strings.Cut(kv, "=")
-		switch {
-		case name == "PATH":
-			path = kv
-		case name == "LANG" || strings.HasPrefix(name, "LC_"):
-			locale = append(locale, kv)
+		name, value, _ := strings.Cut(kv, "=")
+		switch name {
+		case "PATH":
+			path = value
+		case "LANG":
+			lang = value
+		case "TZ":
+			tz = value
 		}
 	}
 	var env []string
 	if path != "" {
-		env = append(env, path)
+		env = append(env, "PATH="+path)
 	}
-	env = append(env, "HOME="+workspace, "PWD="+dir, "ZDOTDIR="+rd.path, "TMPDIR="+rd.tmp)
+	env = append(env, "HOME="+workspace, "PWD="+dir, "TMPDIR="+rd.tmp, "ZDOTDIR="+rd.path)
 	if cluster != nil {
 		env = append(env, "KUBECONFIG="+rd.kubeconfig(), "KUBECACHEDIR="+cluster.cacheDir)
 	}
-	env = append(env, locale...)
+	if lang == "" {
+		lang = defaultLang(runtime.GOOS, fileExists)
+	}
+	env = append(env, "LANG="+lang)
+	if tz != "" {
+		env = append(env, "TZ="+tz)
+	}
 	env = append(env, "TERM=dumb")
+	env = append(env, toolHomeEnv(toolHome)...)
+	env = append(env, toolchain...)
 	return append(env, kstack...)
+}
+
+// defaultLang is LANG for a run whose sidecar has none: en_US.UTF-8 on
+// macOS, which always has it; on Linux C.UTF-8 where the system has that
+// locale, else C.
+func defaultLang(goos string, exists func(string) bool) string {
+	switch {
+	case goos == "darwin":
+		return "en_US.UTF-8"
+	case exists("/usr/lib/locale/C.utf8") || exists("/usr/lib/locale/C.UTF-8"):
+		return "C.UTF-8"
+	}
+	return "C"
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+// toolVersionsLimit is the most of ~/.tool-versions read.
+const toolVersionsLimit = 64 << 10
+
+// toolVersions is asdf's global versions, read from the user's
+// ~/.tool-versions as parseToolVersions reads them. asdf reads them from
+// $HOME, which in the sandbox is the workspace, so they ride as variables.
+// Anything but a plain file holds none.
+func toolVersions(home string) []string {
+	f, err := fileguard.Open(filepath.Join(home, ".tool-versions"))
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	text, err := io.ReadAll(io.LimitReader(f, toolVersionsLimit))
+	if err != nil {
+		return nil
+	}
+	return parseToolVersions(string(text))
+}
+
+var (
+	asdfTool    = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)
+	asdfVersion = regexp.MustCompile(`^[A-Za-z0-9._+-]+$`)
+)
+
+// parseToolVersions is ASDF_<TOOL>_VERSION for each line of text whose tool
+// and first version match asdf's plain shapes, the tool upper-cased with -
+// spelled _, as asdf spells it. Any other line is skipped.
+func parseToolVersions(text string) []string {
+	var env []string
+	for _, line := range strings.Split(text, "\n") {
+		f := strings.Fields(line)
+		if len(f) < 2 || !asdfTool.MatchString(f[0]) || !asdfVersion.MatchString(f[1]) {
+			continue
+		}
+		name := strings.ToUpper(strings.ReplaceAll(f[0], "-", "_"))
+		env = append(env, "ASDF_"+name+"_VERSION="+f[1])
+	}
+	return env
 }

@@ -32,6 +32,7 @@ import (
 	"os/exec"
 	"regexp"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -102,7 +103,7 @@ var _ interface {
 // Command's contract is sandbox.Sandbox.Command's, exec.CommandContext included.
 type sandboxer interface {
 	Command(ctx context.Context, r sandbox.Run) (*exec.Cmd, error)
-	System(home, shell string, env []string) sandbox.FilePolicy
+	System(home, shell string) sandbox.System
 	Never(home string) []string
 	Confines() bool
 	Port() (int, error)
@@ -137,11 +138,16 @@ type Tool struct {
 	// denied is Kstack's own directories, which a sandboxed run cannot read.
 	denied []string
 
-	// The profile snapshot every command sources: its path, "" while there is
-	// none, and ready, closed once it is written or given up — nil for a tool
-	// whose snapshot was never started. snapTimeout and snapLimit bound taking it.
-	snapshot    string
-	ready       chan struct{}
+	// The profile snapshot every command outside the sandbox sources: its
+	// path, "" while there is none, and ready, closed once it is written or
+	// given up — nil for a tool whose snapshot was never started. snapTimeout
+	// and snapLimit bound taking it.
+	snapshot string
+	ready    chan struct{}
+	// snapCtx is the context StartSnapshot made, which its stop cancels;
+	// snapMu guards it and the start that sets ready.
+	snapMu      sync.Mutex
+	snapCtx     context.Context
 	snapTimeout time.Duration
 	snapLimit   int
 	// launch runs the login shell: launchDump, or a test's stand-in.
@@ -547,7 +553,7 @@ func (t *Tool) runCall(ctx context.Context, in input, rt tools.Runtime) (string,
 		return resultText(result{Error: err.Error()}, in.Timeout, nil, false), true
 	}
 	boxer := t.sandboxerFor(rt)
-	snapshot, err := t.snapshotFor(ctx)
+	snapshot, err := t.snapshotFor(ctx, boxer != nil)
 	if err != nil {
 		return resultText(result{Error: err.Error()}, in.Timeout, nil, false), true
 	}
@@ -557,7 +563,7 @@ func (t *Tool) runCall(ctx context.Context, in input, rt tools.Runtime) (string,
 		capture: tools.FileLimit, timeout: in.Timeout, killGrace: killGrace, pipeGrace: pipeGrace,
 	}
 	if boxer != nil {
-		sandboxedRun, err := t.sandboxedRunFor(ctx, boxer, rt, cwd, snapshot, false)
+		sandboxedRun, err := t.sandboxedRunFor(ctx, boxer, rt, cwd, false)
 		if err != nil {
 			return resultText(result{Error: err.Error()}, in.Timeout, nil, false), true
 		}
@@ -600,7 +606,7 @@ func (r *sandboxedRun) end() {
 // cache. A cluster that is gone fails it before anything is made, since a
 // sandboxed kubectl aimed at nothing would read as the cluster being down. The
 // caller calls end when the run ends.
-func (t *Tool) sandboxedRunFor(ctx context.Context, boxer sandboxer, rt tools.Runtime, cwd, snapshot string, background bool) (*sandboxedRun, error) {
+func (t *Tool) sandboxedRunFor(ctx context.Context, boxer sandboxer, rt tools.Runtime, cwd string, background bool) (*sandboxedRun, error) {
 	r := &sandboxedRun{boxer: boxer}
 	var cluster *target
 	var port int
@@ -623,13 +629,13 @@ func (t *Tool) sandboxedRunFor(ctx context.Context, boxer sandboxer, rt tools.Ru
 		r.end()
 		return nil, err
 	}
-	var reads []string
-	if snapshot != "" {
-		reads = append(reads, snapshot)
+	reads := []string{r.dir.path}
+	if err := makeToolHome(rt.Dir); err != nil {
+		r.end()
+		return nil, errors.New("the tool home " + tools.ToolHomePath(rt.Dir) + " could not be made: " + err.Error())
 	}
-	reads = append(reads, r.dir.path)
-	ws := tools.WorkspacePath(rt.Dir)
-	writes := []string{ws, r.dir.tmp}
+	ws, toolHome := tools.WorkspacePath(rt.Dir), tools.ToolHomePath(rt.Dir)
+	writes := []string{ws, toolHome, r.dir.tmp}
 	var relays []sandbox.Relay
 	if cluster != nil {
 		socket := r.dir.socket()
@@ -645,14 +651,22 @@ func (t *Tool) sandboxedRunFor(ctx context.Context, boxer sandboxer, rt tools.Ru
 		writes = append(writes, cluster.cacheDir)
 		relays = []sandbox.Relay{{Port: port, Socket: socket}}
 	}
-	env := sandboxedRunEnv(os.Environ(), t.env, ws, cwd, r.dir, cluster)
-	// System reads the PATH's folders, which can hang on a network mount, so
-	// the policy is built on a goroutine abandoned if ctx ends first.
-	built := make(chan sandbox.Policy, 1)
-	go func() { built <- t.workspacePolicy(boxer, env, reads, writes, relays) }()
+	// System stats folders under the home, Never lists the other homes and
+	// toolVersions reads a file under the home, any of which can hang on a
+	// network mount, so the run is built on a goroutine abandoned if ctx ends
+	// first.
+	built := make(chan sandbox.Run, 1)
+	go func() {
+		sys := boxer.System(t.home, t.shell)
+		toolchain := sys.Env
+		if sys.Asdf {
+			toolchain = slices.Concat(sys.Env, toolVersions(t.home))
+		}
+		env := sandboxedRunEnv(os.Environ(), t.env, ws, cwd, r.dir, cluster, toolHome, toolchain)
+		built <- sandbox.Run{Env: env, Policy: t.workspacePolicy(boxer, sys.Files, reads, writes, relays)}
+	}()
 	select {
-	case p := <-built:
-		r.run = sandbox.Run{Env: env, Policy: p}
+	case r.run = <-built:
 		return r, nil
 	case <-ctx.Done():
 		r.end()
@@ -660,12 +674,12 @@ func (t *Tool) sandboxedRunFor(ctx context.Context, boxer sandboxer, rt tools.Ru
 	}
 }
 
-// workspacePolicy is a sandboxed run's policy: the sandbox's System for env,
+// workspacePolicy is a sandboxed run's policy: system, the sandbox's System,
 // less what lies in Kstack's directories, and the extra writable, which lies
 // in none; the Never paths and Kstack's directories denied but for the run's
 // own reads and writes, which lie inside them; and relays.
-func (t *Tool) workspacePolicy(boxer sandboxer, env, reads, writes []string, relays []sandbox.Relay) sandbox.Policy {
-	files := boxer.System(t.home, t.shell, env).Outside(t.denied...)
+func (t *Tool) workspacePolicy(boxer sandboxer, system sandbox.FilePolicy, reads, writes []string, relays []sandbox.Relay) sandbox.Policy {
+	files := system.Outside(t.denied...)
 	files.Write = append(files.Write, t.extraWritable...)
 	return sandbox.Policy{
 		Files:   files,

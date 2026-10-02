@@ -719,23 +719,23 @@ func TestATaskWhoseSandboxHangsIsRefusedWhenTheCallEnds(t *testing.T) {
 	assert.Empty(t, tasks.started)
 }
 
-// A sandboxed run carries the built environment and the Workspace policy: the
-// sandbox's System less what lies in Kstack's directories, the Never paths and
-// Kstack's directories denied, and the run's own paths inside them — the
-// snapshot and its run's directory read, the workspace and its TMPDIR written.
-// With no cluster it has no relay.
+// A sandboxed run carries the built environment, with System's variables, and
+// the Workspace policy: the sandbox's System less what lies in Kstack's
+// directories, the Never paths and Kstack's directories denied, and the run's
+// own paths inside them — its run's directory read, the workspace, the tool
+// home and its TMPDIR written. With no cluster it has no relay.
 func TestTheWorkspacePolicyIsSystemAndTheRunsOwn(t *testing.T) {
 	rt := testRuntime(t)
 	tl := tool(t)
 	k := kstackDirs(t)
 	fake := &fakeSandboxer{
-		system: sandbox.FilePolicy{Read: []string{"/usr", filepath.Join(k.data, "bin")}, Deny: []string{"/usr/var"}},
-		never:  []string{filepath.Join(tl.home, ".ssh")},
+		system: sandbox.System{
+			Files: sandbox.FilePolicy{Read: []string{"/usr", filepath.Join(k.data, "bin")}, Deny: []string{"/usr/var"}},
+			Env:   []string{"NVM_DIR=/home/ana/.nvm"},
+		},
+		never: []string{filepath.Join(tl.home, ".ssh")},
 	}
 	tl.sandboxer = fake
-	tl.snapshot = filepath.Join(k.runtime, "shell", "snapshot.sh")
-	require.NoError(t, os.MkdirAll(filepath.Dir(tl.snapshot), 0o700))
-	require.NoError(t, os.WriteFile(tl.snapshot, nil, 0o400))
 
 	text, isError := tl.Run(t.Context(), rt, command(`echo "$ZDOTDIR"; echo "$TMPDIR"`))
 	require.False(t, isError, text)
@@ -748,14 +748,14 @@ func TestTheWorkspacePolicyIsSystemAndTheRunsOwn(t *testing.T) {
 	tmp := lines[1]
 	rd := &runDir{path: lines[0], tmp: tmp}
 	ws := tools.WorkspacePath(rt.Dir)
-	assert.Equal(t, sandboxedRunEnv(os.Environ(), tl.env, ws, ws, rd, nil), r.Env)
+	assert.Equal(t, sandboxedRunEnv(os.Environ(), tl.env, ws, ws, rd, nil, tools.ToolHomePath(rt.Dir), fake.system.Env), r.Env)
 	assert.Equal(t, sandbox.Policy{
 		Files: sandbox.FilePolicy{Read: []string{"/usr"}, Deny: []string{"/usr/var"}},
 		Always: sandbox.AlwaysPolicy{
 			Deny:   fake.never,
 			Kstack: []string{k.data, k.cache, k.runtime},
-			Read:   []string{tl.snapshot, rd.path},
-			Write:  []string{ws, tmp},
+			Read:   []string{rd.path},
+			Write:  []string{ws, tools.ToolHomePath(rt.Dir), tmp},
 		},
 	}, r.Policy)
 	assert.NoError(t, r.Policy.Check())
@@ -1051,20 +1051,6 @@ func TestASandboxedRunThatCannotBePreparedCouldNotStart(t *testing.T) {
 	}
 }
 
-// A sandboxed run reads the snapshot it sources.
-func TestASandboxedRunReadsTheSnapshot(t *testing.T) {
-	tl := tool(t)
-	fake := &fakeSandboxer{}
-	tl.sandboxer = fake
-	tl.snapshot = filepath.Join(t.TempDir(), "snapshot.sh")
-	require.NoError(t, os.WriteFile(tl.snapshot, nil, 0o400))
-
-	text, isError := tl.Run(t.Context(), testRuntime(t), command(`echo "$ZDOTDIR"`))
-	require.False(t, isError, text)
-
-	assert.Equal(t, []string{tl.snapshot, strings.TrimSpace(text)}, fake.seen()[0].Policy.Always.Read)
-}
-
 // Stored arguments whose workdir is absolute only on Unix, where alone a run
 // could have written them, read the same. A case here is never edited.
 func TestActionOfReadsOldUnixRowsTheSame(t *testing.T) {
@@ -1106,4 +1092,35 @@ func TestDockerDesktopsBinStaysDenied(t *testing.T) {
 
 	require.False(t, isError, text)
 	assert.Equal(t, "started\n", text)
+}
+
+// System can hang on a network mount, so a sandboxed call whose System never
+// answers ends when its context does, having started nothing.
+func TestTheEnvironmentIsBuiltOnThePolicyGoroutine(t *testing.T) {
+	rt := testRuntime(t)
+	tl := tool(t)
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	ctx, cancel := context.WithCancel(t.Context())
+	fake := &fakeSandboxer{onSystem: cancel, holdSys: release}
+	tl.sandboxer = fake
+
+	_, isError := tl.Run(ctx, rt, command("true"))
+
+	assert.True(t, isError)
+	assert.Empty(t, fake.seen())
+}
+
+// Where System found asdf, the run carries the user's global versions.
+func TestASandboxedRunCarriesAsdfsVersions(t *testing.T) {
+	rt := testRuntime(t)
+	tl := tool(t)
+	require.NoError(t, os.WriteFile(filepath.Join(tl.home, ".tool-versions"), []byte("nodejs 20.1.0\n"), 0o600))
+	fake := &fakeSandboxer{system: sandbox.System{Env: []string{"ASDF_DATA_DIR=/h/.asdf"}, Asdf: true}}
+	tl.sandboxer = fake
+
+	text, isError := tl.Run(t.Context(), rt, command(`echo "$ASDF_DATA_DIR $ASDF_NODEJS_VERSION"`))
+
+	require.False(t, isError, text)
+	assert.Equal(t, "/h/.asdf 20.1.0\n", text)
 }
