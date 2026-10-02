@@ -20,6 +20,7 @@ package sandbox
 
 import (
 	"fmt"
+	"runtime"
 	"strings"
 )
 
@@ -33,11 +34,20 @@ func Main(argv []string) (code int, ok bool) {
 	}
 	switch argv[1] {
 	case InitCommand:
+		// Each thread the forwarder starts counts against the run's process
+		// limit on Linux (forwarderTasks), and relaying needs no parallelism.
+		runtime.GOMAXPROCS(1)
 		return InitMain(argv[2:]), true
 	case ShellCommand:
 		return ShellMain(argv[2:]), true
 	}
 	return 0, false
+}
+
+// firstLine is s up to its first newline.
+func firstLine(s string) string {
+	line, _, _ := strings.Cut(s, "\n")
+	return line
 }
 
 // Run is one command to start sandboxed.
@@ -80,4 +90,8 @@ type Sandbox struct {
 	bwrap string
 	// launcher is the sandbox-exec a run starts under, on macOS.
 	launcher string
+	// perNamespace is whether the kernel counts a process limit per user
+	// namespace, and ownUserNS whether the probe's run had a user namespace
+	// of its own, on Linux.
+	perNamespace, ownUserNS bool
 }

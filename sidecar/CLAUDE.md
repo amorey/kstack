@@ -1305,7 +1305,7 @@ Windows `Probe` answers none, `Command` answers `errNone`, and `System` and `Nev
 nothing: native Windows has no sandbox, and a Windows user who wants one runs the Linux build in
 WSL2 → [ADR](../docs/adr/2026-09-28-native-windows-has-no-sandbox.md).
 
-**A `Policy` is everything the sandbox enforces for a run** (`policy.go`), in three parts, and
+**A `Policy` is everything the sandbox enforces for a run** (`policy.go`), in four parts, and
 each platform compiles it without knowing what a path or a relay is for:
 
 - **`Files`** (`FilePolicy`): `Read` (readable, not writable), `Write` (readable and writable)
@@ -1319,11 +1319,22 @@ each platform compiles it without knowing what a path or a relay is for:
   opens. So a Read of `~` never exposes `~/.ssh`.
 - **`Network`** (`NetworkPolicy`): the `Relays`, each a loopback port the forwarder connects to a
   Unix socket outside the run. No relay is no network; a run has at most one.
+- **`Limits`**: `CPUSeconds`, `MemoryBytes` (Linux alone; macOS's `Command` refuses one),
+  `OpenFiles` and `Processes`, each a resource limit set soft and hard, zero for the platform's
+  own. `CPUSeconds` has a hard limit `cpuGrace` (5 s) above its soft one. `Processes` is counted
+  over the base **`Sandbox.CountedProcesses()`** answers, and the sandbox adds `forwarderTasks`
+  for the forwarder, which starts before the limit is set (32 tasks on Linux, whose kernel counts
+  its threads and which runs with one P, `TestTheForwarderStaysUnderItsTasks`; 1 process on
+  macOS). The base is 0 on Linux from 5.14 in a user namespace of the run's own, else the user's
+  count (`procs_linux.go` scans `/proc` by real uid and sums `Threads:`,
+  `procs_darwin.go` counts `kern.proc.ruid`). → [ADR: process limits are set inside the run](../docs/adr/2026-10-02-process-limits-are-set-inside-the-run.md).
 
 **`Check` refuses** a relative path; any rule or Always path strictly beneath a Write rule, Files
 or Always; a Files rule on or inside an Always path; a run's own path outside every Kstack path,
 on or inside a Deny, holding a Deny (the run's own paths compile last), or that is a link at its last component, since the profile resolves it and
-would open the link's target (`TestARunsOwnPathThatIsALinkIsRefused`); and a second relay. Every path is compared resolved, a missing one through
+would open the link's target (`TestARunsOwnPathThatIsALinkIsRefused`); a second relay; a negative
+limit; and a memory or process limit with no open-files limit, since `sandbox-shell` execs under
+them without restoring the open-files limit the Go runtime raised. Every path is compared resolved, a missing one through
 its deepest folder that exists (`resolved`), since both sandboxes check a file at its real
 location. **`Command` fails rather than narrows or widens**: a run that fails `Run.check` — its policy's
 `Check`, or an `Env` entry `Unpassable` matches — or that its platform cannot enforce, is
@@ -1377,14 +1388,17 @@ seam).
 **What no policy changes stays in each compiler**: on Linux the `/proc`, `/dev` and private `/tmp`
 mounts, the namespaces, `--die-with-parent --new-session --as-pid-1`, the closing `--remount-ro /`
 and the seccomp filter; on macOS the fixed reads, `setsid` and `setpgid` refused, signals within
-the sandbox, no `/dev/tty` and the one Mach service.
+the sandbox, the setuid programs that escalate refused, no `/dev/tty` and the one Mach service.
 
 **On Linux it is bubblewrap** (`sandbox_linux.go`). `Probe` tries the system's bwrap first, the
 first of `/usr/bin/bwrap`, `/bin/bwrap`, `/usr/local/bin/bwrap` and NixOS's
 `/run/current-system/sw/bin/bwrap` that exists, then Kstack's own, `../lib/kstack/bwrap` beside the
 executable (`src-tauri/CLAUDE.md`) (`bwrapPaths`; never off `PATH`), and answers the
-first that runs `/bin/sh -c true` through `Command` within five seconds (`probeBound`: it starts
-this executable twice). A failure's reason is the first line it wrote, naming the cause
+first that runs a shell through `Command` within five seconds (`probeBound`: it starts
+this executable twice). The probe's shell prints the first line of its `/proc/self/uid_map`, with
+builtins alone; a line that differs from the sidecar's means the run had a user namespace of its
+own (`ownUserNS`), and `Probe` keeps whether the kernel's release is 5.14 or later
+(`perNamespace`), the two `CountedProcesses` reads. A failure's reason is the first line it wrote, naming the cause
 (`setting up uid map: Permission denied` where AppArmor restricts user namespaces, `Unknown
 option` from a bwrap too old for a flag), and both reasons when both fail. The system's comes
 first because the distribution patches it, while Kstack's own changes only when the user installs
@@ -1393,7 +1407,8 @@ a new release. Kstack's own stands in where the system has none, or one that fai
 `forwarderPort`, since the namespace's loopback is the run's own. **`Command` refuses a rule on
 `/tmp` or `/dev`, or on or under `/proc`**, a Files rule and a run's own path alike, since it
 would replace a fixed mount; a rule under `/tmp` or `/dev` is bound over it. The arguments come
-in the order that lets each mount lie over the last: the namespaces (`--unshare-net`, `-pid`,
+in the order that lets each mount lie over the last: the namespaces (`--unshare-user-try`, so a
+setuid bwrap makes the run a user namespace where the machine allows one, `--unshare-net`, `-pid`,
 `-ipc`, `-uts`, `--unshare-cgroup-try`, `--die-with-parent --new-session --as-pid-1`); a rule on
 `/` itself; `/proc`, `/dev` and a fresh `/tmp`; the merged rules, one mount each (`mounter`): a
 Read or Write bound at its resolved path and, where that differs from the path as written,
@@ -1404,17 +1419,19 @@ tmpfs, whichever of the two is mounted first (`TestALinkInsideADenialLeadsToItsR
 under an earlier Read not bound again (the fixed mounts hide what lies under them, as a denial does), the run's own paths bound as written, a denied folder an
 empty tmpfs and a denied file `/dev/null`; `--remount-ro /`, then each denied folder remounted read-only after the binds
 made inside it; then the chain, `<self> sandbox-init [--socket <S> --port <P>] -- <self>
-sandbox-shell -- <Shell> <Args…>`. A Deny whose path is missing when the run starts covers
+sandbox-shell [--cpu <C>] [--files <F>] [--memory <M>] [--processes <N>] -- <Shell> <Args…>`. A Deny whose path is missing when the run starts covers
 nothing, since a mount needs a path. `/run` and `/var` are never mounted, so the runtime
 directory, the host's socket and a sibling run's kubeconfig are out of reach.
 
 **On macOS it is Seatbelt** (`sandbox_darwin.go`): `Probe` finds `/usr/bin/sandbox-exec` and runs
-`/usr/bin/true` under `probePolicy`, bounded by two seconds, a failure's reason the
+`/usr/bin/true` under `probePolicy`, bounded by five seconds (`probeTimeout`: the forwarder
+starts this executable once more), a failure's reason the
 first line of its stderr. A probe that runs out of time keeps the sandbox, its reason saying so:
 it runs once, at startup, so a slow start must not leave the session unconfined. `Confines` is
 true; `Port` is a free loopback port, picked by listening on `127.0.0.1:0` and closing, since
 Seatbelt has no private loopback; and `Command` is `sandbox-exec -p <profile> -D …` then the argv
-(`Sandbox.argv`: the shell, or for a run with a relay the forwarder with the shell its child) — its ctx bounds building the profile too, since resolving a path can hang on a
+(`Sandbox.argv`: the forwarder, with its relay, and `sandbox-shell` its child, with the limits,
+for every run) — its ctx bounds building the profile too, since resolving a path can hang on a
 network mount, and a ctx that ends first is its error — which `sandbox-exec` execs into, so the session the Bash tool starts is the run's process group and
 the profile holds every descendant. **The profile is `profile_darwin.sb`**, embedded: fixed rules
 with a marker line each for the policy's rules, the ancestors and the network (`;; RULES`,
@@ -1424,7 +1441,10 @@ port is the one value written into the text. **Every path is resolved** before i
 since Seatbelt checks a file's real path and `/var` and `/tmp` are links into `/private`; the
 socket is passed both as given and resolved. A Deny holds for its path whether or not it exists.
 In order, a later rule winning: `deny default`; processes, signals and process info within the
-sandbox, `setsid` and `setpgid` refused (`syscall-unix`) so a process stays in the run's group,
+sandbox, but no exec of `sudo`, `su`, `login` or `security_authtrampoline`, by path
+(`TestTheProfileRefusesSetuidPrograms`; macOS 27 runs no setuid program under a profile, `ps` and
+`top` included, `TestEverySetuidProgramIsRefused`, and `kern.procargs2` still reads any of the
+user's processes' arguments, and before macOS 27 their environment → [ADR](../docs/adr/2026-10-02-a-macos-sandboxed-command-reads-other-processes-arguments.md)), `setsid` and `setpgid` refused (`syscall-unix`) so a process stays in the run's group,
 `sysctl-read`; **the merged rules**, a Read as `allow file-read*` then `deny file-write*`, so it
 decides a tie with a Write as a read-only mount does, a Write as `allow file-read* file-write*`,
 **a run's own Write followed by a denial of unlinking or creating its root's own entry**
@@ -1454,8 +1474,12 @@ both compilers use. A Toolchain folder that is a link (`~/.nix-profile`) is boun
 and recreated as a link by `mounter.link` on Linux (`TestAToolchainLinkIsRecreated`); Seatbelt
 checks the resolved path.
 
-**`sandbox-shell` confines the shell** (`sandbox.ShellMain`, `seccomp_linux.go`; `shell_notlinux.go`
-refuses it elsewhere). It sits between the forwarder and the shell: it locks its thread, sets
+**`sandbox-shell` sets the run's limits and confines the shell** (`sandbox.ShellMain`;
+`shell.go` writes and reads its command line through `shellCommand` and `parseShellArgs`). It sits
+between the forwarder and the shell, so the limits hold the shell and everything under it and
+never the forwarder, which lives as long as the run and relays every connection. **On macOS**
+(`shell_darwin.go`) it refuses `--memory`, sets the CPU, open-files and process limits and execs
+the shell; `shell_windows.go` refuses it. **On Linux** (`seccomp_linux.go`) it locks its thread, sets
 `PR_SET_NO_NEW_PRIVS`, installs `filter()` on every thread (`SECCOMP_FILTER_FLAG_TSYNC`) and execs
 the shell, so the filter holds the shell and everything under it while the forwarder, which dials
 the run's socket, stays outside. `filter()` is a classic BPF program built with
@@ -1466,7 +1490,16 @@ past the network namespace — and so does
 `socketpair` unless it is a stream or seqpacket pair, since a datagram end can send to a host's
 pathname socket in any directory the run reads; io_uring
 `ENOSYS`, `unshare` and `clone` with `CLONE_NEWUSER` `EPERM`, and `clone3`, whose flags it cannot
-read, `ENOSYS`, on which glibc falls back to `clone`. Its tests run it on `bpf.VM` over a
+read, `ENOSYS`, on which glibc falls back to `clone`; tracing (`ptrace`, `process_vm_readv`,
+`process_vm_writev`, `pidfd_getfd`, `kcmp`, `process_madvise`) and the kernel keyring (`keyctl`,
+`add_key`, `request_key`), which a run inherits from the user's session, `EPERM`. After the filter
+it sets `--cpu` and `--files` (`setTimeAndFiles`, `shell_unix.go`), each clamped to its own hard
+limit (`setClamped`: a stricter machine stays stricter), CPU's hard one `cpuGrace` above. **Given
+`--memory` or `--processes`** it then sets `RLIMIT_NPROC`, then `RLIMIT_AS`, clamped the same way,
+and execs through a raw `execve` (`execLimited`): the
+collector is off and the exec's arguments and failure line are built first, since an allocation
+past the address-space limit is a runtime crash; a failed exec writes `sandbox-shell: cannot start
+<argv0>: errno <n>` with raw `write`s and exits 125. Its tests run it on `bpf.VM` over a
 `seccomp_data` laid out big-endian word by word, and `ShellMain` in a child.
 
 **Tests that start the chain call `sandbox.Main` from their `TestMain`**: `sandbox`, `bash`
@@ -1490,7 +1523,10 @@ and its Bash call read back from `app.db`. A missing sandbox, `kubectl` or `jq` 
 `main` reaches through `sandbox.Main` before it reads a flag of its own; `sandbox.ForwarderArgs`
 is the one writer of its command line. `sandbox.ExitCode` is how a process ended as a shell reports it,
 bash's included. `--socket` and `--port` come together or not at all: a run with no cluster
-passes neither, and its forwarder listens on nothing. With them it listens on
+passes neither, and its forwarder listens on nothing. It sets the core size to zero before the
+child starts, so no process of a run dumps a core, and no other limit: those are
+`sandbox-shell`'s. `sandbox.Main` gives it one P (`GOMAXPROCS(1)`), which keeps its threads
+within `forwarderTasks`. With a socket it listens on
 `127.0.0.1:<port>` before the child starts, so a command never races it,
 relays each connection to the socket byte for byte, half-closing each side as the other ends,
 retries a failed accept after a doubling wait (5ms to 1s, as `net/http`'s server does), since a
@@ -1503,7 +1539,7 @@ Under bwrap the group is bwrap's alone (`--new-session`), and bwrap forwards no 
 it ends bwrap, `--die-with-parent` kills the forwarder, and the kernel ends everything in the
 namespace, so a sandboxed command has no grace on a timeout.
 **Its own failures exit 125** with one `sandbox-init:` line on stderr (bad arguments, a port it
-cannot listen on, a command it cannot start), and `sandbox-shell`'s with one `sandbox-shell:`
+cannot listen on, a core size it cannot set, a command it cannot start), and `sandbox-shell`'s with one `sandbox-shell:`
 line; a command can exit 125 itself, so the line is what tells them apart. `forward_unix.go`
 runs the child; `forward_windows.go` answers 125 with *no sandbox on this platform*.
 
@@ -2180,7 +2216,15 @@ sandbox's `System` `Files`, less every rule on or inside Kstack's directories (`
 (`app` passes the data, cache and runtime directories) as its Kstack paths, the run's directory
 as its own Read, and the workspace, the tool home, its `TMPDIR` and the kubectl cache as its own
 Write; and a run with a cluster has one
-relay, from `Port()` to its proxy socket. Bash's tests lay their folders out under Kstack's three
+relay, from `Port()` to its proxy socket. **Its `Limits`** are `limitCPU` (`MaxTimeout` plus
+`killGrace`) in seconds times `runtime.NumCPU()` on a foreground run and none on a background one,
+which has no clock; `limitMemory` (`limits_linux.go`: 16 GiB; `limits_other.go`: 0, since macOS
+sets none); `limitOpenFiles` (4096); and the sandbox's `CountedProcesses` plus
+`processMargin(runtime.NumCPU())` (`limits_linux.go`: `max(1024, 128 × cpus)`, since Linux counts
+threads; `limits_other.go`: 512) on a foreground run and none on a background one, since a
+machine-wide count drifts over hours as other programs start. `sandboxedRunFor` reads a foreground
+run's base first, through the `sandboxer` seam, and its error fails the call before anything is
+made, so a run never starts under a limit other than its policy's. Bash's tests lay their folders out under Kstack's three
 as `app/paths.go` does (`kstackDirs`), so a test's policy passes `Check` over a real sandbox.
 **A run with a cluster claims its connection and serves a grant over it** (`upstream.go`,
 `proxy.go`). `claim` acquires the lease with `AcquireConnection`, which does not dial, and the
@@ -2211,8 +2255,9 @@ cluster has no grant, no socket and no forwarder. `prompts/sandbox.md` says a sa
 for the user only for a change to the cluster, one request at a time, a denial `Forbidden` and the
 wait counting against its `timeout`; that `exec`, `attach`, `port-forward`, a service account
 token, a helm change, a change past 1 MiB and a background command's change come back
-`Forbidden`; that a Secret changes with `kubectl apply --server-side`; and that a Secret reads
-`[redacted]`.
+`Forbidden`; that a Secret changes with `kubectl apply --server-side`; that a Secret reads
+`[redacted]`; and that `sudo` does not work, a command's processes are limited, one past its CPU
+time is killed with exit 152, and a crash that cannot create a thread hit the count.
 **A `Tool` is the `tools.Gated` a turn is offered**, matched to Claude Code's `Bash`: `Definition` is a function named `Bash` whose
 schema (`prompts/schema.json`), one with a sandbox or without, takes `command`, `description`, `timeout` (milliseconds), `run_in_background` and `workdir` —
 never the reference's `dangerouslyDisableSandbox`, so leaving the sandbox is the user's switch — and whose description is `prompts/description.md`. The schema's `description` property is Kstack's

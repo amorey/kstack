@@ -12,12 +12,27 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build !windows
+
 package sandbox
 
-// forwarderTasks is how many processes a run's process limit holds for the
-// forwarder: itself, since macOS counts processes, never threads.
-const forwarderTasks = 1
+import (
+	"os/exec"
+	"testing"
 
-// guardMemory has nothing to do: the forwarder is never a PID namespace's
-// first process on macOS.
-func guardMemory() error { return nil }
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// The user's count holds this test and its child, through the scan on Linux
+// and the sysctl on macOS.
+func TestTheUsersProcessesAreCounted(t *testing.T) {
+	child := exec.Command("sleep", "60")
+	require.NoError(t, child.Start())
+	t.Cleanup(func() { _ = child.Process.Kill(); _ = child.Wait() })
+
+	n, err := (&Sandbox{}).CountedProcesses()
+
+	require.NoError(t, err)
+	assert.GreaterOrEqual(t, n, 2)
+}

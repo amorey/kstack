@@ -14,10 +14,15 @@
 
 package sandbox
 
-// forwarderTasks is how many processes a run's process limit holds for the
-// forwarder: itself, since macOS counts processes, never threads.
-const forwarderTasks = 1
+import (
+	"os"
 
-// guardMemory has nothing to do: the forwarder is never a PID namespace's
-// first process on macOS.
-func guardMemory() error { return nil }
+	"golang.org/x/sys/unix"
+)
+
+// CountedProcesses is how many processes the kernel already counts against a
+// run that starts now: every process of the user's real uid on the machine.
+func (s *Sandbox) CountedProcesses() (int, error) {
+	procs, err := unix.SysctlKinfoProcSlice("kern.proc.ruid", os.Getuid())
+	return len(procs), err
+}

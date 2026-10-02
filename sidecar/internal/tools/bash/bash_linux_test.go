@@ -12,12 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package sandbox
+package bash
 
-// forwarderTasks is how many processes a run's process limit holds for the
-// forwarder: itself, since macOS counts processes, never threads.
-const forwarderTasks = 1
+import (
+	"os/exec"
+	"testing"
 
-// guardMemory has nothing to do: the forwarder is never a PID namespace's
-// first process on macOS.
-func guardMemory() error { return nil }
+	"github.com/stretchr/testify/require"
+)
+
+// node reserves about 10 GiB of address space for a WebAssembly memory, which
+// fits under the memory limit.
+func TestNodeRunsUnderTheMemoryLimit(t *testing.T) {
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skip("no node on PATH")
+	}
+	tl := proxyTool(t, &fakeLease{})
+	tl.sandboxer = confining(t)
+
+	text, isError := tl.Run(t.Context(), testRuntime(t), command(`node -e 'new WebAssembly.Memory({initial: 1})'`))
+
+	require.False(t, isError, text)
+}

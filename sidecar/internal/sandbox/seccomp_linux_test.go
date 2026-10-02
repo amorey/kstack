@@ -19,6 +19,9 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -195,4 +198,123 @@ func TestTheFilterAssembles(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, got, len(filter()))
 	assert.Equal(t, unix.SockFilter{Code: 0x06, K: unix.SECCOMP_RET_ALLOW}, got[len(got)-1])
+}
+
+// limitOf is the soft limit /proc/<pid>/limits names on the line beginning
+// with name.
+func limitOf(t *testing.T, limits, name string) string {
+	t.Helper()
+	for _, line := range strings.Split(limits, "\n") {
+		if rest, ok := strings.CutPrefix(line, name); ok {
+			return strings.Fields(rest)[0]
+		}
+	}
+	require.Failf(t, "no limit", "%q in %s", name, limits)
+	return ""
+}
+
+// sandbox-shell sets the memory and process limits on what it execs, and
+// everything that starts.
+func TestTheShellAppliesItsLimits(t *testing.T) {
+	p := strconv.Itoa(ownProcesses(t))
+	cmd := exec.Command(os.Args[0], ShellCommand, "--memory", "536870912", "--processes", p, "--", "/bin/sh", "-c", "cat /proc/self/limits")
+
+	out, err := cmd.CombinedOutput()
+
+	require.NoError(t, err, string(out))
+	assert.Equal(t, "536870912", limitOf(t, string(out), "Max address space"))
+	assert.Equal(t, p, limitOf(t, string(out), "Max processes"))
+}
+
+// A command the kernel will not exec under the limits is sandbox-shell's
+// failure, written without allocating: the line, the errno, and 125.
+func TestAShellThatCannotExecUnderLimitsSaysWhy(t *testing.T) {
+	garbage := filepath.Join(t.TempDir(), "garbage")
+	require.NoError(t, os.WriteFile(garbage, []byte{0, 1, 2, 3}, 0o700))
+	p := strconv.Itoa(ownProcesses(t))
+
+	code, _, stderr := runInit(t, exec.Command(os.Args[0], ShellCommand, "--memory", "536870912", "--processes", p, "--", garbage))
+
+	assert.Equal(t, 125, code)
+	assert.Equal(t, "sandbox-shell: cannot start "+garbage+": errno "+strconv.Itoa(int(unix.ENOEXEC))+"\n", stderr)
+}
+
+// Tracing is refused: attaching, reading or writing another process's memory,
+// taking its descriptors, or comparing kernel objects with it.
+func TestTheFilterRefusesTracing(t *testing.T) {
+	for _, nr := range []int{unix.SYS_PTRACE, unix.SYS_PROCESS_VM_READV, unix.SYS_PROCESS_VM_WRITEV,
+		unix.SYS_PIDFD_GETFD, unix.SYS_KCMP, unix.SYS_PROCESS_MADVISE} {
+		assert.Equal(t, errno(unix.EPERM), verdict(t, auditArch, nr), nr)
+	}
+}
+
+func init() {
+	// trace starts a sleep child and attaches to it, as a debugger does, and
+	// prints why it could not, or attached.
+	helpers["trace"] = func() int {
+		runtime.LockOSThread()
+		child := exec.Command("sleep", "60")
+		if err := child.Start(); err != nil {
+			fmt.Print(err)
+			return 1
+		}
+		defer func() { _ = child.Process.Kill(); _ = child.Wait() }()
+		if err := unix.PtraceAttach(child.Process.Pid); err != nil {
+			fmt.Print(err)
+			return 1
+		}
+		fmt.Print("attached")
+		return 0
+	}
+}
+
+// outside skips the test unless the helper named succeeds outside the filter,
+// so the filter is what refuses it inside.
+func outside(t *testing.T, helper string) {
+	t.Helper()
+	if out, err := helperCmd(helper).CombinedOutput(); err != nil {
+		t.Skipf("%s fails outside the filter: %s", helper, out)
+	}
+}
+
+func TestTheShellCannotTraceAProcess(t *testing.T) {
+	outside(t, "trace")
+	cmd := shellCmd(os.Args[0])
+	cmd.Env = append(os.Environ(), "KSTACK_SANDBOX_TEST_HELPER=trace")
+
+	out, err := cmd.CombinedOutput()
+
+	require.Error(t, err)
+	assert.Equal(t, "operation not permitted", string(out))
+}
+
+func TestTheFilterRefusesTheKeyring(t *testing.T) {
+	for _, nr := range []int{unix.SYS_KEYCTL, unix.SYS_ADD_KEY, unix.SYS_REQUEST_KEY} {
+		assert.Equal(t, errno(unix.EPERM), verdict(t, auditArch, nr), nr)
+	}
+}
+
+func init() {
+	// keyring asks for the session keyring, which a process inherits from the
+	// user's session, and prints why it could not, or its id.
+	helpers["keyring"] = func() int {
+		id, err := unix.KeyctlInt(unix.KEYCTL_GET_KEYRING_ID, unix.KEY_SPEC_SESSION_KEYRING, 0, 0, 0)
+		if err != nil {
+			fmt.Print(err)
+			return 1
+		}
+		fmt.Print(id)
+		return 0
+	}
+}
+
+func TestTheShellCannotReadTheKeyring(t *testing.T) {
+	outside(t, "keyring")
+	cmd := shellCmd(os.Args[0])
+	cmd.Env = append(os.Environ(), "KSTACK_SANDBOX_TEST_HELPER=keyring")
+
+	out, err := cmd.CombinedOutput()
+
+	require.Error(t, err)
+	assert.Equal(t, "operation not permitted", string(out))
 }

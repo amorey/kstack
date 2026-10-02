@@ -12,12 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package sandbox
+package bash
 
-// forwarderTasks is how many processes a run's process limit holds for the
-// forwarder: itself, since macOS counts processes, never threads.
-const forwarderTasks = 1
+import (
+	"testing"
 
-// guardMemory has nothing to do: the forwarder is never a PID namespace's
-// first process on macOS.
-func guardMemory() error { return nil }
+	"github.com/stretchr/testify/assert"
+)
+
+// A Go program starts a thread per CPU and a few more, and Linux counts each,
+// so the margin grows with the CPUs from a floor of 1024.
+func TestTheProcessMarginGrowsWithTheCPUs(t *testing.T) {
+	assert.Equal(t, 1024, processMargin(1))
+	assert.Equal(t, 1024, processMargin(8))
+	assert.Equal(t, 4096, processMargin(32))
+}

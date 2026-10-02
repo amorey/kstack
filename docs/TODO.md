@@ -191,7 +191,7 @@ Pending work across the three parts of the app. Grouped by area; detailed items 
   break every sandboxed call, or log a Seatbelt denial on macOS, and nothing in the sidecar says so.
   It also costs time and memory. Measured on Linux with a release build, a start takes 6.9 ms and
   holds 7.4 MB of anonymous memory. A Go binary with only the forwarder's code takes 1.0 ms and
-  1.7 MB. Linux starts the binary twice per call, as `sandbox-init` and `sandbox-shell`.
+  1.7 MB. Every call starts the binary twice, as `sandbox-init` and `sandbox-shell`.
   **Shape:** a Go program under `sidecar/cmd/` that shares no code with the sidecar. A test of its
   imports refuses any package of the sidecar's module. `sandbox-shell` goes in it too, since it
   also runs inside the sandbox.
@@ -202,7 +202,8 @@ Pending work across the three parts of the app. Grouped by area; detailed items 
   - `SIGTERM`, `SIGINT` and `SIGHUP` caught, never ignored;
   - the child's status as the exit code, 128 plus a signal that killed it;
   - 125 and one `sandbox-init:` line on stderr for its own failures;
-  - as a PID namespace's first process, every orphan reaped and its memory non-dumpable.
+  - as a PID namespace's first process, every orphan reaped and its memory non-dumpable;
+  - a core size of zero for the child, and one P, so its threads stay within `forwarderTasks`.
 
   The sidecar keeps `Sandbox.argv` and its own `ExitCode`. The forwarder's tests already drive a
   process and read only its exit, output and port, so they become black-box tests against the
@@ -221,8 +222,8 @@ Pending work across the three parts of the app. Grouped by area; detailed items 
   - macOS signing and notarizing it;
   - `Probe` finding it next to `os.Executable()`, and reporting no sandbox without it.
 
-  **Trigger:** met on Linux, where `sandbox-shell` doubles the starts and the `init`s run
-  confined under bubblewrap.
+  **Trigger:** met, since `sandbox-shell` doubles the starts on both platforms and the `init`s
+  run confined under bubblewrap.
 
 - **Reorganize the model, tool and run-loop code into `llm` → `tools` → `agent` → `chatsvc`.** `llm` speaks to models, `tools` is what the sidecar can do, `agent` runs a loop over the two, and `chatsvc` owns chats, rows, approvals and the live view, with Go enforcing the one import direction; the spec sequence is written when the work starts.
 
@@ -566,6 +567,29 @@ accounts for every finding from the [2 September threat model](security/2026-09-
 A risk we decide to accept is recorded as a **By decision** row in
 [`security-model.md`](security-model.md), each linking the ADR that accepted it — so an accepted
 risk stays distinguishable from an unnoticed one, and is not repeated here.
+
+- **Show what the sandbox does on this machine (high; sandbox owner).** On macOS 15 and 26,
+  `kern.procargs2` hands a sandboxed run the exec-time environment of any of the user's processes,
+  credentials included, and no Seatbelt rule closes it: the read is not checked by the sandbox
+  there ([ADR](adr/2026-10-02-a-macos-sandboxed-command-reads-other-processes-arguments.md)).
+  macOS 27 withholds it. Kstack's users skew towards the newest macOS, so the answer is to say so
+  rather than to work around a version on its way out. **Shape:** the `sandbox` query answers one
+  of three states, and the composer's `SandboxSwitch` draws it: *Sandboxed* (bubblewrap, or macOS
+  27 and later), commands run unasked and confined; *Sandboxed, with a known gap* (macOS 15 and
+  26), a broken shield and a warning naming what is exposed: the environment variables other
+  programs were started with, such as tokens exported in a terminal, until macOS 27; and *No
+  sandbox* (Windows, Linux without a usable bubblewrap), every command asks, which is not a broken
+  shield, since nothing runs unasked. Landing it widens the ADR to the environment shown to the
+  user, moves its row in `security-model.md` to **By decision**, and is a security record.
+
+- **Keep Kstack's provider keys out of its exec-time environment (medium; sidecar owner).** On
+  macOS 15 and 26 a sandboxed run reads the sidecar's exec-time environment like any other
+  process's, and the sidecar reads the provider keys from its environment; clearing them with
+  `os.Unsetenv` changes only its live copy. The sidecar will run standalone, started by the app or
+  a CLI, so it cannot count on its launcher. **Shape:** before it starts a run, the sidecar execs
+  itself again without the key variables and takes the keys over an inherited pipe, since Go has
+  no supported way to reach the exec-time strings and overwrite them in place. A darwin test reads
+  the sidecar through `kern.procargs2` and finds no key.
 
 - **Audit what secrets a sandboxed read still passes (medium; sandbox owner).** Redaction covers
   a Secret's values, `last-applied-configuration`, and a helm release's values and manifest

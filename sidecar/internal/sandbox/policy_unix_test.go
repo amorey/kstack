@@ -17,14 +17,23 @@
 package sandbox
 
 import (
+	"bufio"
+	"context"
+	"errors"
 	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/kstackhq/kstack/sidecar/internal/testutil"
 )
 
 // access is what a run could do with a file: read its contents, write it.
@@ -204,4 +213,150 @@ func TestARunsOwnPathThatCannotBeLookedAtIsRefused(t *testing.T) {
 	p := Policy{Always: AlwaysPolicy{Kstack: []string{filepath.Join(base, "data")}, Write: d}}
 
 	assert.ErrorIs(t, p.Check(), os.ErrPermission)
+}
+
+func init() {
+	// files opens /dev/null until it cannot, and prints how many it opened
+	// and why it stopped.
+	helpers["files"] = func() int {
+		for n := 0; ; n++ {
+			if _, err := os.Open("/dev/null"); err != nil {
+				fmt.Println(n, errors.Is(err, syscall.EMFILE))
+				return 0
+			}
+		}
+	}
+}
+
+// limitedRunOf is a run of argv on s under the System policy over a fresh
+// home, with a workspace it writes, the system's PATH and env, and limits l.
+func limitedRunOf(t *testing.T, s *Sandbox, l Limits, env []string, argv ...string) Run {
+	t.Helper()
+	d := mkdirs(t, resolved(t.TempDir()), "home", "ws")
+	env = append([]string{"PATH=/usr/bin:/bin"}, env...)
+	files := s.System(d[0], "/bin/sh").Files
+	files.Write = append(files.Write, d[1])
+	return Run{
+		Shell: argv[0], Args: argv[1:], Dir: d[1], Env: env,
+		Policy: Policy{Files: files, Always: AlwaysPolicy{Deny: s.Never(d[0])}, Limits: l},
+	}
+}
+
+// limitedRun runs limitedRunOf's run to its end and answers its exit code and
+// stdout. A failsafe bounds it, since a limit that fails to hold leaves a
+// spin running; a run that reaches it fails the test, so the kill is never
+// read as the limit's.
+func limitedRun(t *testing.T, s *Sandbox, l Limits, env []string, argv ...string) (int, string) {
+	t.Helper()
+	r := limitedRunOf(t, s, l, env, argv...)
+	ctx, cancel := context.WithTimeout(t.Context(), 3*testutil.Timeout)
+	defer cancel()
+	cmd := command(t, s, ctx, r)
+	out, err := cmd.Output()
+	if cmd.ProcessState == nil {
+		require.NoError(t, err)
+	}
+	require.NoError(t, ctx.Err(), "the run outlived its bound")
+	return ExitCode(cmd.ProcessState), string(out)
+}
+
+// A process past its CPU time dies of SIGXCPU, which a shell reports as 152.
+func TestACPUSpinEndsWithSIGXCPU(t *testing.T) {
+	s := confining(t)
+
+	code, _ := limitedRun(t, s, Limits{CPUSeconds: 1}, nil, "/bin/sh", "-c", "while :; do :; done")
+
+	assert.Equal(t, 152, code)
+}
+
+func TestOpeningPastTheFileLimitFails(t *testing.T) {
+	s := confining(t)
+
+	code, out := limitedRun(t, s, Limits{OpenFiles: 64}, []string{"KSTACK_SANDBOX_TEST_HELPER=files"}, os.Args[0])
+
+	require.Equal(t, 0, code, out)
+	var n int
+	var emfile bool
+	_, err := fmt.Sscan(out, &n, &emfile)
+	require.NoError(t, err, out)
+	assert.Less(t, n, 64)
+	assert.True(t, emfile, out)
+}
+
+func init() {
+	// forks starts sleep children until it cannot, or until it has started
+	// KSTACK_SANDBOX_TEST_FORKS, so a limit that fails to hold never takes the
+	// machine. It prints how many it started and whether the kernel said
+	// EAGAIN, then waits for its input to end.
+	helpers["forks"] = func() int {
+		most, _ := strconv.Atoi(os.Getenv("KSTACK_SANDBOX_TEST_FORKS"))
+		n := 0
+		var err error
+		for ; n < most; n++ {
+			if err = exec.Command("sleep", "1000").Start(); err != nil {
+				break
+			}
+		}
+		fmt.Println(n, errors.Is(err, syscall.EAGAIN))
+		_, _ = io.Copy(io.Discard, os.Stdin)
+		return 0
+	}
+}
+
+// forkLoop runs the forks helper through s under l, at most most children,
+// calls whileFull once it stops, and answers how many children it started,
+// whether it stopped on EAGAIN, and whileFull's error.
+func forkLoop(t *testing.T, s *Sandbox, l Limits, most int, whileFull func() error) (n int, eagain bool, err error) {
+	t.Helper()
+	env := []string{"KSTACK_SANDBOX_TEST_HELPER=forks", "KSTACK_SANDBOX_TEST_FORKS=" + strconv.Itoa(most)}
+	cmd := command(t, s, t.Context(), limitedRunOf(t, s, l, env, os.Args[0]))
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	in, err := cmd.StdinPipe()
+	require.NoError(t, err)
+	out, err := cmd.StdoutPipe()
+	require.NoError(t, err)
+	require.NoError(t, cmd.Start())
+	t.Cleanup(func() { _ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); _ = cmd.Wait() })
+
+	line, err := bufio.NewReader(out).ReadString('\n')
+	require.NoError(t, err)
+	_, err = fmt.Sscan(line, &n, &eagain)
+	require.NoError(t, err, line)
+	err = whileFull()
+	_ = in.Close()
+	return n, eagain, err
+}
+
+// Where the kernel counts the user's whole machine, a margin over the count
+// still stops a fork loop. Other tests move the count, so the bound is loose:
+// the test proves a limit holds, not its value.
+func TestAForkLoopStopsUnderAMachineWideCount(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("the kernel holds root to no process limit")
+	}
+	s := confining(t)
+	base, err := s.CountedProcesses()
+	require.NoError(t, err)
+	if base == 0 {
+		t.Skip("the run counts its own namespace alone")
+	}
+
+	n, eagain, _ := forkLoop(t, s, Limits{Processes: base + 512, OpenFiles: 4096}, 4096, func() error { return nil })
+
+	assert.Less(t, n, 4096)
+	assert.True(t, eagain)
+}
+
+// sudo cannot gain root: Linux sets no_new_privs, and macOS refuses to start
+// it.
+func TestSudoCannotGainRoot(t *testing.T) {
+	if out, err := exec.Command("sudo", "-n", "id", "-u").Output(); err != nil || string(out) != "0\n" {
+		t.Skip("sudo does not gain root outside the sandbox without a password")
+	}
+	s := confining(t)
+
+	code, out := limitedRun(t, s, Limits{}, nil, "/bin/sh", "-c", "sudo -n id -u")
+
+	assert.NotEqual(t, 0, code)
+	assert.NotContains(t, out, "0")
 }

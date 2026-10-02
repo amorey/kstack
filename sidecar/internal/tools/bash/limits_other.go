@@ -12,12 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package sandbox
+//go:build !linux
 
-// forwarderTasks is how many processes a run's process limit holds for the
-// forwarder: itself, since macOS counts processes, never threads.
-const forwarderTasks = 1
+package bash
 
-// guardMemory has nothing to do: the forwarder is never a PID namespace's
-// first process on macOS.
-func guardMemory() error { return nil }
+// limitMemory is 0: no macOS process can set a useful address-space limit.
+const limitMemory = 0
+
+// processMargin is how many processes a sandboxed run may start over what the
+// kernel already counts against it: a shell, its tools and a parallel xargs
+// are a few dozen.
+func processMargin(int) int {
+	return 512
+}
