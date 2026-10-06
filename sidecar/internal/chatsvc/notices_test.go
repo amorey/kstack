@@ -195,8 +195,17 @@ func TestANoticeTurnListsAGrantMadeAsItStarts(t *testing.T) {
 	tt := newTaskTool()
 	s := startServiceWithTool(t, tt)
 	home := grantable(t, s)
-	first, ft := startTaskTurn(t, s, tt, nil, "1")
-	awaitTurnDone(t, s, first.ChatID)
+	// The first turn is taken while the task's start holds it, and the hook set
+	// once its goroutine has returned: its kick reads the hook after the slot is
+	// released.
+	tt.holding, tt.hold = make(chan struct{}), make(chan struct{})
+	fakeOf(s).SetToolCalls(taskCall())
+	first := send(t, s, nil, "1", "start it")
+	testutil.Wait(t, tt.holding, "the task's start")
+	turn := heldTurn(t, s, first.ChatID)
+	close(tt.hold)
+	ft := testutil.Recv(t, tt.ready, "the task to start")
+	awaitTurnDone(t, turn)
 	before := newestContextOf(t, s, first.ChatID)
 	code := filepath.Join(home, "code")
 
