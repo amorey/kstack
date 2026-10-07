@@ -7,8 +7,8 @@ on:
   pull_request:
     branches:
       - "**"
-  # The nightly run on main rebuilds the Go caches every PR reads, running
-  # every Go test with nothing replayed from a cache.
+  # The nightly run on main runs every Go test with no result replayed, and
+  # saves the Go caches every PR reads.
   schedule:
     - cron: "0 3 * * *"
   workflow_dispatch:

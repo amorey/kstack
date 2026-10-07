@@ -55,7 +55,7 @@ inputs:
     required: false
     default: 'true'
   go-cache-rebuild:
-    description: 'Whether to skip restoring the Go cache, so the job builds a new one to save'
+    description: 'Whether to expire the cached Go test results, so every test runs and the job saves the cache anew'
     required: false
     default: 'false'
   kubectl-version:
@@ -155,17 +155,24 @@ runs:
         } >> "$GITHUB_OUTPUT"
 
     # The key is this run's own, which never exists, so the prefix finds the
-    # newest cache. A rebuilding run restores nothing, so every test runs, and
-    # the job saves the cache after its tests pass.
+    # newest cache.
     - name: Restore Go cache
-      if: >-
-        inputs.setup-go == 'true' && inputs.go-cache-key != ''
-        && inputs.go-cache-rebuild != 'true'
+      if: inputs.setup-go == 'true' && inputs.go-cache-key != ''
       uses: actions/cache/restore@v6
       with:
         path: ${{ steps.go-cache-paths.outputs.path }}
         key: ${{ steps.go-cache-paths.outputs.key }}
         restore-keys: ${{ steps.go-cache-paths.outputs.prefix }}
+
+    # Expires every recorded test result but keeps the compiled packages, so
+    # every test runs on a warm build. Results recorded after this stay valid,
+    # so a PR restoring the saved cache replays them.
+    - name: Expire cached Go test results
+      if: >-
+        inputs.setup-go == 'true' && inputs.go-cache-key != ''
+        && inputs.go-cache-rebuild == 'true'
+      shell: bash
+      run: go clean -testcache
 
     # bubblewrap and passt (pasta, a run's internet) for the sandbox's tests,
     # which fail rather than skip under KSTACK_REQUIRE_SANDBOX, and iproute2,
