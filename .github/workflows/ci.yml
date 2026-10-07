@@ -7,18 +7,27 @@ on:
   pull_request:
     branches:
       - "**"
-  # Main writes the Go and Rust caches every PR reads.
-  push:
-    branches:
-      - main
+  # The nightly run on main rebuilds the Go caches every PR reads, running
+  # every Go test with nothing replayed from a cache.
+  schedule:
+    - cron: "0 3 * * *"
   workflow_dispatch:
+    inputs:
+      rebuild-cache:
+        description: Rebuild the Go caches, as the nightly run does
+        type: boolean
+        default: false
 
+# A PR's new push cancels its last run. Every other run has a group of its own,
+# so a rebuilding run is never cancelled, nor left pending behind another.
 concurrency:
-  group: ci-${{ github.ref }}
-  # A run on main is left to finish, so it saves its caches.
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
+  # A rebuilding run saves a new Go cache per job and runner. The one it
+  # replaces is never restored again, so it is the first GitHub evicts.
+  REBUILD_CACHE: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || inputs.rebuild-cache == true) }}
   # Full debug info swells the Rust caches and slows linking; line tables keep
   # file:line in test backtraces. Workflow-wide, since rust-cache keys on CARGO_*
   # variables and Rust · Audit borrows Rust · Vet's cache.
@@ -222,11 +231,13 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v6
-      - uses: ./.github/actions/setup-environment
+      - id: setup
+        uses: ./.github/actions/setup-environment
         with:
           setup-go: "true"
           setup-sandbox: "true"
           go-cache-key: ${{ github.job }}-${{ matrix.runner }}
+          go-cache-rebuild: ${{ env.REBUILD_CACHE }}
       - name: Build
         working-directory: ./sidecar
         run: go build
@@ -237,6 +248,14 @@ jobs:
         if: ${{ !(matrix.os == 'windows' && matrix.arch == 'arm64') }}
         working-directory: ./sidecar
         run: go test -race ./...
+      # After every test passed, so a failed job leaves its runner's last cache
+      # the newest. The test flags must match a PR's, or a PR replays nothing.
+      - name: Save Go cache
+        if: env.REBUILD_CACHE == 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ steps.setup.outputs.go-cache-path }}
+          key: ${{ steps.setup.outputs.go-cache-key }}
 
   go-coverage:
     name: Go · Coverage
