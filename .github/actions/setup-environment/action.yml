@@ -1,6 +1,14 @@
 name: 'Setup Environment'
 description: 'Sets up Node.js, PNPM, Go, and Rust conditionally for building Kstack'
 
+outputs:
+  go-cache-key:
+    description: 'The Go cache this run saves, when it saves one'
+    value: ${{ steps.go-cache-paths.outputs.key }}
+  go-cache-path:
+    description: 'The directories the Go cache holds'
+    value: ${{ steps.go-cache-paths.outputs.path }}
+
 inputs:
   github-token:
     description: 'GitHub token'
@@ -43,9 +51,13 @@ inputs:
     required: false
     default: ''
   cache-save:
-    description: 'Whether to save the Go and Rust caches, which happens on main alone'
+    description: 'Whether to save the Rust cache, which happens on main alone'
     required: false
     default: 'true'
+  go-cache-rebuild:
+    description: 'Whether to skip restoring the Go cache, so the job builds a new one to save'
+    required: false
+    default: 'false'
   kubectl-version:
     description: 'kubectl version the sandbox tests run'
     required: false
@@ -123,39 +135,37 @@ runs:
         go-version: ${{ inputs.go-version }}
         cache: false
 
+    # One Go cache per job and runner, named after the run that saved it. GOCACHE
+    # is content-addressed, so a cache from before a go.sum change is still
+    # right, just partly unused. The prefix ends in `-run-` because one runner's
+    # name can start another's (ubuntu-24.04, ubuntu-24.04-arm).
     - name: Find Go cache paths
       if: inputs.setup-go == 'true' && inputs.go-cache-key != ''
       id: go-cache-paths
       shell: bash
+      env:
+        PREFIX: go-${{ inputs.go-version }}-${{ inputs.go-cache-key }}-run-
       run: |
-        echo "gomodcache=$(go env GOMODCACHE)" >> "$GITHUB_OUTPUT"
-        echo "gocache=$(go env GOCACHE)" >> "$GITHUB_OUTPUT"
+        {
+          echo "prefix=$PREFIX"
+          echo "key=$PREFIX$GITHUB_RUN_ID"
+          echo "path<<EOF"
+          go env GOMODCACHE GOCACHE
+          echo "EOF"
+        } >> "$GITHUB_OUTPUT"
 
-    # Saved on main alone, as the Rust cache is. actions/cache saves in its
-    # post step, so main takes it and everywhere else takes restore alone.
-    - name: Set up Go cache
-      if: >-
-        inputs.setup-go == 'true' && inputs.go-cache-key != ''
-        && inputs.cache-save == 'true' && github.ref == 'refs/heads/main'
-      uses: actions/cache@v6
-      with:
-        path: |
-          ${{ steps.go-cache-paths.outputs.gomodcache }}
-          ${{ steps.go-cache-paths.outputs.gocache }}
-        key: go-${{ inputs.go-version }}-${{ inputs.go-cache-key }}-${{ hashFiles('sidecar/go.sum') }}
-        restore-keys: go-${{ inputs.go-version }}-${{ inputs.go-cache-key }}-
-
+    # The key is this run's own, which never exists, so the prefix finds the
+    # newest cache. A rebuilding run restores nothing, so every test runs, and
+    # the job saves the cache after its tests pass.
     - name: Restore Go cache
       if: >-
         inputs.setup-go == 'true' && inputs.go-cache-key != ''
-        && !(inputs.cache-save == 'true' && github.ref == 'refs/heads/main')
+        && inputs.go-cache-rebuild != 'true'
       uses: actions/cache/restore@v6
       with:
-        path: |
-          ${{ steps.go-cache-paths.outputs.gomodcache }}
-          ${{ steps.go-cache-paths.outputs.gocache }}
-        key: go-${{ inputs.go-version }}-${{ inputs.go-cache-key }}-${{ hashFiles('sidecar/go.sum') }}
-        restore-keys: go-${{ inputs.go-version }}-${{ inputs.go-cache-key }}-
+        path: ${{ steps.go-cache-paths.outputs.path }}
+        key: ${{ steps.go-cache-paths.outputs.key }}
+        restore-keys: ${{ steps.go-cache-paths.outputs.prefix }}
 
     # bubblewrap and passt (pasta, a run's internet) for the sandbox's tests,
     # which fail rather than skip under KSTACK_REQUIRE_SANDBOX, and iproute2,
