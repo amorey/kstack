@@ -121,12 +121,12 @@ describe('ContextOmnibox', () => {
     expect(clusterSegment()).toHaveTextContent('staging');
   });
 
-  it('opens the memory dialog from the brain icon', async () => {
+  it('opens the memory popover from the brain icon', async () => {
     const user = userEvent.setup();
     render(<ContextOmnibox />);
 
     await user.click(screen.getByRole('button', { name: 'Memory' }));
-    expect(openDialog).toHaveBeenCalledWith('memories');
+    expect(screen.getByText('Memory', { selector: 'p' })).toBeInTheDocument();
   });
 
   it('lights the brain icon while the cluster sees any memory', () => {
