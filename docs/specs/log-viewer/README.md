@@ -38,7 +38,8 @@ never redesigned.
 ## The shape of the work
 
 **Steps are numbered in waves.** `1A` and `1B` can be built at the same time: one is the sidecar,
-the other the webview, and they meet only in step 2. `3A` and `3B` can be built at the same time
+the other the webview, and they meet only in step 2. `1C` changes the sidecar's cursor text
+behind step 2's client, which never reads one, so it can be built beside either. `3A` and `3B` can be built at the same time
 too, since each adds to the rows step 2 draws and neither needs the other. Prose says "step 1A".
 
 **Every step can ship.** Step 1A serves lines nothing reads yet. Step 1B is a core with tests and
@@ -46,7 +47,7 @@ no screen. Step 2 is the first thing a user sees, and it is already useful. Step
 add a feature the viewer works without.
 
 **Copy, then reshape.** Each step names the kubetail files it starts from and what changes. The
-rule: take what works, change what kstack's contracts need, and drop what kstack has no use for.
+rule: take what works, change what kstack's contracts need, fix what is wrong, and drop what kstack has no use for.
 
 **Attribution.** Both projects are Apache 2.0, and kubetail's files are copyright "The Kubetail
 Authors", which includes contributors outside this team, so a copied file keeps their notice.
@@ -75,7 +76,8 @@ section.
 
 - **The `Client` is the seam.** Four fetches — since, until, after, before, each a cursor and a
   limit answering records and a next cursor — and one `subscribe(after)`. A cursor names a
-  line and is opaque to the client. The core knows nothing else, and the sidebar and a future inline card share the
+  line and is opaque to the client; a bare RFC 3339 time names a moment, the one form a
+  client mints. The core knows nothing else, and the sidebar and a future inline card share the
   client, not the component.
 - **Lines come through GraphQL.** A `logsFetch` query and a `logsFollow` subscription on the
   sidecar's schema, carrying a `LogsViewInput` built field by field from the `LogsViewAction` the
@@ -101,13 +103,14 @@ section.
   `Viewport` with the selection. A reader pulls it once.
 - **Log text is cluster data.** The sidecar strips terminal control sequences before a line
   reaches the wire, and every cell is drawn as text through the sinks the transcript uses.
-- **The core is a library, and the lint holds the line.** `src/lib/log-viewer/` imports nothing
-  from the app. It knows lines, cursors, anchors and a scroll element, and nothing about
-  columns, cells, the viewport, GraphQL or the error bus. Everything that knows those —
-  the client, the rows, the widths, the toolbar, the selection — lives beside `LogViewer` in
-  `src/components/widgets/`. The app imports the library; the library imports `react` and
-  `@tanstack/react-virtual`. An ESLint config object scoped to the directory fails any import
-  from `@/`.
+- **The core is a library.** `src/lib/log-viewer/` imports `react` — and
+  `@tanstack/react-virtual` once the core lands — and its own files, and nothing else. It knows
+  lines, cursors, anchors and a scroll element, and nothing about columns, cells, the viewport,
+  GraphQL or the error bus. Everything that knows those — the client, the viewport, the rows,
+  the widths, the toolbar, the selection — lives in the app, beside `LogViewer` in
+  `src/components/widgets/` or under `src/lib/`. The boundary is held by convention, not by
+  lint, while the library may still change shape; its `README.md` states the contract and the
+  boundary, so the directory reads as a package of its own.
 - **The viewer's props stay as they are, but for one name.** `query`, `openAt`, `pinToEnd` and
   `viewport`, keyed on the call's id by its mount. Rung 1 called the last `store` and its type
   `ViewerStore`; step 1B renames them, since a store sounds like where the lines are kept, and
@@ -124,6 +127,7 @@ section.
 | --- | --- | --- |
 | 1A | Lines from the sidecar | [1A-lines-from-the-sidecar.md](1A-lines-from-the-sidecar.md) |
 | 1B | The headless core | [1B-the-headless-core.md](1B-the-headless-core.md) |
+| 1C | Opaque cursors | [1C-opaque-cursors.md](1C-opaque-cursors.md) |
 | 2 | The viewer in the sidebar | [2-the-viewer-in-the-sidebar.md](2-the-viewer-in-the-sidebar.md) |
 | 3A | Columns, wrap and controls | [3A-columns-wrap-and-controls.md](3A-columns-wrap-and-controls.md) |
 | 3B | Select and copy | [3B-select-and-copy.md](3B-select-and-copy.md) |
@@ -154,11 +158,11 @@ section.
 
 Fixed here so the steps agree. Go paths are under `sidecar/internal/`.
 
-- **A line** (a *record* in kubetail's code): one log line with its timestamp, its message and
-  its source — the namespace, pod and container it came from, whether it is from the instance
-  before the last restart, and the node it ran on with the node's region, zone, OS and
-  architecture. On the wire it is `LogRecord`; in the webview, `LogLine` in the library's
-  `src/lib/log-viewer/types.ts`, which the viewport imports.
+- **A line** (a *record* in kubetail's code): one log line with its timestamp, its message, its
+  stream — the namespace, pod and container it came from, and whether it is from the instance
+  before the last restart, which together name it — and its place: the node it ran on with the
+  node's region, zone, OS and architecture. On the wire it is `LogRecord`; in the webview,
+  `LogLine` in the library's `src/lib/log-viewer/types.ts`.
 - **An anchor**: where the viewer is told to be — `Head`, `Tail`, or `At` a moment. The view's
   own word (`LogsViewAnchor` on the wire), and the only position the core's props and handle
   speak of.
@@ -174,7 +178,8 @@ Fixed here so the steps agree. Go paths are under `sidecar/internal/`.
   columns and selection, behind the props the sidebar mounts.
 - **The viewport**: what one viewer has on screen — the visible range, whether it is at the
   end and pinned there, how many lines, and the selection — as a `Viewport` value held by a
-  `ViewportHandle` the viewer writes and the composer pulls at send. `src/lib/viewport.ts`. Not
-  the lines: those are the core's.
+  `ViewportHandle` the viewer writes and the composer pulls at send. `src/lib/viewport.ts`, the
+  app's, since the selection is the viewer's and the reader is the composer. Not the lines:
+  those are the core's.
 - **`services/logs`**: the sidecar package that resolves a view's sources against the mirror and
   streams their lines.
