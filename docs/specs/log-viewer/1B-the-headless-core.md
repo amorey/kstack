@@ -6,8 +6,9 @@ status: In progress
 
 # The headless core
 
-**Needs:** `wip/log-views` as it stands after rung 1. **Unblocks:** step 2. Can be built beside
-step 1A.
+**Needs:** `wip/log-views` as it stands after rung 1. **Unblocks:** step 1D, which rebuilds the
+core this step built over a contract the sidecar owns; what it changes here is in its §4–§7.
+Can be built beside step 1A.
 
 ## In short
 
