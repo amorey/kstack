@@ -12,22 +12,31 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import { useState } from 'react';
+
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it } from 'vitest';
 
 import { MemoryRail } from '@/components/widgets/memory-rail';
 
+// `MemoryRail` is controlled; this wrapper gives each test somewhere for the
+// selection to live, the way `MemoryPopoverContent` does.
+function ControlledRail() {
+  const [selected, setSelected] = useState('Minikube');
+  return <MemoryRail defaultCluster="Minikube" selected={selected} onSelect={setSelected} />;
+}
+
 describe('MemoryRail', () => {
   it('starts with the cluster group expanded and its first cluster selected', () => {
-    render(<MemoryRail />);
+    render(<ControlledRail />);
     expect(screen.getByRole('button', { name: 'Cluster' })).toHaveAttribute('aria-expanded', 'true');
     expect(screen.getByRole('button', { name: 'Minikube' })).toHaveAttribute('aria-pressed', 'true');
   });
 
   it('collapses the cluster group without losing the selection', async () => {
     const user = userEvent.setup();
-    render(<MemoryRail />);
+    render(<ControlledRail />);
 
     await user.click(screen.getByRole('button', { name: 'Cluster' }));
     expect(screen.getByRole('button', { name: 'Cluster' })).toHaveAttribute('aria-expanded', 'false');
@@ -39,7 +48,7 @@ describe('MemoryRail', () => {
 
   it('selects one row at a time, cluster or General', async () => {
     const user = userEvent.setup();
-    render(<MemoryRail />);
+    render(<ControlledRail />);
 
     await user.click(screen.getByRole('button', { name: '2nd Cluster' }));
     expect(screen.getByRole('button', { name: '2nd Cluster' })).toHaveAttribute('aria-pressed', 'true');

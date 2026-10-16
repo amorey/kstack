@@ -13,9 +13,10 @@
 // limitations under the License.
 
 // The memory popover's skeleton: layout, spacing and color tokens lifted from the
-// Figma frame (node 36965:38530). The rail (`MemoryRail`) is wired for real; the
-// rest is still a static placeholder — those land component by component on top
-// of this shape.
+// Figma frame (node 36965:38530). The rail (`MemoryRail`) and the viewing-other-
+// cluster banner (node 36965:37953) are wired for real; the rest is still a
+// static placeholder — those land component by component on top of this shape.
+import { useState } from 'react';
 import type { ReactElement, RefObject } from 'react';
 
 import { Popover as PopoverPrimitive } from '@base-ui/react/popover';
@@ -23,6 +24,7 @@ import { Pencil, Trash2, X } from 'lucide-react';
 
 import { PopoverClose } from '@kubetail/ui/elements/popover';
 
+import { useActiveKubeContext } from '@/lib/active-kube-context';
 import { MemoryRail } from '@/components/widgets/memory-rail';
 
 function MemoryInstructions() {
@@ -84,10 +86,49 @@ function SavedMemories() {
   );
 }
 
-function MemoryDetail() {
+// Node 36965:37953: shown only while browsing a cluster other than the window's
+// active one — General included, since "another cluster's memory" means a
+// cluster, not the cross-cluster bucket.
+function ViewingOtherClusterBanner({
+  cluster,
+  defaultCluster,
+  onBackToDefault,
+}: {
+  cluster: string;
+  defaultCluster: string;
+  onBackToDefault: () => void;
+}) {
+  return (
+    <div className="flex w-full shrink-0 items-center gap-2 rounded-lg bg-accent px-3 py-1.5">
+      <p className="flex-1 text-xs text-accent-foreground">Viewing {cluster}’s memory.</p>
+      <button type="button" onClick={onBackToDefault} className="text-xs font-medium text-primary">
+        Back to {defaultCluster}
+      </button>
+    </div>
+  );
+}
+
+function MemoryDetail({
+  selected,
+  defaultCluster,
+  onBackToDefault,
+}: {
+  selected: string;
+  defaultCluster: string;
+  onBackToDefault: () => void;
+}) {
+  const viewingOtherCluster = selected !== defaultCluster && selected !== 'General';
+
   return (
     <div className="flex h-full min-w-0 flex-1 flex-col gap-6 pl-4">
       <div className="flex min-h-0 flex-1 flex-col gap-5">
+        {viewingOtherCluster && (
+          <ViewingOtherClusterBanner
+            cluster={selected}
+            defaultCluster={defaultCluster}
+            onBackToDefault={onBackToDefault}
+          />
+        )}
         <MemoryInstructions />
         <SavedMemories />
       </div>
@@ -102,6 +143,14 @@ function MemoryDetail() {
 }
 
 export function MemoryPopoverContent() {
+  // The rail's default row is always the window's active cluster — placeholder
+  // 'Minikube' until the window has resolved one, matching the other rail rows,
+  // which are placeholders too until the real cluster list is wired. `selected`
+  // starts unset so it tracks that default live; picking a row fixes it.
+  const { context } = useActiveKubeContext();
+  const defaultCluster = context || 'Minikube';
+  const [selected, setSelected] = useState<string | null>(null);
+
   return (
     <div className="flex w-full flex-col gap-3 p-[18px]">
       <div className="flex flex-col gap-0.5">
@@ -116,9 +165,13 @@ export function MemoryPopoverContent() {
         </p>
       </div>
       <div className="flex h-96 items-start">
-        <MemoryRail />
+        <MemoryRail defaultCluster={defaultCluster} selected={selected ?? defaultCluster} onSelect={setSelected} />
         <div className="h-full w-px shrink-0 bg-border" />
-        <MemoryDetail />
+        <MemoryDetail
+          selected={selected ?? defaultCluster}
+          defaultCluster={defaultCluster}
+          onBackToDefault={() => setSelected(defaultCluster)}
+        />
       </div>
     </div>
   );

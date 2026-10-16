@@ -14,8 +14,9 @@
 
 // The memory popover's left rail (Figma's `.memoryrail`, node 36946:37550): a
 // Cluster group that collapses to the scoped memories, and a General row beside
-// it for memories that aren't scoped to any cluster. Selecting a row is what
-// decides the detail pane beside it — not wired yet, see `memory-popover.tsx`.
+// it for memories that aren't scoped to any cluster. Selection is controlled by
+// `MemoryPopoverContent`, which the detail pane (and its viewing-other-cluster
+// banner) reads too.
 import { useState } from 'react';
 
 import { ChevronDown } from 'lucide-react';
@@ -49,13 +50,21 @@ const generalRowClass = (selected: boolean) =>
       : 'text-sidebar-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground',
   );
 
-const RAIL_CLUSTERS = ['Minikube', '2nd Cluster', '3rd Cluster', '4th Cluster'];
+// The other clusters are still placeholder names — the real list lands with the
+// cached-data wiring. The default cluster (the window's active one) always leads.
+const OTHER_CLUSTERS = ['2nd Cluster', '3rd Cluster', '4th Cluster'];
 
-export function MemoryRail() {
+export function MemoryRail({
+  defaultCluster,
+  selected,
+  onSelect,
+}: {
+  defaultCluster: string;
+  selected: string;
+  onSelect: (name: string) => void;
+}) {
   const [clusterOpen, setClusterOpen] = useState(true);
-  // Which row reads as selected. Placeholder state: nothing downstream reads it
-  // yet — the detail pane starts following it once that component is wired.
-  const [selected, setSelected] = useState('Minikube');
+  const clusters = [defaultCluster, ...OTHER_CLUSTERS];
 
   return (
     <div className="flex h-full w-44 shrink-0 flex-col gap-2">
@@ -76,12 +85,12 @@ export function MemoryRail() {
         </button>
         {clusterOpen && (
           <div className="flex flex-col gap-1 px-1.5 py-0.5">
-            {RAIL_CLUSTERS.map((name) => (
+            {clusters.map((name) => (
               <button
                 key={name}
                 type="button"
                 aria-pressed={selected === name}
-                onClick={() => setSelected(name)}
+                onClick={() => onSelect(name)}
                 className={clusterRowClass(selected === name)}
               >
                 {name}
@@ -90,14 +99,16 @@ export function MemoryRail() {
           </div>
         )}
       </div>
-      <button
-        type="button"
-        aria-pressed={selected === 'General'}
-        onClick={() => setSelected('General')}
-        className={generalRowClass(selected === 'General')}
-      >
-        General
-      </button>
+      <div className="pr-1.5">
+        <button
+          type="button"
+          aria-pressed={selected === 'General'}
+          onClick={() => onSelect('General')}
+          className={generalRowClass(selected === 'General')}
+        >
+          General
+        </button>
+      </div>
     </div>
   );
 }
