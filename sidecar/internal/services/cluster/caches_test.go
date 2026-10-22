@@ -1263,6 +1263,20 @@ func syncingCacheWithKinds(t *testing.T) (deps, ClusterCacheID) {
 	return d, ClusterCacheID(cache.ID)
 }
 
+// watchSyncStatus opens the sync-detail gauge and ends it before the test's temp dir goes:
+// the pump reopens the cache's file every tick, and Windows removes no open file.
+func watchSyncStatus(t *testing.T, svc *service, clusterID ClusterID, cacheID ClusterCacheID) *Stream[ClusterCacheSyncStatus] {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	stream, err := svc.Caches().WatchSyncStatus(ctx, clusterID, cacheID)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		cancel()
+		testutil.WaitClosed(t, stream.Frames, "the gauge to stop")
+	})
+	return stream
+}
+
 // setKindReason is one kind's worker having settled somewhere.
 func setKindReason(d deps, cacheID ClusterCacheID, spec ClusterCachedKindSpec, state kubesync.KindState) {
 	syncFake(d).setKindState(int64(cacheID), toKubestoreKind(spec), state)
@@ -1498,8 +1512,7 @@ func TestCachesWatchSyncStatusServesTheDiscoveryReasonAndEveryKind(t *testing.T)
 		Reason: kubesync.ReasonSyncFailed, Message: "forbidden", Restarts: 3,
 	})
 
-	stream, err := serviceOver(t, d).Caches().WatchSyncStatus(context.Background(), ownerClusterOf(t, d, cacheID), cacheID)
-	require.NoError(t, err)
+	stream := watchSyncStatus(t, serviceOver(t, d), ownerClusterOf(t, d, cacheID), cacheID)
 
 	got := testutil.Recv(t, stream.Frames, "the cache's sync detail")
 	assert.Equal(t, kubesync.ReasonPartial, got.Discovery.Reason)
@@ -1523,8 +1536,7 @@ func TestCachesWatchSyncStatusCarriesAStoreFailure(t *testing.T) {
 		Reason: kubesync.ReasonStoreFailed, Message: "disk full",
 	})
 
-	stream, err := serviceOver(t, d).Caches().WatchSyncStatus(context.Background(), ownerClusterOf(t, d, cacheID), cacheID)
-	require.NoError(t, err)
+	stream := watchSyncStatus(t, serviceOver(t, d), ownerClusterOf(t, d, cacheID), cacheID)
 
 	got := testutil.Recv(t, stream.Frames, "the cache's sync detail")
 	assert.Equal(t, kubesync.ReasonStoreFailed, got.Discovery.Reason)
@@ -1539,8 +1551,7 @@ func TestCachesWatchSyncStatusReadsAPausedKindOffItsRecord(t *testing.T) {
 	writeCatalog(t, d, cacheID, kindRow("v1", "Pod", "pods"))
 	pauseKind(t, d, beehive.ObjectID(cacheID), "v1", "pods")
 
-	stream, err := serviceOver(t, d).Caches().WatchSyncStatus(context.Background(), ownerClusterOf(t, d, cacheID), cacheID)
-	require.NoError(t, err)
+	stream := watchSyncStatus(t, serviceOver(t, d), ownerClusterOf(t, d, cacheID), cacheID)
 
 	got := testutil.Recv(t, stream.Frames, "the cache's sync detail")
 	require.Len(t, got.Kinds, 2)
@@ -1556,15 +1567,7 @@ func TestCachesWatchSyncStatusEmitsOnlyOnAChange(t *testing.T) {
 
 	svc := serviceOver(t, d)
 	svc.gaugeCadence = time.Millisecond
-	// Ended before the temp dir goes: at this cadence the pump reopens the cache's file
-	// every tick, and one landing mid-cleanup fails the test on a directory it refilled.
-	ctx, cancel := context.WithCancel(context.Background())
-	stream, err := svc.Caches().WatchSyncStatus(ctx, ownerClusterOf(t, d, cacheID), cacheID)
-	require.NoError(t, err)
-	defer func() {
-		cancel()
-		testutil.WaitClosed(t, stream.Frames, "the gauge to stop")
-	}()
+	stream := watchSyncStatus(t, svc, ownerClusterOf(t, d, cacheID), cacheID)
 	testutil.Recv(t, stream.Frames, "the first detail")
 
 	// A negative assertion has no event to wait for, so it takes a bounded window — many
@@ -1583,8 +1586,7 @@ func TestCachesWatchSyncStatusCountsRowsFromTheStore(t *testing.T) {
 	d, cacheID := syncingCacheWithKinds(t)
 	writeCatalog(t, d, cacheID, kindRow("v1", "Pod", "pods"))
 
-	stream, err := serviceOver(t, d).Caches().WatchSyncStatus(context.Background(), ownerClusterOf(t, d, cacheID), cacheID)
-	require.NoError(t, err)
+	stream := watchSyncStatus(t, serviceOver(t, d), ownerClusterOf(t, d, cacheID), cacheID)
 
 	got := testutil.Recv(t, stream.Frames, "the cache's sync detail")
 	require.Len(t, got.Kinds, 2)
@@ -1596,8 +1598,7 @@ func TestCachesWatchSyncStatusCountsRowsFromTheStore(t *testing.T) {
 func TestCachesWatchSyncStatusHoldsSilentForAMismatchedPair(t *testing.T) {
 	d, cacheID := syncingCacheWithKinds(t)
 
-	stream, err := serviceOver(t, d).Caches().WatchSyncStatus(context.Background(), ClusterID("999"), cacheID)
-	require.NoError(t, err)
+	stream := watchSyncStatus(t, serviceOver(t, d), ClusterID("999"), cacheID)
 
 	testutil.NoRecv(t, stream.Frames, 50*time.Millisecond, "a verdict for a cache that is not this cluster's")
 }
@@ -2488,8 +2489,7 @@ func TestCachesSyncStatusIsOneReadingOfTheGauge(t *testing.T) {
 	got, ok, err := svc.Caches().SyncStatus(context.Background(), ownerClusterOf(t, d, cacheID), cacheID)
 	require.NoError(t, err)
 	require.True(t, ok)
-	stream, err := svc.Caches().WatchSyncStatus(context.Background(), ownerClusterOf(t, d, cacheID), cacheID)
-	require.NoError(t, err)
+	stream := watchSyncStatus(t, svc, ownerClusterOf(t, d, cacheID), cacheID)
 	want := testutil.Recv(t, stream.Frames, "the gauge's first frame")
 
 	assert.Equal(t, want, got)
