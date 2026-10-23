@@ -39,6 +39,7 @@ const line = (i: number, message = `line ${i}`): LogsReadAction['lines'][number]
   container: 'app',
   previous: false,
   message,
+  truncatedBytes: 0,
   gap: null,
 });
 
@@ -66,17 +67,18 @@ const action: LogsReadAction = {
   grep: 'error',
   since: '2026-10-17T09:13:00Z',
   until: null,
-  mode: 'Head',
+  before: { lines: 0, span: '' },
+  after: { lines: 0, span: '' },
+  pageFrom: 'First',
   resolvedAt: '2026-10-17T10:00:00Z',
   lines: [
     line(0, '<b>bold</b> ‮reversed'),
     { ...line(1), gap: { after: '2026-10-17T09:14:00Z', before: '2026-10-17T09:14:01Z' } },
     ...Array.from({ length: 10 }, (_, i) => line(i + 2)),
   ],
-  dropped: 3,
-  before: 'Unread',
-  after: 'More',
-  skipped: ['webapp-b/app: forbidden'],
+  olderMore: true,
+  newerMore: true,
+  notices: [{ code: 'stream-skipped', message: 'webapp-b/app: forbidden' }],
   viewAround,
 };
 
@@ -127,9 +129,15 @@ describe('LogsReadCard', () => {
     expect(container).toHaveTextContent('“Why checkout failed”');
   });
 
-  it('draws the range’s two ends and a tail read’s mode', () => {
-    const { container } = draw({ read: { ...action, since: null, until: '2026-10-17T09:15:00Z', mode: 'Tail' } });
+  it('draws the range’s two ends and a read of the newest', () => {
+    const { container } = draw({ read: { ...action, since: null, until: '2026-10-17T09:15:00Z', pageFrom: 'Last' } });
     expect(container).toHaveTextContent('up to 2026-10-17T09:15:00Z, the newest');
+  });
+
+  it('draws the padding as the action holds it, and no end for a continuation', () => {
+    const read = { ...action, before: { lines: 100, span: '' }, after: { lines: 0, span: 'PT5M' }, pageFrom: null };
+    const { container } = draw({ read });
+    expect(container).toHaveTextContent('from 2026-10-17T09:13:00Z, 100 lines before, PT5M after, matching /error/');
   });
 
   it('draws the first eight rows from the action alone, holes included, and requests nothing', () => {
@@ -153,19 +161,27 @@ describe('LogsReadCard', () => {
     expect(container.querySelector('mark')).not.toBeNull();
   });
 
-  it('words what the model saw beyond the lines: the dropped, each edge, the skipped streams', () => {
-    const { container } = draw();
-    expect(container).toHaveTextContent('3 more lines were left out');
-    expect(container).toHaveTextContent('older lines may exist');
-    expect(container).toHaveTextContent('newer lines exist');
-    expect(container).toHaveTextContent('could not read webapp-b/app: forbidden');
+  it('words what the model saw beyond the lines: each side with more, then each notice', () => {
+    draw();
+    expect(screen.getByTestId('logs-read-beyond')).toHaveTextContent(
+      'Older lines exist. Newer lines exist. webapp-b/app: forbidden',
+    );
+    expect(screen.getByText('webapp-b/app: forbidden').closest('[title]')).toHaveAttribute('title', 'stream-skipped');
   });
 
-  it('says nothing of an edge that is the end, and words a cursor’s side as more', () => {
-    const { container } = draw({ read: { ...action, before: 'More', after: 'End', dropped: 0, skipped: [] } });
-    expect(container).toHaveTextContent('older lines exist');
-    expect(container).not.toHaveTextContent('newer lines');
-    expect(container).not.toHaveTextContent('left out');
+  it('says nothing of a side with no more, and nothing at all with neither and no notice', () => {
+    const { container, unmount } = draw({ read: { ...action, newerMore: false, notices: [] } });
+    expect(screen.getByTestId('logs-read-beyond')).toHaveTextContent(/^Older lines exist\.$/);
+    expect(container).not.toHaveTextContent('Newer lines');
+    unmount();
+
+    draw({ read: { ...action, olderMore: false, newerMore: false, notices: [] } });
+    expect(screen.queryByTestId('logs-read-beyond')).toBeNull();
+  });
+
+  it('ends a cut line with what the server cut', () => {
+    draw({ read: { ...action, lines: [{ ...line(0), truncatedBytes: 4096 }] } });
+    expect(rows()[0]).toHaveTextContent('line 0 … 4 KiB cut');
   });
 
   it('View around this focuses the read’s view around at this call', () => {
@@ -181,8 +197,58 @@ describe('LogsReadCard', () => {
   });
 
   it('has no View around this for a read of no line, and says there were none', () => {
-    const { container } = draw({ read: { ...action, lines: [], viewAround: null, dropped: 0 } });
+    const { container } = draw({ read: { ...action, lines: [], viewAround: null } });
     expect(screen.queryByRole('button', { name: 'View around this' })).not.toBeInTheDocument();
     expect(container).toHaveTextContent('No lines');
+  });
+});
+
+describe('LogsReadCard tags', () => {
+  const tagOf = (row: HTMLElement) => {
+    const first = row.firstElementChild?.textContent ?? '';
+    return first === 'before' || first === 'after' ? first : null;
+  };
+  const tagged = (read: LogsReadAction) => {
+    draw({ read });
+    return rows().map(tagOf);
+  };
+  const at = (stamp: string) => ({ ...line(0), timestamp: stamp });
+
+  it('tags a line stamped before `since` as before', () => {
+    const read = {
+      ...action,
+      before: { lines: 2, span: '' },
+      lines: [at('2026-10-17T09:12:59Z'), at('2026-10-17T09:13:00Z')],
+    };
+    expect(tagged(read)).toEqual(['before', null]);
+  });
+
+  it('tags a line stamped after `until` as after', () => {
+    const read = {
+      ...action,
+      until: '2026-10-17T09:15:00Z',
+      after: { lines: 0, span: 'PT1M' },
+      lines: [at('2026-10-17T09:15:00Z'), at('2026-10-17T09:15:00.000000001Z')],
+    };
+    expect(tagged(read)).toEqual([null, 'after']);
+  });
+
+  it('with `until` open and padding after, tags a line at or past `resolvedAt` as after', () => {
+    const read = {
+      ...action,
+      after: { lines: 5, span: '' },
+      lines: [at('2026-10-17T09:59:59.999999999Z'), at('2026-10-17T10:00:00Z')],
+    };
+    expect(tagged(read)).toEqual([null, 'after']);
+  });
+
+  it('with `until` open and no padding after, tags nothing after', () => {
+    const read = { ...action, lines: [at('2026-10-17T10:00:00Z'), at('2026-10-17T11:00:00Z')] };
+    expect(tagged(read)).toEqual([null, null]);
+  });
+
+  it('compares stamps as instants, whatever their fraction digits', () => {
+    const read = { ...action, lines: [at('2026-10-17T09:13:00.000Z'), at('2026-10-17T09:12:59.999999999Z')] };
+    expect(tagged(read)).toEqual([null, 'before']);
   });
 });

@@ -17,7 +17,7 @@
 
 import { useEffect, useState, useSyncExternalStore } from 'react';
 
-import { compareTimestamps } from '@/lib/log-viewer';
+import { compareTimestamps, resumeOf } from '@/lib/log-viewer';
 import type { Client, Cursor, FetchQuery, FollowFrame, LogLine, Page } from '@/lib/log-viewer';
 import type { LogsViewAction } from '@/lib/logs-view';
 
@@ -30,7 +30,7 @@ export const READ_ON_PAGES = 4;
 export type InlinePlan = {
   /** The first read. */
   first: FetchQuery;
-  /** Of an `Around` page, the lines before its anchor or from it on; every line of the others. */
+  /** Of an `At` page, the lines before its anchor or from it on; every line of the others. */
   keep: 'before' | 'from' | 'all';
   /** The end the window keeps: a tail window its newest lines, the others their first. */
   end: 'tail' | 'head';
@@ -46,25 +46,27 @@ export type InlinePlan = {
  */
 export function inlinePlan(action: LogsViewAction, until: string | null): InlinePlan {
   const { anchor, pinToEnd, resolvedAt } = action;
-  const read = (mode: FetchQuery['mode'], at: string | null): FetchQuery => ({
-    mode,
-    cursor: null,
-    at,
-    limit: INLINE_LINES,
-  });
+  const limit = INLINE_LINES;
   if (anchor.kind === 'Head') {
-    return { first: read('Head', null), keep: 'all', end: 'head', follow: false, until: null };
+    return { first: { kind: 'First', limit }, keep: 'all', end: 'head', follow: false, until: null };
   }
   if (anchor.kind === 'At') {
-    return { first: read('Around', anchor.at), keep: 'from', end: 'head', follow: false, until: null };
+    return {
+      first: { kind: 'At', at: anchor.at as string, limit },
+      keep: 'from',
+      end: 'head',
+      follow: false,
+      until: null,
+    };
   }
   // A pinned tail runs live while it is the newest and ends where it stopped being live; an
-  // unpinned one never ran and ends at its own moment.
+  // unpinned one never ran and ends at its own moment. The lines before an `At` page's anchor
+  // all precede the moment, so a frozen tail holds none at it.
   const moment = pinToEnd ? until : resolvedAt;
   if (moment === null) {
-    return { first: read('Tail', null), keep: 'all', end: 'tail', follow: true, until: null };
+    return { first: { kind: 'Last', limit }, keep: 'all', end: 'tail', follow: true, until: null };
   }
-  return { first: read('Around', moment), keep: 'before', end: 'tail', follow: false, until: moment };
+  return { first: { kind: 'At', at: moment, limit }, keep: 'before', end: 'tail', follow: false, until: moment };
 }
 
 export type InlineRead = {
@@ -72,7 +74,7 @@ export type InlineRead = {
   lines: LogLine[];
   /** Whether the read stopped short of eight lines with more that way. */
   more: boolean;
-  /** Where a follow goes on from: the first page's `after` edge. */
+  /** Where a follow goes on from: the first page's `resumeOf`. */
   after: Cursor | null;
 };
 
@@ -83,33 +85,29 @@ function kept(page: Page, keep: InlinePlan['keep']): LogLine[] {
 }
 
 /**
- * Reads a window's lines as the plan says. A page short of eight lines whose edge still says
- * `more` spent its budget, as a selective grep does, so the read goes on that way: back from
- * the `before` edge for a tail window, on from the `after` edge for the others.
+ * Reads a window's lines as the plan says. A page short of eight lines with a page on spent its
+ * budget, as a selective grep does, so the read goes on that way: back from `prev` for a tail
+ * window, on from `next` for the others.
  */
 export async function readInline(client: Client, plan: InlinePlan): Promise<InlineRead> {
   const tail = plan.end === 'tail';
   const page = await client.fetch(plan.first);
+  const onward = ({ edges }: Page) => (tail ? edges.prev : edges.next);
   let lines = kept(page, plan.keep);
-  let edge = tail ? page.before : page.after;
-  for (let i = 0; i < READ_ON_PAGES && lines.length < INLINE_LINES && edge.more && edge.cursor !== null; i += 1) {
+  let cursor = onward(page);
+  for (let i = 0; i < READ_ON_PAGES && lines.length < INLINE_LINES && cursor !== null; i += 1) {
     // eslint-disable-next-line no-await-in-loop -- each page starts at the last one's edge
-    const next = await client.fetch({
-      mode: tail ? 'Tail' : 'Head',
-      cursor: edge.cursor,
-      at: null,
-      limit: INLINE_LINES,
-    });
+    const next = await client.fetch({ kind: 'Continue', cursor, seen: null, limit: INLINE_LINES });
     // A page can repeat a line the last one sent; its cursor names it.
     const held = new Set(lines.map((line) => line.cursor));
     const fresh = next.lines.filter((line) => !held.has(line.cursor));
     lines = tail ? [...fresh, ...lines] : [...lines, ...fresh];
-    edge = tail ? next.before : next.after;
+    cursor = onward(next);
   }
   return {
     lines: tail ? lines.slice(-INLINE_LINES) : lines.slice(0, INLINE_LINES),
-    more: lines.length < INLINE_LINES && edge.more,
-    after: page.after.cursor,
+    more: lines.length < INLINE_LINES && cursor !== null,
+    after: resumeOf(page),
   };
 }
 
@@ -215,7 +213,8 @@ export class InlineLines {
       }
     };
     try {
-      this.stopFollow = this.client.follow(after, onFrame, () => this.stop());
+      // From the page's own cursor, which already holds where each stream stopped.
+      this.stopFollow = this.client.follow(after, [], onFrame, () => this.stop());
     } catch {
       this.stop();
     }

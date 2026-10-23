@@ -308,8 +308,8 @@ describe('ChatTranscript', () => {
   it('runs only the newest view live, and reads the older one up to the newer one’s moment', () => {
     draw([msg({ status: 'Complete', toolCalls: [pinnedView('a', T1), pinnedView('b', T2)] })]);
     expect(fetched).toEqual([
-      { mode: 'Around', cursor: null, at: T2, limit: 8 },
-      { mode: 'Tail', cursor: null, at: null, limit: 8 },
+      { kind: 'At', at: T2, limit: 8 },
+      { kind: 'Last', limit: 8 },
     ]);
   });
 
@@ -347,7 +347,9 @@ describe('ChatTranscript', () => {
           resolvedAt: '2026-10-17T10:00:00Z',
           since: '2026-10-17T09:13:00Z',
           until: null,
-          mode: 'Head',
+          before: { lines: 0, span: '' },
+          after: { lines: 0, span: '' },
+          pageFrom: 'First',
           lines: [
             {
               timestamp: '2026-10-17T09:14:00Z',
@@ -356,13 +358,13 @@ describe('ChatTranscript', () => {
               container: 'app',
               previous: false,
               message: 'panic: nil map',
+              truncatedBytes: 0,
               gap: null,
             },
           ],
-          dropped: 0,
-          before: 'Unread',
-          after: 'End',
-          skipped: [],
+          olderMore: true,
+          newerMore: false,
+          notices: [],
           viewAround: null,
         },
       },
@@ -392,6 +394,7 @@ describe('ChatTranscript', () => {
       since: '2026-10-18T13:50:00Z',
       limit: 1,
       maxBytes: 16384,
+      maxMessageBytes: 4096,
       resolvedAt: '2026-10-18T13:50:00Z',
       until: '2026-10-19T13:50:00Z',
     };
@@ -424,6 +427,7 @@ describe('ChatTranscript', () => {
       container: 'app',
       previous: false,
       message: 'panic: nil map',
+      truncatedBytes: 0,
       gap: null,
     };
     draw([

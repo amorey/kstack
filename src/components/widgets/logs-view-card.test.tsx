@@ -178,12 +178,12 @@ describe('LogsViewCard', () => {
   it('draws its window under the receipt, the newest pinned tail reading live', () => {
     draw({ view: tail });
     expect(inline()).toBeInTheDocument();
-    expect(fetched).toEqual([{ mode: 'Tail', cursor: null, at: null, limit: 8 }]);
+    expect(fetched).toEqual([{ kind: 'Last', limit: 8 }]);
   });
 
   it('reads an older card up to the next view’s moment', () => {
     draw({ view: tail, until: '2026-10-08T14:09:00Z' });
-    expect(fetched).toEqual([{ mode: 'Around', cursor: null, at: '2026-10-08T14:09:00Z', limit: 8 }]);
+    expect(fetched).toEqual([{ kind: 'At', at: '2026-10-08T14:09:00Z', limit: 8 }]);
   });
 
   it('draws the window empty until the chat’s cluster is known', () => {

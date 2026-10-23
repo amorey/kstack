@@ -22,12 +22,13 @@ const TAIL: Anchor = { kind: 'Tail', at: null };
 const AT: Anchor = { kind: 'At', at: '2026-10-15T00:00:30Z' };
 
 // Line `i` is stamped `i` seconds past midnight unless told otherwise.
-function line(i: number, second = i): LogLine {
+function line(i: number, second = i, container = 'app'): LogLine {
   return {
     timestamp: `2026-10-15T00:${String(Math.floor(second / 60)).padStart(2, '0')}:${String(second % 60).padStart(2, '0')}Z`,
     cursor: `c${i}`,
     message: `line ${i}`,
-    stream: { namespace: 'ns', pod: 'p', container: 'app', previous: false },
+    truncatedBytes: 0,
+    stream: { namespace: 'ns', pod: 'p', container, previous: false },
     place: { node: '', region: '', zone: '', os: '', arch: '' },
     gap: null,
   };
@@ -35,19 +36,21 @@ function line(i: number, second = i): LogLine {
 
 const range = (from: number, to: number) => Array.from({ length: to - from }, (_, k) => line(from + k));
 
-function page(from: number, to: number, over: Partial<Page> = {}): Page {
+type PageOver = { edges?: Partial<Page['edges']>; anchor?: number | null; notices?: Page['notices'] };
+
+function page(from: number, to: number, over: PageOver = {}): Page {
   return {
     lines: range(from, to),
-    before: { cursor: `before-${from}`, more: true },
-    after: { cursor: `after-${to}`, more: true },
-    anchor: null,
-    skipped: [],
-    ...over,
+    edges: { prev: `before-${from}`, next: `after-${to}`, follow: null, ...over.edges },
+    anchor: over.anchor ?? null,
+    notices: over.notices ?? [],
   };
 }
 
-const END = { cursor: 'live-end', more: false };
-const START = { cursor: null, more: false };
+// The live end: nothing newer to page to, a follow from here.
+const END = { next: null, follow: 'live-end' };
+// Nothing older.
+const START = { prev: null };
 
 function make(options: Partial<LogWindowOptions> = {}): LogWindow {
   return new LogWindow({ pinToEnd: true, firstPageSize: 50, pageSize: 20, ...options });
@@ -85,7 +88,7 @@ describe('before any event', () => {
       length: 0,
       before: { more: false, empty: false, loading: false },
       after: { more: false, empty: false, loading: false },
-      skipped: [],
+      notices: [],
     });
   });
 });
@@ -93,21 +96,21 @@ describe('before any event', () => {
 describe('landing', () => {
   it('asks for the first page each anchor reads, changing nothing', () => {
     const w = make({ firstPageSize: 30 });
-    expect(w.landing(HEAD)).toEqual({ mode: 'Head', cursor: null, at: null, limit: 30 });
-    expect(w.landing(TAIL)).toEqual({ mode: 'Tail', cursor: null, at: null, limit: 30 });
-    expect(w.landing(AT)).toEqual({ mode: 'Around', cursor: null, at: AT.at, limit: 30 });
+    expect(w.landing(HEAD)).toEqual({ kind: 'First', limit: 30 });
+    expect(w.landing(TAIL)).toEqual({ kind: 'Last', limit: 30 });
+    expect(w.landing(AT)).toEqual({ kind: 'At', at: AT.at, limit: 30 });
     expect(w.getSnapshot()).toBe(CORE_INITIAL_STATE);
   });
 
   it('puts key 0 at the first line for Head', () => {
     const w = make();
-    expect(w.landed(page(0, 3, { before: START }), HEAD)).toEqual({ kind: 'none' });
+    expect(w.landed(page(0, 3, { edges: START }), HEAD)).toEqual({ kind: 'none' });
     expect(keys(w)).toEqual([0, 1, 2]);
   });
 
   it('puts key 0 at the last line for Tail, and goes to the end', () => {
     const w = make();
-    expect(w.landed(page(0, 3, { after: END }), TAIL)).toEqual({ kind: 'toEnd' });
+    expect(w.landed(page(0, 3, { edges: END }), TAIL)).toEqual({ kind: 'toEnd' });
     expect(keys(w)).toEqual([-2, -1, 0]);
   });
 
@@ -130,7 +133,7 @@ describe('landing', () => {
   });
 
   it('reads both edges off the page, and marks each empty that held no line and said more', () => {
-    const w = landed(HEAD, page(0, 3, { before: START }), { pinToEnd: false });
+    const w = landed(HEAD, page(0, 3, { edges: START }), { pinToEnd: false });
     expect(w.edges()).toEqual({
       before: { more: false, empty: false, loading: false },
       after: { more: true, empty: false, loading: false },
@@ -146,8 +149,9 @@ describe('landing', () => {
   });
 
   it('publishes what it landed', () => {
-    const w = landed(HEAD, page(0, 3, { skipped: ['ns/q/app: gone'] }), { pinToEnd: false });
-    expect(w.getSnapshot()).toMatchObject({ loading: true, failed: false, length: 3, skipped: ['ns/q/app: gone'] });
+    const gone = { code: 'stream-skipped', message: 'ns/q/app: gone' };
+    const w = landed(HEAD, page(0, 3, { notices: [gone] }), { pinToEnd: false });
+    expect(w.getSnapshot()).toMatchObject({ loading: true, failed: false, length: 3, notices: [gone] });
     w.loadingEnded();
     expect(w.getSnapshot().loading).toBe(false);
   });
@@ -155,20 +159,20 @@ describe('landing', () => {
 
 describe('the pin on landing', () => {
   it('follows a Tail landing with pinToEnd', () => {
-    const w = landed(TAIL, page(0, 3, { after: END }));
+    const w = landed(TAIL, page(0, 3, { edges: END }));
     expect(w.getSnapshot()).toMatchObject({ pinnedToEnd: true, following: true });
     expect(w.following()).toBe(true);
-    expect(w.followFrom()).toBe('live-end');
+    expect(w.followFrom().cursor).toBe('live-end');
   });
 
   it('pins no Tail landing without pinToEnd', () => {
-    const w = landed(TAIL, page(0, 3, { after: END }), { pinToEnd: false });
+    const w = landed(TAIL, page(0, 3, { edges: END }), { pinToEnd: false });
     expect(w.getSnapshot()).toMatchObject({ pinnedToEnd: false, following: false });
   });
 
   it('pins no Head or At landing, even when its page reached the end', () => {
-    expect(landed(HEAD, page(0, 3, { after: END })).getSnapshot().pinnedToEnd).toBe(false);
-    expect(landed(AT, page(0, 3, { after: END, anchor: 1 })).getSnapshot().pinnedToEnd).toBe(false);
+    expect(landed(HEAD, page(0, 3, { edges: END })).getSnapshot().pinnedToEnd).toBe(false);
+    expect(landed(AT, page(0, 3, { edges: END, anchor: 1 })).getSnapshot().pinnedToEnd).toBe(false);
   });
 });
 
@@ -188,17 +192,22 @@ describe('tickets', () => {
     const w = make({ pinToEnd: false });
     expect(w.startPage('after')).toBeNull();
 
-    w.landed(page(10, 20, { before: START }), HEAD);
+    w.landed(page(10, 20, { edges: START }), HEAD);
     expect(w.startPage('before')).toBeNull();
     const ticket = w.startPage('after');
     expect(ticket).not.toBeNull();
     expect(w.startPage('after')).toBeNull();
-    expect(w.query('after')).toEqual({ mode: 'Head', cursor: 'after-20', at: null, limit: 20 });
+    expect(w.query('after')).toEqual({ kind: 'Continue', cursor: 'after-20', seen: ['c19'], limit: 20 });
   });
 
-  it('asks Tail from the before edge’s cursor', () => {
-    const w = landed(TAIL, page(10, 20, { after: END }), { pinToEnd: false });
-    expect(w.query('before')).toEqual({ mode: 'Tail', cursor: 'before-10', at: null, limit: 20 });
+  it('continues from the before edge’s `prev` with no `seen`', () => {
+    const w = landed(TAIL, page(10, 20, { edges: END }), { pinToEnd: false });
+    expect(w.query('before')).toEqual({ kind: 'Continue', cursor: 'before-10', seen: null, limit: 20 });
+  });
+
+  it('continues from the after edge’s `follow` when its `next` is null', () => {
+    const w = landed(TAIL, page(10, 20, { edges: END }), { pinToEnd: false });
+    expect(w.query('after')).toMatchObject({ kind: 'Continue', cursor: 'live-end' });
   });
 
   it('changes nothing for a stale ticket, paged or failed', () => {
@@ -240,37 +249,43 @@ describe('tickets', () => {
 
 describe('paged', () => {
   it('prepends less the held before, holds, and reads the before edge alone', () => {
-    const w = landed(TAIL, page(10, 20, { after: END }), { pinToEnd: false });
+    const w = landed(TAIL, page(10, 20, { edges: END }), { pinToEnd: false });
     const ticket = w.startPage('before') as number;
-    const effect = w.paged(ticket, page(5, 12, { before: START, after: { cursor: 'ignored', more: false } }));
+    const effect = w.paged(ticket, page(5, 12, { edges: { ...START, next: null, follow: 'ignored' } }));
     expect(effect).toEqual({ kind: 'hold' });
     expect(cursors(w)).toEqual(range(5, 20).map((l) => l.cursor));
     expect(w.keyAt(w.getSnapshot().length - 1)).toBe(0);
     expect(w.edges().before).toEqual({ more: false, empty: false, loading: false });
-    expect(w.query('after')).toEqual({ mode: 'Head', cursor: 'live-end', at: null, limit: 20 });
+    expect(w.query('after')).toMatchObject({ cursor: 'live-end' });
   });
 
   it('sets empty before when a page held no line and said more', () => {
-    const w = landed(TAIL, page(10, 20, { after: END }), { pinToEnd: false });
-    w.paged(w.startPage('before') as number, page(0, 0, { before: { cursor: 'older', more: true } }));
+    const w = landed(TAIL, page(10, 20, { edges: END }), { pinToEnd: false });
+    w.paged(w.startPage('before') as number, page(0, 0, { edges: { prev: 'older' } }));
     expect(w.edges().before).toEqual({ more: true, empty: true, loading: false });
     expect(w.getSnapshot().before).toEqual({ more: true, empty: true, loading: false });
-    expect(w.query('before')?.cursor).toBe('older');
+    expect(w.query('before')).toMatchObject({ cursor: 'older' });
   });
 
   it('appends less the held after, and moves resume', () => {
     const w = landed(HEAD, page(0, 10), { pinToEnd: false });
-    const effect = w.paged(w.startPage('after') as number, page(8, 15, { before: { cursor: 'ignored', more: false } }));
+    const effect = w.paged(w.startPage('after') as number, page(8, 15, { edges: { prev: null } }));
     expect(effect).toEqual({ kind: 'none' });
     expect(cursors(w)).toEqual(range(0, 15).map((l) => l.cursor));
-    expect(w.query('after')?.cursor).toBe('after-15');
+    expect(w.query('after')).toMatchObject({ cursor: 'after-15' });
     expect(w.edges().before).toEqual({ more: true, empty: false, loading: false });
   });
 
   it('sets empty after when a page held no line and said more', () => {
     const w = landed(HEAD, page(0, 10), { pinToEnd: false });
-    w.paged(w.startPage('after') as number, page(0, 0, { after: { cursor: 'on', more: true } }));
+    w.paged(w.startPage('after') as number, page(0, 0, { edges: { next: 'on' } }));
     expect(w.getSnapshot().after).toEqual({ more: true, empty: true, loading: false });
+  });
+
+  it('never sets empty after on an empty poll of the live end, which spent no budget', () => {
+    const w = landed(HEAD, page(0, 10), { pinToEnd: false });
+    w.paged(w.startPage('after') as number, page(0, 0, { edges: END }));
+    expect(w.getSnapshot().after).toEqual({ more: true, empty: false, loading: false });
   });
 });
 
@@ -325,13 +340,19 @@ describe('readOn', () => {
   });
 
   it('does not read on after a page of repeats that says no more', () => {
-    const w = landed(TAIL, page(10, 20, { after: END }), { pinToEnd: false });
-    w.paged(w.startPage('before') as number, page(15, 18, { before: START }));
+    const w = landed(TAIL, page(10, 20, { edges: END }), { pinToEnd: false });
+    w.paged(w.startPage('before') as number, page(15, 18, { edges: START }));
     expect(w.readOn('before')).toBe(false);
   });
 
+  it('does not read on after a poll of the live end that brought only repeats', () => {
+    const w = landed(TAIL, page(10, 20, { edges: END }), { pinToEnd: false });
+    w.paged(w.startPage('after') as number, page(15, 20, { edges: END }));
+    expect(w.readOn('after')).toBe(false);
+  });
+
   it('stops reading on when the page fails', () => {
-    const w = landed(TAIL, page(10, 20, { after: END }), { pinToEnd: false });
+    const w = landed(TAIL, page(10, 20, { edges: END }), { pinToEnd: false });
     w.paged(w.startPage('before') as number, page(15, 18));
     expect(w.readOn('before')).toBe(true);
     w.pageFailed(w.startPage('before') as number);
@@ -341,11 +362,11 @@ describe('readOn', () => {
 
 describe('the after edge', () => {
   it('has no more while following or paused, and more otherwise, whatever the page said', () => {
-    const pinned = landed(TAIL, page(0, 10, { after: END }));
+    const pinned = landed(TAIL, page(0, 10, { edges: END }));
     expect(pinned.edges().after).toEqual({ more: false, empty: false, loading: false });
     expect(pinned.query('after')).toBeNull();
 
-    const behind = landed(TAIL, page(0, 10, { after: END }), { pinToEnd: false });
+    const behind = landed(TAIL, page(0, 10, { edges: END }), { pinToEnd: false });
     expect(behind.edges().after).toEqual({ more: true, empty: false, loading: false });
     expect(behind.getSnapshot().after).toEqual({ more: true, empty: false, loading: false });
 
@@ -357,7 +378,7 @@ describe('the after edge', () => {
 
 describe('reaching the bottom', () => {
   it('answers false and wants nothing while following or paused', () => {
-    expect(landed(TAIL, page(0, 10, { after: END })).reachedBottom()).toBe(false);
+    expect(landed(TAIL, page(0, 10, { edges: END })).reachedBottom()).toBe(false);
     const paused = landed(HEAD, page(0, 10), { pinToEnd: false });
     paused.setPaused(true);
     expect(paused.reachedBottom()).toBe(false);
@@ -366,12 +387,12 @@ describe('reaching the bottom', () => {
   it('pins when the page after finds no more, whether or not it added lines', () => {
     const w = landed(HEAD, page(0, 10), { pinToEnd: false });
     expect(w.reachedBottom()).toBe(true);
-    expect(w.paged(w.startPage('after') as number, page(10, 12, { after: END }))).toEqual({ kind: 'toEnd' });
+    expect(w.paged(w.startPage('after') as number, page(10, 12, { edges: END }))).toEqual({ kind: 'toEnd' });
     expect(w.getSnapshot()).toMatchObject({ pinnedToEnd: true, following: true });
 
-    const none = landed(HEAD, page(0, 10, { after: END }), { pinToEnd: false });
+    const none = landed(HEAD, page(0, 10, { edges: END }), { pinToEnd: false });
     none.reachedBottom();
-    expect(none.paged(none.startPage('after') as number, page(8, 10, { after: END }))).toEqual({ kind: 'toEnd' });
+    expect(none.paged(none.startPage('after') as number, page(8, 10, { edges: END }))).toEqual({ kind: 'toEnd' });
     expect(none.getSnapshot().pinnedToEnd).toBe(true);
   });
 
@@ -379,7 +400,7 @@ describe('reaching the bottom', () => {
     const w = landed(HEAD, page(0, 10), { pinToEnd: false });
     w.reachedBottom();
     expect(w.paged(w.startPage('after') as number, page(10, 30))).toEqual({ kind: 'none' });
-    w.paged(w.startPage('after') as number, page(30, 32, { after: END }));
+    w.paged(w.startPage('after') as number, page(30, 32, { edges: END }));
     expect(w.getSnapshot().pinnedToEnd).toBe(false);
   });
 
@@ -388,90 +409,178 @@ describe('reaching the bottom', () => {
     w.reachedBottom();
     w.paged(w.startPage('after') as number, page(5, 10));
     expect(w.readOn('after')).toBe(true);
-    expect(w.paged(w.startPage('after') as number, page(10, 11, { after: END }))).toEqual({ kind: 'toEnd' });
+    expect(w.paged(w.startPage('after') as number, page(10, 11, { edges: END }))).toEqual({ kind: 'toEnd' });
     expect(w.getSnapshot().pinnedToEnd).toBe(true);
   });
 
   it('pins nothing without the wish', () => {
     const w = landed(HEAD, page(0, 10), { pinToEnd: false });
-    w.paged(w.startPage('after') as number, page(10, 12, { after: END }));
+    w.paged(w.startPage('after') as number, page(10, 12, { edges: END }));
     expect(w.getSnapshot().pinnedToEnd).toBe(false);
   });
 
+  it('reads on from `follow` once unpinned by a scroll, and pins on a page with no `next`', () => {
+    const w = landed(TAIL, page(0, 10, { edges: END }));
+    w.scrolledUp();
+    expect(w.reachedBottom()).toBe(true);
+    expect(w.query('after')).toMatchObject({ cursor: 'live-end' });
+    const effect = w.paged(w.startPage('after') as number, page(10, 12, { edges: { next: null, follow: 'later' } }));
+    expect(effect).toEqual({ kind: 'toEnd' });
+    expect(w.getSnapshot().following).toBe(true);
+    expect(w.followFrom().cursor).toBe('later');
+  });
+
   it('unpins and drops the wish on a scroll up', () => {
-    const w = landed(TAIL, page(0, 10, { after: END }));
+    const w = landed(TAIL, page(0, 10, { edges: END }));
     w.scrolledUp();
     expect(w.getSnapshot()).toMatchObject({ pinnedToEnd: false, following: false });
 
     w.reachedBottom();
     w.scrolledUp();
-    w.paged(w.startPage('after') as number, page(10, 12, { after: END }));
+    w.paged(w.startPage('after') as number, page(10, 12, { edges: END }));
     expect(w.getSnapshot().pinnedToEnd).toBe(false);
   });
 });
 
-describe('skipped', () => {
-  it('gathers each page’s streams once, first seen first, and a landing starts over', () => {
-    const w = landed(HEAD, page(0, 10, { skipped: ['a'] }), { pinToEnd: false });
-    w.paged(w.startPage('after') as number, page(10, 12, { skipped: ['b', 'a'] }));
-    w.paged(w.startPage('before') as number, page(0, 0, { skipped: ['b', 'c', 'c'] }));
-    expect(w.getSnapshot().skipped).toEqual(['a', 'b', 'c']);
+describe('notices', () => {
+  const notice = (code: string, message = code) => ({ code, message });
 
-    const before = w.getSnapshot().skipped;
-    w.paged(w.startPage('after') as number, page(12, 14, { skipped: ['c'] }));
-    expect(w.getSnapshot().skipped).toBe(before);
+  it('gathers each page’s notices once per code and message, first seen first, and a landing starts over', () => {
+    const w = landed(HEAD, page(0, 10, { notices: [notice('a')] }), { pinToEnd: false });
+    w.paged(w.startPage('after') as number, page(10, 12, { notices: [notice('b'), notice('a')] }));
+    w.paged(w.startPage('before') as number, page(0, 0, { notices: [notice('b', 'other'), notice('c'), notice('c')] }));
+    expect(w.getSnapshot().notices).toEqual([notice('a'), notice('b'), notice('b', 'other'), notice('c')]);
+
+    const before = w.getSnapshot().notices;
+    w.paged(w.startPage('after') as number, page(12, 14, { notices: [notice('c')] }));
+    expect(w.getSnapshot().notices).toBe(before);
 
     w.landed(page(0, 1), HEAD);
-    expect(w.getSnapshot().skipped).toEqual([]);
+    expect(w.getSnapshot().notices).toEqual([]);
+  });
+
+  it('takes a follow’s notice as a page’s, held once', () => {
+    const w = landed(TAIL, page(0, 10, { edges: END, notices: [notice('a')] }));
+    w.followed([
+      { kind: 'Notice', notice: notice('b') },
+      { kind: 'Notice', notice: notice('a') },
+    ]);
+    expect(w.getSnapshot().notices).toEqual([notice('a'), notice('b')]);
+  });
+});
+
+describe('seen', () => {
+  it('sends the newest line held of each container on every page after, and none before', () => {
+    const w = landed(
+      AT,
+      { ...page(0, 0, { anchor: 2 }), lines: [line(0, 0, 'a'), line(1, 1, 'b'), line(2, 2, 'a')] },
+      {
+        pinToEnd: false,
+      },
+    );
+    expect(w.query('after')).toMatchObject({ seen: ['c2', 'c1'] });
+    expect(w.query('before')).toMatchObject({ seen: null });
+
+    w.paged(w.startPage('after') as number, { ...page(3, 3), lines: [line(3, 3, 'b')] });
+    expect(w.query('after')).toMatchObject({ seen: ['c2', 'c3'] });
+
+    // An older page leaves the newest where it was.
+    w.paged(w.startPage('before') as number, { ...page(0, 0), lines: [line(-1, 0, 'c')] });
+    expect(w.query('after')).toMatchObject({ seen: ['c2', 'c3'] });
+  });
+
+  it('keys a container’s current and previous runs as one', () => {
+    const previous = { ...line(1), stream: { ...line(1).stream, previous: true } };
+    const w = landed(HEAD, { ...page(0, 0), lines: [line(0), previous] }, { pinToEnd: false });
+    expect(w.query('after')).toMatchObject({ seen: ['c1'] });
+  });
+
+  it('follows from the page’s cursor with the newest line of each container, and moves on each frame', () => {
+    const w = landed(TAIL, page(0, 10, { edges: END }));
+    expect(w.followFrom()).toEqual({ cursor: 'live-end', seen: ['c9'] });
+    w.followed([lineFrame(10), { kind: 'Line', line: line(11, 11, 'b') }]);
+    expect(w.followFrom()).toEqual({ cursor: 'live-end', seen: ['c10', 'c11'] });
+  });
+
+  it('reads on after a follow from the page that pinned it, holding no line twice', async () => {
+    vi.useFakeTimers();
+    const streams = ['a', 'b'].map((container) => ({
+      stream: { namespace: 'ns', pod: 'p', container, previous: false },
+      place: { node: '', region: '', zone: '', os: '', arch: '' },
+    }));
+    const fake = new FakeClient({ lines: 40, streams, repeat: 6 });
+    const w = make({ firstPageSize: 10, pageSize: 10 });
+    const fetched = async (query: FetchQuery) => {
+      const pending = fake.fetch(query);
+      await vi.runOnlyPendingTimersAsync();
+      return pending;
+    };
+    w.landed(await fetched(w.landing(TAIL)), TAIL);
+
+    const frames: FollowFrame[] = [];
+    const { cursor, seen } = w.followFrom();
+    const cancel = fake.follow(cursor, seen, (frame) => frames.push(frame));
+    await vi.runOnlyPendingTimersAsync();
+    fake.append(5);
+    w.followed(frames);
+    cancel();
+    w.scrolledUp();
+    fake.append(5);
+
+    w.paged(w.startPage('after') as number, await fetched(w.query('after') as FetchQuery));
+    const held = cursors(w);
+    expect(new Set(held).size).toBe(held.length);
+    expect(held).toHaveLength(50 - 30);
+    vi.useRealTimers();
   });
 });
 
 describe('followed', () => {
   it('appends less the held and goes to the end', () => {
-    const w = landed(TAIL, page(0, 10, { after: END }));
+    const w = landed(TAIL, page(0, 10, { edges: END }));
     expect(w.followed([lineFrame(8), lineFrame(9), lineFrame(10), lineFrame(11)])).toEqual({ kind: 'toEnd' });
     expect(cursors(w).slice(-3)).toEqual(['c9', 'c10', 'c11']);
     expect(w.getSnapshot().length).toBe(12);
   });
 
-  it('moves resume on a checkpoint and not on a line', () => {
-    const w = landed(TAIL, page(0, 10, { after: END }));
-    w.followed([lineFrame(10)]);
-    expect(w.followFrom()).toBe('live-end');
-    w.followed([lineFrame(11), { kind: 'Checkpoint', cursor: 'cp-1' }, lineFrame(12)]);
-    expect(w.followFrom()).toBe('cp-1');
+  it('never moves resume on a frame', () => {
+    const w = landed(TAIL, page(0, 10, { edges: END }));
+    w.followed([lineFrame(10), { kind: 'Notice', notice: { code: 'n', message: 'n' } }]);
+    expect(w.followFrom().cursor).toBe('live-end');
   });
 
-  it('tells no one about checkpoints alone, or lines it holds', () => {
-    const w = landed(TAIL, page(0, 10, { after: END }));
+  it('tells no one about notices or lines it holds', () => {
+    const w = landed(TAIL, page(0, 10, { edges: END, notices: [{ code: 'n', message: 'n' }] }));
     const listener = vi.fn();
     w.subscribe(listener);
-    w.followed([{ kind: 'Checkpoint', cursor: 'cp' }, lineFrame(9)]);
+    w.followed([{ kind: 'Notice', notice: { code: 'n', message: 'n' } }, lineFrame(9)]);
     expect(listener).not.toHaveBeenCalled();
     w.followed([lineFrame(10)]);
     expect(listener).toHaveBeenCalledOnce();
   });
 
   it('changes nothing while not following: unpinned, paused, ended or not landed', () => {
-    const unpinned = landed(TAIL, page(0, 10, { after: END }), { pinToEnd: false });
-    const paused = landed(TAIL, page(0, 10, { after: END }));
+    const unpinned = landed(TAIL, page(0, 10, { edges: END }), { pinToEnd: false });
+    const paused = landed(TAIL, page(0, 10, { edges: END }));
     paused.setPaused(true);
-    const ended = landed(TAIL, page(0, 10, { after: END }));
+    const ended = landed(TAIL, page(0, 10, { edges: END }));
     ended.followed([{ kind: 'Ended', reason: 'gone' }]);
     const notLanded = make();
 
     [unpinned, paused, ended, notLanded].forEach((w) => {
       const before = w.getSnapshot();
-      expect(w.followed([lineFrame(10), { kind: 'Checkpoint', cursor: 'cp' }])).toEqual({ kind: 'none' });
+      expect(w.followed([lineFrame(10), { kind: 'Notice', notice: { code: 'n', message: 'n' } }])).toEqual({
+        kind: 'none',
+      });
       expect(w.getSnapshot()).toBe(before);
     });
-    expect(unpinned.query('after')?.cursor).toBe('live-end');
+    expect(unpinned.query('after')).toMatchObject({ cursor: 'live-end' });
   });
 });
 
 describe('an Ended frame', () => {
   it('closes the follow, ignores what comes after it, and opens the after edge', () => {
-    const w = landed(TAIL, page(0, 10, { after: END }));
+    const w = landed(TAIL, page(0, 10, { edges: END }));
     w.followed([lineFrame(10), { kind: 'Ended', reason: 'the pod went away' }, lineFrame(11)]);
     expect(w.getSnapshot()).toMatchObject({
       ended: 'the pod went away',
@@ -481,14 +590,14 @@ describe('an Ended frame', () => {
     });
     expect(w.edges().after.more).toBe(true);
 
-    w.landed(page(0, 3, { after: END }), TAIL);
+    w.landed(page(0, 3, { edges: END }), TAIL);
     expect(w.getSnapshot()).toMatchObject({ ended: null, following: true });
   });
 });
 
 describe('setPaused', () => {
   it('closes the follow, asks for nothing after and drops the wish to pin', () => {
-    const w = landed(TAIL, page(0, 10, { after: END }));
+    const w = landed(TAIL, page(0, 10, { edges: END }));
     w.setPaused(true);
     expect(w.getSnapshot()).toMatchObject({ following: false, pinnedToEnd: true });
     expect(w.query('after')).toBeNull();
@@ -502,23 +611,24 @@ describe('setPaused', () => {
     w.reachedBottom();
     const ticket = w.startPage('after') as number;
     w.setPaused(true);
-    expect(w.paged(ticket, page(10, 12, { after: END }))).toEqual({ kind: 'none' });
+    expect(w.paged(ticket, page(10, 12, { edges: END }))).toEqual({ kind: 'none' });
     expect(w.getSnapshot()).toMatchObject({ length: 10, pinnedToEnd: false });
 
     w.setPaused(false);
-    w.paged(w.startPage('after') as number, page(10, 12, { after: END }));
+    w.paged(w.startPage('after') as number, page(10, 12, { edges: END }));
     expect(w.getSnapshot().pinnedToEnd).toBe(false);
   });
 });
 
 describe('followFailed', () => {
   it('unpins, so the next scroll to the bottom pages, pins and follows', () => {
-    const w = landed(TAIL, page(0, 10, { after: END }));
+    const w = landed(TAIL, page(0, 10, { edges: END }));
     w.followFailed();
     expect(w.getSnapshot()).toMatchObject({ pinnedToEnd: false, following: false });
 
     expect(w.reachedBottom()).toBe(true);
-    expect(w.paged(w.startPage('after') as number, page(10, 11, { after: END }))).toEqual({ kind: 'toEnd' });
+    expect(w.query('after')).toMatchObject({ cursor: 'live-end' });
+    expect(w.paged(w.startPage('after') as number, page(10, 11, { edges: END }))).toEqual({ kind: 'toEnd' });
     expect(w.getSnapshot()).toMatchObject({ pinnedToEnd: true, following: true });
   });
 });
@@ -537,7 +647,7 @@ describe('publishing', () => {
   });
 
   it('moves length and tells its listeners on every page and batch that adds a line', () => {
-    const w = landed(TAIL, page(10, 20, { after: END }));
+    const w = landed(TAIL, page(10, 20, { edges: END }));
     const ticket = w.startPage('before') as number;
     const listener = vi.fn();
     w.subscribe(listener);
@@ -549,7 +659,7 @@ describe('publishing', () => {
   });
 
   it('stops telling a listener that unsubscribed', () => {
-    const w = landed(TAIL, page(0, 10, { after: END }));
+    const w = landed(TAIL, page(0, 10, { edges: END }));
     const listener = vi.fn();
     w.subscribe(listener)();
     w.followed([lineFrame(10)]);
@@ -559,7 +669,7 @@ describe('publishing', () => {
 
 describe('setVisibleRange', () => {
   it('publishes how many lines are on screen and whether the newest is', () => {
-    const w = landed(TAIL, page(0, 10, { after: END }));
+    const w = landed(TAIL, page(0, 10, { edges: END }));
     w.setVisibleRange(5, 9);
     expect(w.getSnapshot()).toMatchObject({ visible: 5, atEnd: true });
     w.setVisibleRange(3, 7);
@@ -567,13 +677,13 @@ describe('setVisibleRange', () => {
   });
 
   it('is never at the end while not following', () => {
-    const w = landed(TAIL, page(0, 10, { after: END }), { pinToEnd: false });
+    const w = landed(TAIL, page(0, 10, { edges: END }), { pinToEnd: false });
     w.setVisibleRange(5, 9);
     expect(w.getSnapshot().atEnd).toBe(false);
   });
 
   it('spans the earliest and latest visible timestamps when a follow’s lines arrived out of order', () => {
-    const w = landed(TAIL, page(0, 10, { after: END }));
+    const w = landed(TAIL, page(0, 10, { edges: END }));
     w.followed([
       { kind: 'Line', line: line(10, 50) },
       { kind: 'Line', line: line(11, 12) },
@@ -585,7 +695,7 @@ describe('setVisibleRange', () => {
 
   it('notifies when atEnd changes though the range moved its end alone', () => {
     const w = make();
-    w.landed({ ...page(0, 0), lines: [line(0, 1), line(1, 1), line(2, 1)], after: END }, TAIL);
+    w.landed({ ...page(0, 0, { edges: END }), lines: [line(0, 1), line(1, 1), line(2, 1)] }, TAIL);
     w.setVisibleRange(0, 1);
     const listener = vi.fn();
     w.subscribe(listener);
@@ -801,7 +911,7 @@ async function walk(seed: number) {
     if (paused && edge === 'after') expect(length(), `${context}: a page added lines while paused`).toBe(lengthBefore);
     passed.push(...entry.spans);
     moved = true;
-    checkPin(edge === 'after' && !answer.page.after.more && bottomWish);
+    checkPin(edge === 'after' && answer.page.edges.next === null && bottomWish);
     if (w.readOn(edge)) pageToward(edge);
   }
 
@@ -825,7 +935,8 @@ async function walk(seed: number) {
       w.followOpened();
       outstanding.after = null;
       try {
-        cancel = fake.follow(w.followFrom(), (frame) => frames.push(frame));
+        const { cursor, seen } = w.followFrom();
+        cancel = fake.follow(cursor, seen, (frame) => frames.push(frame));
       } catch {
         w.followFailed();
         expect(w.getSnapshot().pinnedToEnd, `${context}: a refused follow left it pinned`).toBe(false);

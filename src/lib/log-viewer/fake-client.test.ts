@@ -14,7 +14,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { FakeClient, type FakeStream } from './fake-client';
-import type { FetchQuery, FollowFrame, LogLine, Page } from './types';
+import type { Cursor, FetchQuery, FollowFrame, LogLine, Page } from './types';
 
 const NOW = Date.parse('2026-10-15T12:00:00.000Z');
 
@@ -26,7 +26,15 @@ function stream(pod: string, weight?: number): FakeStream {
   };
 }
 
-const q = (query: Partial<FetchQuery>): FetchQuery => ({ mode: 'Head', cursor: null, at: null, limit: 10, ...query });
+const first = (limit = 10): FetchQuery => ({ kind: 'First', limit });
+const last = (limit = 10): FetchQuery => ({ kind: 'Last', limit });
+const at = (moment: string, limit = 10): FetchQuery => ({ kind: 'At', at: moment, limit });
+const on = (cursor: Cursor, limit = 10, seen: Cursor[] | null = null): FetchQuery => ({
+  kind: 'Continue',
+  cursor,
+  seen,
+  limit,
+});
 
 // Every fetch takes `delayMs` on a timer; this runs it out and answers the page.
 async function fetchNow(fake: FakeClient, query: FetchQuery): Promise<Page> {
@@ -54,6 +62,11 @@ describe('the log', () => {
     expect([0, 1, 2].map((i) => fake.lineAt(i).gap)).toEqual([null, gap, null]);
   });
 
+  it('writes every line whole but those `truncate` cuts', () => {
+    const fake = new FakeClient({ lines: 3, streams: [stream('a')], truncate: { 2: 18_432 } });
+    expect([0, 1, 2].map((i) => fake.lineAt(i).truncatedBytes)).toEqual([0, 0, 18_432]);
+  });
+
   it('writes lines a millisecond apart, the last stamped with the clock', () => {
     const fake = new FakeClient({ lines: 3, streams: [stream('a')] });
     expect(fake.lineCount).toBe(3);
@@ -73,9 +86,9 @@ describe('the log', () => {
     ]);
   });
 
-  it('answers Around at a moment inside a spaced history with lines on both sides', async () => {
+  it('answers At at a moment inside a spaced history with lines on both sides', async () => {
     const fake = new FakeClient({ lines: 5000, streams: [stream('a')], spacingMs: 2000 });
-    const page = await fetchNow(fake, q({ mode: 'Around', at: '2026-10-15T11:00:00Z', limit: 5 }));
+    const page = await fetchNow(fake, at('2026-10-15T11:00:00Z', 5));
     expect(page.lines).toHaveLength(10);
     expect(page.anchor).toBe(5);
     expect(page.lines[5].timestamp).toBe('2026-10-15T11:00:00.000Z');
@@ -116,141 +129,136 @@ describe('the log', () => {
   });
 });
 
-// Where a page's after edge goes on from, read off the next page `Head` reads from it.
-async function firstAfter(fake: FakeClient, cursor: string | null): Promise<number> {
-  const next = await fetchNow(fake, q({ mode: 'Head', cursor, limit: 500 }));
+// Where a page's after edge goes on from, read off the page a `Continue` from it answers.
+async function firstAfter(fake: FakeClient, cursor: Cursor | null): Promise<number> {
+  const next = await fetchNow(fake, on(cursor as Cursor, 500));
   return next.lines.length ? indexes(fake, next.lines)[0] : fake.lineCount;
 }
 
 describe('fetch', () => {
-  it('answers Head with no cursor from the start, cut by the limit', async () => {
+  it('answers First from the start, cut by the limit, with `next` and no `prev`', async () => {
     const fake = new FakeClient({ lines: 100, repeat: 5 });
-    const page = await fetchNow(fake, q({ mode: 'Head', limit: 10 }));
+    const page = await fetchNow(fake, first(10));
     expect(indexes(fake, page.lines)).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
-    expect(page.before).toEqual({ cursor: null, more: false });
-    expect(page.after.more).toBe(true);
-    expect(await firstAfter(fake, page.after.cursor)).toBe(10);
+    expect(page.edges.prev).toBeNull();
+    expect(page.edges.follow).toBeNull();
+    expect(await firstAfter(fake, page.edges.next)).toBe(10);
     expect(page.anchor).toBeNull();
-    expect(page.skipped).toEqual([]);
+    expect(page.notices).toEqual([]);
   });
 
-  it('answers Head that reaches the newest line with the live end, `repeat` lines back', async () => {
+  it('answers a read that reaches the newest line with `follow` at the live end, `repeat` lines back', async () => {
     const fake = new FakeClient({ lines: 8, repeat: 3 });
-    const page = await fetchNow(fake, q({ mode: 'Head', limit: 10 }));
+    const page = await fetchNow(fake, first(10));
     expect(page.lines).toHaveLength(8);
-    expect(page.after.more).toBe(false);
-    expect(await firstAfter(fake, page.after.cursor)).toBe(5);
+    expect(page.edges.next).toBeNull();
+    expect(await firstAfter(fake, page.edges.follow)).toBe(5);
   });
 
   it('never puts the live end before where the read started', async () => {
     const fake = new FakeClient({ lines: 30, repeat: 25 });
-    const head = await fetchNow(fake, q({ mode: 'Head', limit: 10 }));
-    const page = await fetchNow(fake, q({ mode: 'Head', cursor: head.after.cursor, limit: 40 }));
+    const head = await fetchNow(fake, first(10));
+    const page = await fetchNow(fake, on(head.edges.next as Cursor, 40));
     expect(indexes(fake, page.lines)[0]).toBe(10);
-    expect(await firstAfter(fake, page.after.cursor)).toBe(10);
+    expect(await firstAfter(fake, page.edges.follow)).toBe(10);
 
-    const tail = await fetchNow(fake, q({ mode: 'Tail', limit: 10 }));
+    const tail = await fetchNow(fake, last(10));
     expect(indexes(fake, tail.lines)[0]).toBe(20);
-    expect(await firstAfter(fake, tail.after.cursor)).toBe(20);
+    expect(await firstAfter(fake, tail.edges.follow)).toBe(20);
   });
 
-  it('answers Head with a cursor after it, its before edge the cursor given', async () => {
-    const fake = new FakeClient({ lines: 100 });
-    const first = await fetchNow(fake, q({ mode: 'Head', limit: 10 }));
-    const page = await fetchNow(fake, q({ mode: 'Head', cursor: first.after.cursor, limit: 10 }));
-    expect(indexes(fake, page.lines)[0]).toBe(10);
-    expect(page.before).toEqual({ cursor: first.after.cursor, more: true });
-  });
-
-  it('reads after a line when a line’s cursor is the Head cursor', async () => {
-    const fake = new FakeClient({ lines: 100 });
-    const page = await fetchNow(fake, q({ mode: 'Head', cursor: fake.lineAt(41).cursor, limit: 3 }));
-    expect(indexes(fake, page.lines)).toEqual([42, 43, 44]);
-  });
-
-  it('answers Tail with no cursor from the end, cut by the limit', async () => {
+  it('answers Last from the end, cut by the limit, and reads back from `prev`', async () => {
     const fake = new FakeClient({ lines: 100, repeat: 4 });
-    const page = await fetchNow(fake, q({ mode: 'Tail', limit: 10 }));
+    const page = await fetchNow(fake, last(10));
     expect(indexes(fake, page.lines)).toEqual([90, 91, 92, 93, 94, 95, 96, 97, 98, 99]);
-    expect(page.before.more).toBe(true);
-    expect(page.after.more).toBe(false);
-    expect(await firstAfter(fake, page.after.cursor)).toBe(96);
+    expect(page.edges.next).toBeNull();
+    expect(await firstAfter(fake, page.edges.follow)).toBe(96);
 
-    const older = await fetchNow(fake, q({ mode: 'Tail', cursor: page.before.cursor, limit: 10 }));
+    const older = await fetchNow(fake, on(page.edges.prev as Cursor));
     expect(indexes(fake, older.lines)).toEqual([80, 81, 82, 83, 84, 85, 86, 87, 88, 89]);
-    expect(older.after).toEqual({ cursor: page.before.cursor, more: true });
   });
 
-  it('answers Tail that reaches the oldest line with no before edge', async () => {
+  it('answers a read that reaches the oldest line with no `prev`', async () => {
     const fake = new FakeClient({ lines: 5 });
-    const page = await fetchNow(fake, q({ mode: 'Tail', limit: 10 }));
+    const page = await fetchNow(fake, last(10));
     expect(page.lines).toHaveLength(5);
-    expect(page.before).toEqual({ cursor: null, more: false });
+    expect(page.edges.prev).toBeNull();
 
-    const middle = await fetchNow(fake, q({ mode: 'Head', limit: 2 }));
-    const older = await fetchNow(fake, q({ mode: 'Tail', cursor: middle.after.cursor, limit: 10 }));
+    const tail = await fetchNow(fake, last(3));
+    const older = await fetchNow(fake, on(tail.edges.prev as Cursor));
     expect(indexes(fake, older.lines)).toEqual([0, 1]);
-    expect(older.before).toEqual({ cursor: null, more: false });
+    expect(older.edges.prev).toBeNull();
   });
 
-  it('answers Around with the Tail half’s before, the Head half’s after and the anchor', async () => {
+  it('answers At with lines either side of the moment and the anchor between', async () => {
     const fake = new FakeClient({ lines: 100, repeat: 2 });
-    const at = fake.lineAt(50).timestamp;
-    const page = await fetchNow(fake, q({ mode: 'Around', at, limit: 5 }));
+    const page = await fetchNow(fake, at(fake.lineAt(50).timestamp, 5));
     expect(indexes(fake, page.lines)).toEqual([45, 46, 47, 48, 49, 50, 51, 52, 53, 54]);
     expect(page.anchor).toBe(5);
-    expect(page.before.more).toBe(true);
-    expect(page.after.more).toBe(true);
-    expect(await firstAfter(fake, page.after.cursor)).toBe(55);
-    const older = await fetchNow(fake, q({ mode: 'Tail', cursor: page.before.cursor, limit: 1 }));
+    expect(await firstAfter(fake, page.edges.next)).toBe(55);
+    const older = await fetchNow(fake, on(page.edges.prev as Cursor, 1));
     expect(indexes(fake, older.lines)).toEqual([44]);
   });
 
-  it('answers Around at a moment written with an offset', async () => {
+  it('answers At at a moment written with an offset', async () => {
     const fake = new FakeClient({ lines: 100 });
     const utc = new Date(fake.lineAt(50).timestamp);
-    const at = `${new Date(utc.getTime() + 2 * 3600_000).toISOString().slice(0, -1)}+02:00`;
-    const page = await fetchNow(fake, q({ mode: 'Around', at, limit: 1 }));
+    const moment = `${new Date(utc.getTime() + 2 * 3600_000).toISOString().slice(0, -1)}+02:00`;
+    const page = await fetchNow(fake, at(moment, 1));
     expect(indexes(fake, page.lines)).toEqual([49, 50]);
   });
 
-  it('answers Around near either end as the halves’ tables say', async () => {
+  it('answers At near either end with no `prev`, or `follow` and no `next`', async () => {
     const fake = new FakeClient({ lines: 10, repeat: 2 });
-    const early = await fetchNow(fake, q({ mode: 'Around', at: fake.lineAt(1).timestamp, limit: 3 }));
+    const early = await fetchNow(fake, at(fake.lineAt(1).timestamp, 3));
     expect(indexes(fake, early.lines)).toEqual([0, 1, 2, 3]);
     expect(early.anchor).toBe(1);
-    expect(early.before).toEqual({ cursor: null, more: false });
+    expect(early.edges.prev).toBeNull();
 
-    const late = await fetchNow(fake, q({ mode: 'Around', at: '2030-01-01T00:00:00Z', limit: 3 }));
+    const late = await fetchNow(fake, at('2030-01-01T00:00:00Z', 3));
     expect(indexes(fake, late.lines)).toEqual([7, 8, 9]);
     expect(late.anchor).toBe(3);
-    expect(late.after.more).toBe(false);
-    expect(await firstAfter(fake, late.after.cursor)).toBe(8);
+    expect(late.edges.next).toBeNull();
+    expect(await firstAfter(fake, late.edges.follow)).toBe(8);
+  });
+
+  it('reads each container named in `seen` past its line, and the rest from the cursor', async () => {
+    const fake = new FakeClient({ lines: 20, streams: [stream('a'), stream('b')] });
+    const head = await fetchNow(fake, first(4));
+    // Lines alternate a, b: a's line 8 is held, so a goes on from 10 and b from 4.
+    const page = await fetchNow(fake, on(head.edges.next as Cursor, 6, [fake.lineAt(8).cursor]));
+    expect(indexes(fake, page.lines)).toEqual([5, 7, 9, 10, 11, 12]);
+  });
+
+  it('keeps the newer of two `seen` lines of one container', async () => {
+    const fake = new FakeClient({ lines: 20, streams: [stream('a')] });
+    const head = await fetchNow(fake, first(4));
+    const page = await fetchNow(fake, on(head.edges.next as Cursor, 3, [fake.lineAt(9).cursor, fake.lineAt(6).cursor]));
+    expect(indexes(fake, page.lines)).toEqual([10, 11, 12]);
   });
 });
 
 describe('what the fake refuses', () => {
-  it('rejects a fetch with a cursor it did not write', async () => {
+  it('rejects a Continue from a cursor it did not write, or from a line’s', async () => {
     const fake = new FakeClient({ lines: 10 });
-    const foreign = ['line-3', 'fake:line:x', 'fake:line:10', 'fake:position:11', ''];
-    const answers = await Promise.allSettled(foreign.map((cursor) => fake.fetch(q({ mode: 'Head', cursor }))));
+    const foreign = ['line-3', 'fake:next:x', 'fake:next:11', 'fake:line:3', ''];
+    const answers = await Promise.allSettled(foreign.map((cursor) => fake.fetch(on(cursor))));
     expect(answers.map((a) => a.status)).toEqual(foreign.map(() => 'rejected'));
-    await expect(fake.fetch(q({ mode: 'Tail', cursor: 'nope' }))).rejects.toThrow(Error);
   });
 
-  it('rejects a cursor beside `at`, `at` beside Head or Tail, and Around with none', async () => {
+  it('rejects `seen` beside `prev`, a `seen` it did not write, and a limit under one', async () => {
     const fake = new FakeClient({ lines: 10 });
-    const at = fake.lineAt(5).timestamp;
-    await expect(fake.fetch(q({ mode: 'Around', at, cursor: fake.lineAt(1).cursor }))).rejects.toThrow(Error);
-    await expect(fake.fetch(q({ mode: 'Around' }))).rejects.toThrow(Error);
-    await expect(fake.fetch(q({ mode: 'Head', at }))).rejects.toThrow(Error);
-    await expect(fake.fetch(q({ mode: 'Tail', at }))).rejects.toThrow(Error);
-    await expect(fake.fetch(q({ mode: 'Head', limit: 0 }))).rejects.toThrow(Error);
+    const tail = await fetchNow(fake, last(3));
+    await expect(fake.fetch(on(tail.edges.prev as Cursor, 3, []))).rejects.toThrow(Error);
+    await expect(fake.fetch(on(tail.edges.follow as Cursor, 3, ['fake:line:99']))).rejects.toThrow(Error);
+    await expect(fake.fetch(first(0))).rejects.toThrow(Error);
   });
 
-  it('throws from follow with a cursor it did not write', () => {
+  it('throws from follow with a cursor that is not a `next` or `follow` it wrote', async () => {
     const fake = new FakeClient({ lines: 10 });
-    expect(() => fake.follow('elsewhere', () => {})).toThrow(Error);
+    const tail = await fetchNow(fake, last(3));
+    expect(() => fake.follow('elsewhere', [], () => {})).toThrow(Error);
+    expect(() => fake.follow(tail.edges.prev as Cursor, [], () => {})).toThrow(Error);
   });
 });
 
@@ -258,7 +266,7 @@ describe('time', () => {
   it('answers a fetch once `delayMs` has passed', async () => {
     const fake = new FakeClient({ lines: 10, delayMs: 100 });
     let page: Page | undefined;
-    fake.fetch(q({})).then(
+    fake.fetch(first()).then(
       (p) => {
         page = p;
       },
@@ -292,9 +300,9 @@ describe('time', () => {
   });
 });
 
-function record(fake: FakeClient, after: string) {
+function record(fake: FakeClient, cursor: Cursor, seen: Cursor[] = []) {
   const frames: FollowFrame[] = [];
-  const cancel = fake.follow(after, (frame) => frames.push(frame));
+  const cancel = fake.follow(cursor, seen, (frame) => frames.push(frame));
   const lines = () =>
     indexes(
       fake,
@@ -303,89 +311,71 @@ function record(fake: FakeClient, after: string) {
   return { frames, cancel, lines };
 }
 
-const position = (index: number) => `fake:position:${index}`;
+// The live end of a fake of `count` lines with no repeat: a `follow` past every line.
+async function liveEnd(fake: FakeClient): Promise<Cursor> {
+  return (await fetchNow(fake, last(1))).edges.follow as Cursor;
+}
 
 describe('follow', () => {
-  it('replays the lines after `after` once `delayMs` has passed, with what was appended meanwhile', async () => {
+  it('replays the lines past the cursor once `delayMs` has passed, with what was appended meanwhile', async () => {
     const fake = new FakeClient({ lines: 10, delayMs: 50, repeat: 0 });
-    const follow = record(fake, fake.lineAt(6).cursor);
+    const head = await fetchNow(fake, first(7));
+    const follow = record(fake, head.edges.next as Cursor);
     fake.append(1);
     expect(follow.frames).toEqual([]);
     await vi.advanceTimersByTimeAsync(50);
     expect(follow.lines()).toEqual([7, 8, 9, 10]);
-    expect(follow.frames.at(-1)).toEqual({ kind: 'Checkpoint', cursor: position(11) });
+    expect(follow.frames.every((f) => f.kind === 'Line')).toBe(true);
   });
 
   it('sends nothing on a quiet follow', async () => {
-    const fake = new FakeClient({ lines: 10 });
-    const follow = record(fake, position(10));
+    const fake = new FakeClient({ lines: 10, repeat: 0 });
+    const follow = record(fake, await liveEnd(fake));
     await vi.advanceTimersByTimeAsync(0);
     expect(follow.frames).toEqual([]);
   });
 
-  it('sends each append’s lines inside the append, one stream’s batch after another, then a checkpoint', async () => {
-    const fake = new FakeClient({ lines: 0, streams: [stream('a'), stream('b')], repeat: 1 });
-    const follow = record(fake, position(0));
+  it('sends each append’s lines inside the append, one stream’s batch after another', async () => {
+    const fake = new FakeClient({ lines: 0, streams: [stream('a'), stream('b')], repeat: 0 });
+    const follow = record(fake, await liveEnd(fake));
     await vi.advanceTimersByTimeAsync(0);
 
     fake.append(4);
-    expect(follow.frames.map((f) => (f.kind === 'Line' ? f.line.stream.pod : f.kind))).toEqual([
-      'a',
-      'a',
-      'b',
-      'b',
-      'Checkpoint',
-    ]);
+    expect(follow.frames.map((f) => (f.kind === 'Line' ? f.line.stream.pod : f.kind))).toEqual(['a', 'a', 'b', 'b']);
     expect(follow.lines()).toEqual([0, 2, 1, 3]);
-    expect(follow.frames.at(-1)).toEqual({ kind: 'Checkpoint', cursor: position(3) });
 
     fake.append(1);
     expect(follow.lines()).toEqual([0, 2, 1, 3, 4]);
-    expect(follow.frames.at(-1)).toEqual({ kind: 'Checkpoint', cursor: position(4) });
   });
 
-  it('never checkpoints before `after` or before its last checkpoint', async () => {
-    const fake = new FakeClient({ lines: 10, repeat: 5 });
-    const follow = record(fake, position(9));
+  it('reads each container named in `seen` past its line', async () => {
+    const fake = new FakeClient({ lines: 10, streams: [stream('a'), stream('b')] });
+    const head = await fetchNow(fake, first(4));
+    const follow = record(fake, head.edges.next as Cursor, [fake.lineAt(6).cursor]);
     await vi.advanceTimersByTimeAsync(0);
-    expect(follow.frames.at(-1)).toEqual({ kind: 'Checkpoint', cursor: position(9) });
-    fake.append(1);
-    expect(follow.frames.at(-1)).toEqual({ kind: 'Checkpoint', cursor: position(9) });
+    // Lines alternate a, b: a goes on past 6, b from 4.
+    expect(follow.lines()).toEqual([8, 5, 7, 9]);
   });
 
   it('delivers nothing once cancelled, before its replay or after', async () => {
-    const fake = new FakeClient({ lines: 10 });
-    const early = record(fake, position(0));
+    const fake = new FakeClient({ lines: 10, repeat: 0 });
+    const head = await fetchNow(fake, first(1));
+    const early = record(fake, head.edges.next as Cursor);
     early.cancel();
     await vi.advanceTimersByTimeAsync(0);
     expect(early.frames).toEqual([]);
 
-    const late = record(fake, position(10));
+    const late = record(fake, await liveEnd(fake));
     await vi.advanceTimersByTimeAsync(0);
     late.cancel();
     fake.append(3);
     expect(late.frames).toEqual([]);
   });
 
-  it('reads on from a checkpoint’s cursor as a Head cursor and as `after`', async () => {
-    const fake = new FakeClient({ lines: 10, repeat: 2 });
-    const follow = record(fake, position(10));
-    await vi.advanceTimersByTimeAsync(0);
-    fake.append(5);
-    const checkpoint = follow.frames.at(-1) as { kind: 'Checkpoint'; cursor: string };
-
-    const page = await fetchNow(fake, q({ mode: 'Head', cursor: checkpoint.cursor }));
-    expect(indexes(fake, page.lines)).toEqual([13, 14]);
-
-    const reopened = record(fake, checkpoint.cursor);
-    await vi.advanceTimersByTimeAsync(0);
-    expect(reopened.lines()).toEqual([13, 14]);
-  });
-
   it('repeats `repeat` lines from the live end, and no more', async () => {
     const fake = new FakeClient({ lines: 100, repeat: 7 });
-    const tail = await fetchNow(fake, q({ mode: 'Tail', limit: 50 }));
-    const follow = record(fake, tail.after.cursor as string);
+    const tail = await fetchNow(fake, last(50));
+    const follow = record(fake, tail.edges.follow as Cursor);
     await vi.advanceTimersByTimeAsync(0);
     expect(follow.lines()).toEqual([93, 94, 95, 96, 97, 98, 99]);
   });
@@ -395,94 +385,98 @@ describe('the knobs', () => {
   it('fails the next fetch, and only it', async () => {
     const fake = new FakeClient({ lines: 10 });
     fake.failNext('fetch');
-    const failed = fake.fetch(q({}));
+    const failed = fake.fetch(first());
     const caught = failed.catch((e: unknown) => e);
     await vi.runOnlyPendingTimersAsync();
     expect(await caught).toBeInstanceOf(Error);
-    expect((await fetchNow(fake, q({}))).lines).toHaveLength(10);
+    expect((await fetchNow(fake, first())).lines).toHaveLength(10);
   });
 
-  it('throws from the next follow, and only it', () => {
+  it('throws from the next follow, and only it', async () => {
     const fake = new FakeClient({ lines: 10 });
+    const end = await liveEnd(fake);
     fake.failNext('follow');
-    expect(() => fake.follow(position(0), () => {})).toThrow(Error);
-    expect(() => fake.follow(position(0), () => {})).not.toThrow();
+    expect(() => fake.follow(end, [], () => {})).toThrow(Error);
+    expect(() => fake.follow(end, [], () => {})).not.toThrow();
   });
 
-  it('keeps a skipped stream out of every page and follow, and names it, until unskipped', async () => {
+  it('keeps a skipped stream out of every page and follow, and names it in a notice, until unskipped', async () => {
     const a = stream('a');
     const b = stream('b');
     const fake = new FakeClient({ lines: 10, streams: [a, b], repeat: 0 });
     fake.skip(b.stream);
 
-    const page = await fetchNow(fake, q({ mode: 'Head', limit: 10 }));
+    const page = await fetchNow(fake, first(10));
     expect(page.lines.map((l) => l.stream.pod)).toEqual(['a', 'a', 'a', 'a', 'a']);
-    expect(page.skipped).toHaveLength(1);
-    expect(page.skipped[0]).toContain('default/b/app');
+    expect(page.notices).toHaveLength(1);
+    expect(page.notices[0].code).toBe('stream-skipped');
+    expect(page.notices[0].message).toContain('default/b/app');
 
-    const around = await fetchNow(fake, q({ mode: 'Around', at: fake.lineAt(5).timestamp, limit: 4 }));
+    const around = await fetchNow(fake, at(fake.lineAt(5).timestamp, 4));
     expect(indexes(fake, around.lines)).toEqual([2, 4, 6, 8]);
     expect(around.anchor).toBe(2);
 
-    const follow = record(fake, position(10));
+    const follow = record(fake, await liveEnd(fake));
     await vi.advanceTimersByTimeAsync(0);
     fake.append(2);
     expect(follow.lines()).toEqual([10]);
 
     fake.unskip(b.stream);
-    expect((await fetchNow(fake, q({ mode: 'Head', limit: 20 }))).skipped).toEqual([]);
+    expect((await fetchNow(fake, first(20))).notices).toEqual([]);
     fake.append(2);
     expect(follow.lines()).toEqual([10, 12, 13]);
   });
 
-  it('answers the next fetch with no line, its read-on edges `limit` past where it started', async () => {
+  it('answers the next fetch with no line, its edges where the read would have left them', async () => {
     const fake = new FakeClient({ lines: 100, repeat: 2 });
 
     fake.emptyNext();
-    const head = await fetchNow(fake, q({ mode: 'Head', limit: 10 }));
+    const head = await fetchNow(fake, first(10));
     expect(head.lines).toEqual([]);
-    expect(head.before).toEqual({ cursor: null, more: false });
-    expect(head.after.more).toBe(true);
-    expect(await firstAfter(fake, head.after.cursor)).toBe(10);
+    expect(head.edges.prev).toBeNull();
+    expect(await firstAfter(fake, head.edges.next)).toBe(10);
+
+    const middle = await fetchNow(fake, at(fake.lineAt(50).timestamp, 1));
+    fake.emptyNext();
+    const back = await fetchNow(fake, on(middle.edges.prev as Cursor, 10));
+    expect(back.lines).toEqual([]);
+    expect(back.edges.prev).not.toBeNull();
 
     fake.emptyNext();
-    const tail = await fetchNow(fake, q({ mode: 'Tail', cursor: position(50), limit: 10 }));
-    expect(tail.lines).toEqual([]);
-    expect(tail.before.more).toBe(true);
-    expect(tail.after).toEqual({ cursor: position(50), more: true });
-
-    fake.emptyNext();
-    const around = await fetchNow(fake, q({ mode: 'Around', at: fake.lineAt(70).timestamp, limit: 5 }));
+    const around = await fetchNow(fake, at(fake.lineAt(70).timestamp, 5));
     expect(around.lines).toEqual([]);
     expect(around.anchor).toBe(0);
-    expect(await firstAfter(fake, around.after.cursor)).toBe(75);
+    expect(await firstAfter(fake, around.edges.next)).toBe(75);
+
+    const near = await fetchNow(fake, at(fake.lineAt(95).timestamp, 1));
+    fake.emptyNext();
+    const end = await fetchNow(fake, on(near.edges.next as Cursor, 10));
+    expect(end.edges.next).toBeNull();
+    expect(await firstAfter(fake, end.edges.follow)).toBe(98);
 
     fake.emptyNext();
-    const end = await fetchNow(fake, q({ mode: 'Head', cursor: position(95), limit: 10 }));
-    expect(end.after.more).toBe(false);
-    expect(await firstAfter(fake, end.after.cursor)).toBe(98);
-
-    fake.emptyNext();
-    const landing = await fetchNow(fake, q({ mode: 'Tail', limit: 10 }));
-    expect(landing.after.more).toBe(false);
-    expect(await firstAfter(fake, landing.after.cursor)).toBe(100);
+    const landing = await fetchNow(fake, last(10));
+    expect(landing.edges.next).toBeNull();
+    expect(await firstAfter(fake, landing.edges.follow)).toBe(100);
 
     expect(fake.passedOver()).toEqual([
       { from: 0, to: 10 },
-      { from: 40, to: 50 },
+      { from: 39, to: 49 },
       { from: 65, to: 75 },
-      { from: 95, to: 98 },
+      { from: 96, to: 98 },
       { from: 90, to: 100 },
     ]);
-    const older = await fetchNow(fake, q({ mode: 'Tail', cursor: tail.before.cursor, limit: 1 }));
-    expect(indexes(fake, older.lines)).toEqual([39]);
+    const older = await fetchNow(fake, on(back.edges.prev as Cursor, 1));
+    expect(indexes(fake, older.lines)).toEqual([38]);
   });
 
   it('ends every open follow, and sends nothing after', async () => {
-    const fake = new FakeClient({ lines: 10, delayMs: 10 });
-    const live = record(fake, position(10));
+    const fake = new FakeClient({ lines: 10, delayMs: 10, repeat: 0 });
+    const end = await liveEnd(fake);
+    const head = await fetchNow(fake, first(1));
+    const live = record(fake, end);
     await vi.advanceTimersByTimeAsync(10);
-    const waiting = record(fake, position(0));
+    const waiting = record(fake, head.edges.next as Cursor);
 
     fake.endFollows('the pod went away');
     expect(live.frames).toEqual([{ kind: 'Ended', reason: 'the pod went away' }]);

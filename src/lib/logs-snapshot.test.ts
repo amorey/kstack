@@ -22,6 +22,7 @@ const line = (i: number): LogLine => ({
   timestamp: `2026-10-17T09:14:${String(i % 60).padStart(2, '0')}.000000001Z`,
   cursor: `c${i}`,
   message: `line ${i}`,
+  truncatedBytes: 0,
   stream: { namespace: 'payments', pod: 'webapp-x', container: 'app', previous: i === 1 },
   place: { node: 'n1', region: '', zone: '', os: 'linux', arch: 'arm64' },
   gap: null,

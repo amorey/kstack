@@ -16,8 +16,10 @@
 // so a card filling in never moves the transcript, and no scroller of its own. One line per
 // row, cut at the card's edge. Every name and message is cluster text, drawn through
 // `VisibleText` as the viewer's rows are, a message with its colours.
+import { cn } from '@kubetail/ui/lib/utils';
+
 import { AnsiText } from '@/components/widgets/ansi-text';
-import { Dot, GapNotice, LOG_ROW_PX, lineTime } from '@/components/widgets/log-viewer';
+import { CutNotice, Dot, GapNotice, LOG_ROW_PX, lineTime } from '@/components/widgets/log-viewer';
 import { VisibleText } from '@/components/widgets/visible-text';
 import { INLINE_LINES, type InlineState } from '@/lib/inline-log-lines';
 import type { LogLine } from '@/lib/log-viewer';
@@ -70,9 +72,17 @@ export function GapRow({ line }: { line: LogLine }) {
   );
 }
 
-export function LineRow({ line, oneStream }: { line: LogLine; oneStream: boolean }) {
+/** A line outside a read's range is tagged with the side it lies on, and muted. */
+export type LineTag = 'before' | 'after' | null;
+
+export function LineRow({ line, oneStream, tag = null }: { line: LogLine; oneStream: boolean; tag?: LineTag }) {
   return (
-    <div data-testid="logs-inline-row" className="flex gap-2 px-2 whitespace-nowrap" style={{ height: LOG_ROW_PX }}>
+    <div
+      data-testid="logs-inline-row"
+      className={cn('flex gap-2 px-2 whitespace-nowrap', tag !== null && 'text-muted-foreground')}
+      style={{ height: LOG_ROW_PX }}
+    >
+      {tag !== null && <span className="shrink-0 italic">{tag}</span>}
       <span className="shrink-0 text-muted-foreground tabular-nums">{lineTime(line.timestamp)}</span>
       <Dot line={line} />
       {!oneStream && (
@@ -82,6 +92,7 @@ export function LineRow({ line, oneStream }: { line: LogLine; oneStream: boolean
       )}
       <span className="min-w-0 truncate">
         <AnsiText text={line.message} />
+        <CutNotice bytes={line.truncatedBytes} />
       </span>
     </div>
   );

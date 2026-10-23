@@ -84,9 +84,9 @@ function watchClient(client: Client, record: (error: string | null) => void): Cl
           throw error;
         },
       ),
-    follow: (after, onFrame, onFailed) => {
+    follow: (cursor, seen, onFrame, onFailed) => {
       try {
-        const stop = client.follow(after, onFrame, (error) => {
+        const stop = client.follow(cursor, seen, onFrame, (error) => {
           record(errorText(error));
           onFailed(error);
         });
@@ -275,7 +275,7 @@ function Rows({
 }
 
 /** What the viewer draws from the core's state; the visible range is the viewport's alone. */
-const VIEWER_FIELDS = ['loading', 'failed', 'ended', 'skipped'] as const;
+const VIEWER_FIELDS = ['loading', 'failed', 'ended', 'notices'] as const;
 
 export function LogViewer({ clusterId, query, openAt, pinToEnd, viewport }: LogViewerProps) {
   // Built once per mount; it opens nothing until the core asks.
@@ -350,17 +350,11 @@ export function LogViewer({ clusterId, query, openAt, pinToEnd, viewport }: LogV
         onColumnsChange={setColumns}
         onWrapChange={setWrap}
       />
-      {state.skipped.length > 0 && (
-        <p className={muted}>
-          Not read:{' '}
-          {state.skipped.map((stream, i) => (
-            <span key={stream}>
-              {i > 0 && ', '}
-              <VisibleText text={stream} />
-            </span>
-          ))}
+      {state.notices.map(({ code, message }) => (
+        <p key={`${code}:${message}`} className={muted} title={code}>
+          <VisibleText text={message} />
         </p>
-      )}
+      ))}
       {state.ended !== null && (
         <p className={muted}>
           No new lines: <VisibleText text={state.ended} />

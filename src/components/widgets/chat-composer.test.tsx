@@ -58,6 +58,7 @@ const selectedLine = (i: number): LogLine => ({
   timestamp: `2026-10-17T09:14:0${i}.000Z`,
   cursor: `c${i}`,
   message: `line ${i}`,
+  truncatedBytes: 0,
   stream: { namespace: 'payments', pod: 'webapp-x', container: 'app', previous: false },
   place: { node: '', region: '', zone: '', os: '', arch: '' },
   gap: null,

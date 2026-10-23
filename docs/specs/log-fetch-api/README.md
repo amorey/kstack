@@ -77,10 +77,10 @@ the ADR when the work lands.
    and a continuation reads nothing to find the edge. The one read is a counted first page
    finding where it starts. A late line can move a counted edge by one; nothing else moves it.
 4. **The first page comes from `first` or `last`, as the design says.** The viewer's
-   jump-to-time, today's `Around` mode, is two first pages the app's client sends together: a
-   window since the moment read first, and a window until the moment read last. The library
-   drops the line both hold, and the client knows the anchor. The service has no `At` page and
-   no anchor.
+   jump-to-time, the library's `At` read, is two first pages the app's client sends together: a
+   window since the moment read first, and a window until the nanosecond before it read last.
+   The halves are disjoint, since a page limit cuts each at its own end, and the client knows
+   the anchor. The service has no `At` page and no anchor.
 5. **The polled `follow` is the live end's page cursor.** The design's live window is not
    built. A live window is one whose end is open, lies after now, or whose counted `after` is
    short of its count. Its newest page carries `follow`, and a continuation from it answers what each
@@ -119,12 +119,16 @@ the ADR when the work lands.
 11. **The model's token is the service's page cursor, as it came.** A continuation is `cursor`
     alone, as the design says. The tool prints the cursor and passes it back; it wraps nothing
     and stores nothing. Today's `EncodeCursor` and `DecodeCursor` go.
-12. **The viewer's library contract changes as little as it can.** `src/lib/log-viewer` keeps
-    its `Client` with `Head`, `Tail` and `Around`, and its cursors stay opaque strings. The
-    app's `logs-client.ts` maps that onto the new wire: a library edge cursor is the service's
-    page cursor as it came. The library learns the new line field, a `Notice` follow frame, and
-    `seen` on a `Head`, the lines it holds per stream, which is how it goes on after a follow
-    now that a follow sends no checkpoint.
+12. **The viewer's library contract keeps the viewer's vocabulary and takes the wire's shapes
+    where they are plainer.** `src/lib/log-viewer` keeps its `Client` with `fetch` and
+    `follow`, and its cursors stay opaque strings: an edge cursor is the service's page cursor
+    as it came, a line's cursor the record's. A `fetch` query is a union of the four reads the
+    viewer makes, `First`, `Last`, `At` and `Continue`, so no field is null by rule. A page
+    names its `edges` as the wire's three strings, `prev`, `next` and `follow`, and carries
+    `notices` with their codes, the one type a page and a `Notice` follow frame share. The
+    contract takes no bound, padding or cap: the viewer never sets one. `At` stays the
+    library's, since the service has no anchor; the app's `logs-client.ts` joins its two pages.
+    The follow sends no checkpoint; a `Continue` carries `seen`, the lines held per stream.
 13. **One stateless cursor for every caller.** A `prev` cursor is the scope and the window, a few
     hundred characters, or a few thousand for a scope of many sources. A `next` or `follow` adds
     an entry per stream that had a line on the page, so it grows with the page's streams: a
@@ -186,9 +190,11 @@ the ADR when the work lands.
     refused, since a stream it does not name would read from now and lose what it wrote
     meanwhile. `Fetch` takes `Seen` beside a page cursor the same way, so a caller that followed
     from a cursor pages on from the same cursor. The viewer's `follow(cursor)` sends its edge
-    cursor through; a reconnect, and the page after the follow, send the same cursor and the
-    last line held of each stream as `Seen`. `Since` is inclusive, as a window's is, and has no
-    exclusive twin: the lines past one a caller saw are what `Seen` asks for.
+    cursor through, and the client's reconnect the same cursor with the last line it delivered
+    of each container as `Seen`; every page the viewer reads on from its after edge sends the
+    cursor with the last line it holds of each container, followed or not. `Since` is
+    inclusive, as a window's is, and has no exclusive twin: the lines past one a caller saw are
+    what `Seen` asks for.
     **A follow sends no checkpoint.** A checkpoint named the oldest watermark across the scope,
     so one quiet stream made every reconnect replay every busy stream from where the quiet one
     stopped. The caller already holds what a reconnect needs, its own last line per stream, so
@@ -248,24 +254,22 @@ the ADR when the work lands.
 | 1 | [1-service.md](1-service.md) | The log service's one query: window, context, caps, page cursor, notices | Landed (#382) |
 | 2 | [2-follow.md](2-follow.md) | The follow on the same types: scope, a start that is a moment with the lines seen or a page's `follow`, the message cap, frames with notices and a coded end | Landed (#383) |
 | 3 | [3-graphql-wire.md](3-graphql-wire.md) | `logsFetch` and `logsFollow` on the landed types, the action types the transcript draws, generated code on both sides | Landed (#384) |
-| 4 | [4-tools.md](4-tools.md) | The tools' shared parser, `LogsRead` on the window query, `LogsWatch` on the follow, their prompts and actions | Planned |
+| 4 | [4-tools.md](4-tools.md) | The tools' shared parser, `LogsRead` on the window query, `LogsWatch` on the follow, their prompts and actions | Landed (#385) |
 | 5 | [5-webview.md](5-webview.md) | The app's logs client on the new wire, fetch and follow; the viewer and the transcript draw the new fields | Planned |
 
-The service and the wire are built. What remains binds the model's tools and the webview to
-them. Steps 1 and 2 stay in this directory as the record of the design until the ADR
+The service, the wire and the tools are built. What remains binds the webview to them. Steps 1 and 2 stay in this directory as the record of the design until the ADR
 folds them in; the code and `services/logs/README.md` are the reference for the steps that
 follow, never those two files.
 
 ## Order
 
-Step 3 landed. Step 4 next; step 5 needs it.
+Steps 3 and 4 landed. Step 5 is last.
 
 ```
 3 → 4 → 5
 ```
 
-Each step is one pull request into `wip/log-fetch-api`. `pnpm build` is red until step 5; each
-pull request before it says so in its summary. A step's spec names its tasks in the order to
+Each step is one pull request into `wip/log-fetch-api`. `pnpm build` is red until step 5 lands. A step's spec names its tasks in the order to
 do them; do one task at a time.
 
 ## When it lands

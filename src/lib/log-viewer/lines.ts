@@ -33,6 +33,20 @@ function instant(timestamp: string): { seconds: number; fraction: string } {
   return { seconds: Date.parse(seconds + offset), fraction: fraction.padEnd(9, '0') };
 }
 
+/** The nanosecond before a stamp, RFC 3339 in UTC with nine fraction digits. */
+export function previousNanosecond(timestamp: string): string {
+  const { seconds, fraction } = instant(timestamp);
+  const nanos = Number(fraction);
+  const whole = nanos === 0 ? seconds - 1000 : seconds;
+  const rest = nanos === 0 ? 999_999_999 : nanos - 1;
+  return `${new Date(whole).toISOString().slice(0, 19)}.${String(rest).padStart(9, '0')}Z`;
+}
+
+/** A line's container as the server keys `seen`: its current and previous runs are one. */
+export function containerKey({ namespace, pod, container }: LogLine['stream']): string {
+  return `${namespace}/${pod}/${container}`;
+}
+
 // What the window holds: the lines in the order the client answered them, and every
 // held line's cursor. A line whose cursor is held is a repeat — what a page or a reopened
 // follow sends again at the edge it went on from — and is dropped.

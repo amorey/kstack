@@ -39,6 +39,7 @@ const line = (i: number, message = `panic ${i}`): LogsWatchTask['matched'][numbe
   container: 'app',
   previous: false,
   message,
+  truncatedBytes: 0,
   gap: null,
 });
 
@@ -60,6 +61,7 @@ const action: LogsWatchAction = {
   since: '2026-10-18T13:45:00Z',
   limit: 100,
   maxBytes: 16384,
+  maxMessageBytes: 4096,
   resolvedAt: '2026-10-18T13:50:00Z',
   until: '2026-10-18T14:00:00Z',
 };
@@ -169,6 +171,12 @@ describe('LogsWatchCard', () => {
     draw();
     fireEvent.click(screen.getByRole('button', { name: 'Show all 12 lines' }));
     expect(rows()).toHaveLength(12);
+  });
+
+  it('ends a cut line with what the server cut, and tags none', () => {
+    draw({ task: { ...matched, matched: [{ ...line(0), truncatedBytes: 1536 }] } });
+    expect(rows()[0]).toHaveTextContent('panic 0 … 1.5 KiB cut');
+    expect(rows()[0]).not.toHaveClass('text-muted-foreground');
   });
 
   it('draws markup and reordering characters in a line as text', () => {

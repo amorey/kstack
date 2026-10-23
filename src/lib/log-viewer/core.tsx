@@ -505,8 +505,10 @@ function useClient({ client, logWindow, anchor, paused, following, perform, onEr
     };
     let unsubscribe: () => void;
     try {
+      const { cursor, seen } = logWindow.followFrom();
       unsubscribe = client.follow(
-        logWindow.followFrom(),
+        cursor,
+        seen,
         (frame) => {
           batch.push(frame);
           cancelFlush ??= onNextFrame(flush);

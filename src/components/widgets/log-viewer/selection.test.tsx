@@ -36,6 +36,7 @@ const makeLine = (overrides: Partial<LogLine> = {}): LogLine => ({
   timestamp: '2024-06-15T10:30:01.123Z',
   cursor: 'cursor-1',
   message: 'ERROR: something failed',
+  truncatedBytes: 0,
   stream: { namespace: 'default', pod: 'my-pod-abc', container: 'my-container', previous: false },
   place: { node: 'node-1', region: 'us-east-1', zone: 'us-east-1a', os: 'linux', arch: 'amd64' },
   gap: null,

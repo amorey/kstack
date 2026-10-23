@@ -104,6 +104,17 @@ export function GapNotice({ line, gap }: { line: LogLine; gap: NonNullable<LogLi
   );
 }
 
+// What the server cut off a line's message, at its end. Nothing opens the whole line.
+export function CutNotice({ bytes }: { bytes: number }) {
+  if (bytes === 0) return null;
+  const size = bytes < 1024 ? `${bytes} B` : `${Number((bytes / 1024).toFixed(1))} KiB`;
+  return (
+    <span className="text-muted-foreground" title="Cut by the server">
+      {` … ${size} cut`}
+    </span>
+  );
+}
+
 // A run of selected rows is outlined at its first row's top and its last row's bottom.
 function selectionBoxShadow(isTop: boolean, isBottom: boolean): string | undefined {
   if (isTop && isBottom) return 'inset 0 1px 0 0 var(--ring), inset 0 -1px 0 0 var(--ring)';
@@ -160,7 +171,14 @@ export type LogViewerRowProps = {
 
 function cellContent(line: LogLine, col: Column) {
   if (col === 'Dot') return <Dot line={line} />;
-  if (col === 'Message') return <AnsiText text={line.message} />;
+  if (col === 'Message') {
+    return (
+      <>
+        <AnsiText text={line.message} />
+        <CutNotice bytes={line.truncatedBytes} />
+      </>
+    );
+  }
   return <VisibleText text={getPlainAttribute(line, col)} />;
 }
 

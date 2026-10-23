@@ -19,6 +19,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { LogLine } from '@/lib/log-viewer';
 import { type Column, DEFAULT_COLUMNS, dotColor } from './columns';
 import {
+  CutNotice,
   LOG_GAP_ROW_H,
   LOG_ROW_H,
   LOG_ROW_PX,
@@ -35,6 +36,7 @@ const line = (over: Partial<LogLine> = {}): LogLine => ({
   timestamp: local(2026, 9, 15, 9, 5, 3, 123),
   cursor: 'c1',
   message: 'GET /healthz 200',
+  truncatedBytes: 0,
   stream: { namespace: 'prod', pod: 'webapp-7f9c', container: 'istio-proxy', previous: false },
   place: { node: 'node-a', region: 'eu-west-1', zone: 'eu-west-1b', os: 'linux', arch: 'arm64' },
   gap: null,
@@ -199,6 +201,17 @@ describe('LogViewerRow', () => {
     );
   });
 
+  it('ends a cut line’s message with what the server cut', () => {
+    render(<Row of={line({ truncatedBytes: 18_432 })} />);
+    expect(cellOf('Message')).toHaveTextContent('GET /healthz 200 … 18 KiB cut');
+    expect(screen.getByTitle('Cut by the server')).toBeInTheDocument();
+  });
+
+  it('draws no cut on a whole line', () => {
+    render(<Row />);
+    expect(screen.queryByTitle('Cut by the server')).toBeNull();
+  });
+
   it('draws no notice for a line with no hole', () => {
     render(<Row />);
     expect(screen.queryByTestId('log-gap')).toBeNull();
@@ -347,5 +360,19 @@ describe('estimateRowHeight', () => {
     expect(estimateRowHeight(long, width)).toBe(LOG_ROW_PX);
     expect(estimateRowHeight(long, width / 3)).toBe(3 * LOG_ROW_PX);
     expect(estimateRowHeight({ ...long, gap }, width / 3)).toBe(4 * LOG_ROW_PX);
+  });
+});
+
+describe('CutNotice', () => {
+  const text = (bytes: number) => render(<CutNotice bytes={bytes} />).container.textContent;
+
+  it('says the cut in KiB to one decimal, and in bytes under one KiB', () => {
+    expect(text(18_432)).toBe(' … 18 KiB cut');
+    expect(text(1536)).toBe(' … 1.5 KiB cut');
+    expect(text(1000)).toBe(' … 1000 B cut');
+  });
+
+  it('draws nothing for a whole line', () => {
+    expect(text(0)).toBe('');
   });
 });
