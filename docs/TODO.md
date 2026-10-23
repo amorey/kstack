@@ -139,11 +139,19 @@ Pending work across the three parts of the app. Grouped by area; detailed items 
     bit, the only fact the fetcher can know without reading the line whole. The readers (`Fetch`,
     `Follow`, both tools, the viewer) surface it; the ellipsis leaves the stored text, since what
     to draw is the reader's call. `docs/security-model.md` pins the cut with an ellipsis
-    (`TestStripControlCutsALongLine`); move that row in the same change. The log fetch API spec
-    takes the file's line as the whole message until this lands.
+    (`TestStripControlCutsALongLine`); move that row in the same change. Until then `Fetch` and
+    `Follow` take the file's line as the whole message, and `TruncatedBytes` counts only the
+    request's cut.
   - **A safe way to read the whole line.** A bounded read of one line from the kubelet on request,
     streamed to the caller in parts under a byte budget, never held whole and never written to
     the file.
+
+- **Bound a log scope's size, then cap the page cursor.** A scope's sources and filter values have
+  no size limit, and `MaxStreams` bounds the streams the mirror resolves, not the cached streams of
+  gone pods read beside them. So a page cursor, which carries the scope and an entry per container
+  passed, has no bound either, and `decodePageCursor` caps only its inflation. **Shape:** a
+  serialized scope budget and a total container limit, both checked before a page is served, so
+  the decoder can refuse an oversized token without ever refusing one the service wrote.
 
 - **Give a grep its context lines.** `Fetch` applies `Grep` to the range alone and leaves the
   padding unfiltered (rule 11), so nothing shows the lines around each match. **Shape:** a
@@ -616,11 +624,12 @@ Pending work across the three parts of the app. Grouped by area; detailed items 
 
 ## Frontend (webview)
 
-- **The log viewer's window is unbounded.** A long follow grows without end. Cap it at `maxLines`, dropping lines at the edge farther from the reader and never on screen; a dropped line comes back as a page from the sidecar's log cache, or from the kubelet once the cache has let it go. Its own pull request, over the working viewer.
+- **Bound the viewer's window and re-fetch from its edge page cursors.** A long follow grows the window's lines without end. Cap it at `maxLines`, dropping lines at the edge farther from the reader and never on screen, and keep that edge's page cursor, so scrolling back is an ordinary `Continue`. A dropped line comes back from the sidecar's log cache, or from the kubelet once the cache has let it go. The cost is the library's stable-key rule across a drop.
 - **The log viewer shows only the filters the model set.** Kubetail's sidebar lists each region, zone, OS, architecture and node the open sources span, with a count per value. That needs one query answering what a view's sources resolved to, which the sidecar's resolve already computes (`services/logs/resolve.go`) and the wire does not carry.
-- **The inline card reads an `At` window as an `Around` page and keeps its head half.** The tail
-  half is a backward read for lines nobody uses. `services/logs` can read a `Head` page from a
-  moment; `src/lib/inline-log-lines.ts` should ask for that instead.
+- **The inline card reads an `At` window and keeps one half.** `src/lib/inline-log-lines.ts` asks
+  for both halves of the moment and drops the other, a read for lines nobody uses. The service
+  reads either half as one first page (a window since the moment from `First`, or until it from
+  `Last`); the library's query union has no kind that asks for one half alone.
 - **Read on through empty log pages.** A grep with no match across many logs returns several empty
   pages in a row, each cut at the page's limits (→ [ADR: backward log reads assume normal
   logs](adr/2026-10-18-backward-reads-assume-normal-logs.md)), and the viewer shows *Keep looking* after each. It could read on by itself a few
@@ -628,7 +637,7 @@ Pending work across the three parts of the app. Grouped by area; detailed items 
 - **The log viewer cannot say how far a search has got.** *"Searched back to 09:14, no matches
   yet."* The webview never reads a cursor, so a page needs to carry a moment: a small wire change.
 - **The log viewer cannot tell a limit from a failure.** A stream stopped at a second too loud to
-  read (`failLimit`) and one whose read failed both arrive in `skipped`. Telling them apart lets the
+  read (`FailLimit`) and one whose read failed both arrive as a `stream-skipped` notice. Telling them apart lets the
   kubetail offer sit next to the reason.
 - **The log viewer has no download or timezone setting.**
 - **The log file's budget has no setting.** Each cluster cache's log file holds up to 1 GiB (`logstore.DefaultRetention.Bytes`), with SQLite's index and WAL on top, so a user with several clusters can use several GiB of disk. **Trigger:** a user asking to keep less. **Shape:** a setting read where `logs.New` takes its `Retention`.

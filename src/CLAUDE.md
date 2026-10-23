@@ -151,7 +151,7 @@ Live data: `useClusterCachedDataKinds` (`src/lib/cluster-cached-data-kinds.tsx`)
 
 ## The log viewer's library
 
-**`src/lib/log-viewer/` is the viewer's headless core**; its `README.md` is the whole statement. In brief:
+**`src/lib/log-viewer/` is the viewer's headless core**; its `README.md` is the whole statement. → [ADR: a log read is a window over a range](../docs/adr/2026-10-23-a-log-read-is-a-window-over-a-range.md). In brief:
 
 - `types.ts` is the contract: a `Client` with `fetch` (a query of kind `First`, `Last`, `At` or `Continue`; a `Page` with `prev`/`next`/`follow` edges and `notices`) and `follow(cursor, seen)` (`Line`, `Notice`, `Ended`; a follow that cannot open throws or calls `onFailed`, and the window unpins). **Cursors are opaque**; a line whose cursor is held is a repeat, dropped. Every `Continue` from the after edge sends `seen`, the newest line held of each container.
 - `LogWindow` (`window.ts`) is a React-free class holding the lines and the rules (stable keys, key 0 at the landing; only a `Tail` landing pins, then the pin is the user's; following is derived; one page per edge in flight). `window.test.ts` ends in a seeded walk over `FakeClient` that checks the rules after every step.

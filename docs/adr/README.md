@@ -195,7 +195,7 @@ usually just documentation in the wrong place.
 | 2026-10-13 | [The sidecar's own mirror reads keep their connections](2026-10-13-the-sidecars-own-mirror-reads-keep-their-connections.md) | sidecar | Accepted |
 | 2026-10-13 | [A cache reading is one snapshot](2026-10-13-a-cache-reading-is-one-snapshot.md) | sidecar | Accepted |
 | 2026-10-17 | [Keep a cluster cache's log lines in a file of its own, evicted by read](2026-10-17-the-log-cache.md) | sidecar | Accepted |
-| 2026-10-17 | [A log cursor is a position, and a container's instance is its id](2026-10-17-a-log-cursor-is-a-position.md) | sidecar | Accepted |
+| 2026-10-17 | [A log cursor is a position, and a container's instance is its id](2026-10-17-a-log-cursor-is-a-position.md) | sidecar | Superseded by [2026-10-23-a-log-read-is-a-window-over-a-range](2026-10-23-a-log-read-is-a-window-over-a-range.md) |
 | 2026-10-17 | [A head read never links, and a line carries the hole before it](2026-10-17-a-head-read-never-links.md) | sidecar | Accepted |
 | 2026-10-17 | [Record a bash stop as the runner's act, and kill at once on a cancel](2026-10-17-a-bash-stop-is-the-runners-record.md) | sidecar | Accepted |
 | 2026-10-17 | [A cloud platform is how a vendor's wire is authenticated, never a dialect](2026-10-17-a-cloud-platform-is-auth-on-a-vendors-wire.md) | sidecar | Accepted |
@@ -214,3 +214,4 @@ usually just documentation in the wrong place.
 | 2026-10-17 | [Hold each chat's draft and send in an outbox above the routes](2026-10-17-the-chat-outbox-holds-each-chats-send-above-the-routes.md) | frontend | Accepted |
 | 2026-10-18 | [Backward log reads assume normal logs, and stop clearly where normal ends](2026-10-18-backward-reads-assume-normal-logs.md) | sidecar | Accepted |
 | 2026-10-18 | [A rich view is a tool call's action](2026-10-18-a-rich-view-is-a-tool-calls-action.md) | cross-cutting | Accepted |
+| 2026-10-23 | [A log read is a window over a range](2026-10-23-a-log-read-is-a-window-over-a-range.md) | cross-cutting | Accepted |

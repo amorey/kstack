@@ -74,7 +74,7 @@ Four boundaries, in the order an attacker meets them:
 these checks, but required-check and release-gating settings are not established by this file. **Held by review** means it is true today and
 nothing stops the next change undoing it. **By decision** means the gap is a risk we accepted, and
 links the ADR that accepted it. **Not built** links the work. **Pending rebuild** means the
-mechanism was removed for a rewrite (the LLM rewrite, the [log fetch API](specs/log-fetch-api/))
+mechanism was removed for a rewrite (the LLM rewrite)
 and is not back yet; the row keeps the status it had and states what the rebuild must reproduce.
 
 | Protection | Where | Status |

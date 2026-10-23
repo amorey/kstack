@@ -53,7 +53,7 @@ cache at `<cache>/logs/<cache id>.db` (schema `migrations/0001_init.sql`: `strea
   versioned JSON in base64url (`Encode`, `Decode`); one with no runtime id is a moment
   (`MomentAt`). A `Bound` is one end of a read's range, a cursor and whether a line at it is in
   range; `StreamPos` reads one as each stream's position. A `Direction` is `Newer` or `Older`.
-  → [ADR: a log cursor is a position](../../../../docs/adr/2026-10-17-a-log-cursor-is-a-position.md).
+  → [ADR: a log read is a window over a range](../../../../docs/adr/2026-10-23-a-log-read-is-a-window-over-a-range.md).
 - **Every message goes through `KeepColor`** (`clean.go`) before the file and the wire: every control
   dropped but SGR sequences. Grep (`Matches`, over a `CompileGrep` regexp of at most `MaxGrep`
   bytes) and `ForModel` read a stored line through `StripControl`, which drops those too; a
@@ -146,7 +146,7 @@ built in `app` as `logs.New`, which owns the log store and is the cluster servic
   before `capMessage` cuts it, so a cut never leaves a fragment of a secret. A `FetchResponse`
   echoes the request as it ran, with `ResolvedAt`, the first page's clock, its records oldest first, its
   `Notices` (never nil), and its place as `Page{Prev, Next, Follow}`. The rules are `Fetch`'s doc
-  comment.
+  comment. → [ADR: a log read is a window over a range](../../../../docs/adr/2026-10-23-a-log-read-is-a-window-over-a-range.md).
   **A page cursor holds everything a continuation needs** (`pageCursor`): the scope, the window
   as the first page pinned it (`resolvedWindow`: `ResolvedAt`, `Start`), the way it reads, where
   each stream goes on from (`seen`, one line cursor per container by name, newer cursors only), a

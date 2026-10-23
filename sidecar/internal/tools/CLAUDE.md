@@ -146,7 +146,7 @@ tool's oversized result. Its action, `LogsReadAction`, holds the window as it ra
 model read and whether the page had more each way, with `viewAround`, the scope's view at its
 first line's moment, unpinned.
 
-→ [the model reads logs](../../../docs/security/2026-10-17-the-model-reads-logs.md).
+→ [ADR: a log read is a window over a range](../../../docs/adr/2026-10-23-a-log-read-is-a-window-over-a-range.md), [the model reads logs](../../../docs/security/2026-10-17-the-model-reads-logs.md).
 
 ## LogsWatch (`tools/logswatch`)
 

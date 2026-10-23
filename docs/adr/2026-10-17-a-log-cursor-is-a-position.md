@@ -2,7 +2,7 @@
 title: A log cursor is a position, and a container's instance is its id
 date: 2026-10-17
 scope: sidecar
-status: Accepted
+status: Superseded by [2026-10-23-a-log-read-is-a-window-over-a-range](2026-10-23-a-log-read-is-a-window-over-a-range.md)
 ---
 
 # A log cursor is a position, and a container's instance is its id
