@@ -95,17 +95,18 @@ type Notice struct {
 // FetchRequest is one page. A first page sets Scope, what is read, Window, when, and
 // PageFrom; with PageFromFirst it may set Seen, the last line the caller has of each
 // stream, so that stream reads past its line and every other from the window's
-// start. A continuation sets PageCursor alone, one of a page's Prev, Next or
-// Follow as it came: the cursor holds the scope and the window. PageSize is the
+// start. A continuation sets Cursor, one of a page's Prev, Next or Follow as it
+// came: the cursor holds the scope and the window. Beside a Next or Follow it may
+// set Seen, merged into the cursor's entries, the newer line standing. PageSize is the
 // lines a page holds, 1 to MaxPageSize, 0 for DefaultPageSize. MaxMessageBytes
 // cuts each message, 0 for the service's own cap. MaxPageBytes caps the sum of a
 // page's messages, 0 for MaxPageBytesCap. The three are read on every page.
 type FetchRequest struct {
 	Scope
 	Window
-	Seen       []string
-	PageFrom   PageFrom
-	PageCursor *string
+	Seen     []string
+	PageFrom PageFrom
+	Cursor   *string
 
 	PageSize        int
 	MaxMessageBytes int
@@ -155,7 +156,8 @@ type FetchResponse struct {
 //  4. A record's place in the window is its timestamp against the echoed bounds.
 //  5. PageFromFirst reads oldest first from the window's start, PageFromLast newest first
 //     from its end.
-//  6. A continuation sends its PageCursor alone; Prev reads newest first, Next and
+//  6. A continuation sends its Cursor, and beside a Next or Follow may send Seen,
+//     unless the window's After is counted; Prev reads newest first, Next and
 //     Follow oldest first, never past the window's edge. Mixed requests are
 //     conflicting-parameters; a cursor the service did not write is cursor-invalid,
 //     and one whose scope is now refused keeps the scope's code. The scope is
@@ -188,14 +190,14 @@ func (s *Service) Fetch(ctx context.Context, id cluster.ClusterID, q FetchReques
 	if err != nil {
 		return FetchResponse{}, err
 	}
-	if q.PageCursor != nil {
+	if q.Cursor != nil {
 		q.Scope, q.Window = c.Scope, c.Window
 	}
 	grep, err := logline.CompileGrep(c.Grep)
 	if err != nil {
 		return FetchResponse{}, err
 	}
-	first := q.PageCursor == nil
+	first := q.Cursor == nil
 	notices := []Notice{}
 	if first && c.Since == nil && c.Window.Before != (Padding{}) {
 		notices = append(notices, Notice{refusal.CodeEmptyPadding, "there is no padding before an open since"})
@@ -222,40 +224,66 @@ func (s *Service) Fetch(ctx context.Context, id cluster.ClusterID, q FetchReques
 // checkRequest is q with its defaults filled and its caps applied, refusing a
 // request whose parts do not go together (rule 6) or whose page is out of bounds.
 func checkRequest(q FetchRequest) (FetchRequest, error) {
-	scoped := len(q.Sources) > 0 || len(q.Filters) > 0 || q.Grep != ""
+	maxMessage, err := messageCap(q.MaxMessageBytes)
 	switch {
-	case (q.PageFrom == "") == (q.PageCursor == nil):
+	case (q.PageFrom == "") == (q.Cursor == nil):
 		return q, refusal.New(refusal.CodeConflictingParameters, "a request is a first page from first or last, or a page cursor alone")
 	case q.PageFrom != "" && q.PageFrom != PageFromFirst && q.PageFrom != PageFromLast:
 		return q, refusal.New(refusal.CodeConflictingParameters, fmt.Sprintf("a first page comes from first or last, not %q", q.PageFrom))
-	case q.PageCursor != nil && (scoped || q.Window != (Window{}) || len(q.Seen) > 0):
-		return q, refusal.New(refusal.CodeConflictingParameters, "a page cursor holds its scope and window, so a continuation sends it alone")
+	case q.Cursor != nil && (!q.Scope.empty() || q.Window != (Window{})):
+		return q, refusal.New(refusal.CodeConflictingParameters, "a page cursor holds its scope and window, so a continuation sends neither")
 	case len(q.Seen) > 0 && (q.PageFrom == PageFromLast || q.Before != (Padding{}) || q.After != (Padding{})):
 		return q, refusal.New(refusal.CodeConflictingParameters, "seen goes with a first page from first, with no padding")
 	case q.PageSize < 0 || q.PageSize > MaxPageSize:
 		return q, refusal.New(refusal.CodeBadPage, fmt.Sprintf("a page holds 1 to %d lines", MaxPageSize))
-	case q.MaxMessageBytes < 0 || q.MaxPageBytes < 0:
-		return q, refusal.New(refusal.CodeBadPage, "a byte cap is not negative")
+	case err != nil:
+		return q, err
+	case q.MaxPageBytes < 0:
+		return q, errNegativeCap
 	}
 	if q.PageSize == 0 {
 		q.PageSize = DefaultPageSize
 	}
-	if q.MaxMessageBytes == 0 || q.MaxMessageBytes > MaxMessageBytesCap {
-		q.MaxMessageBytes = MaxMessageBytesCap
-	}
+	q.MaxMessageBytes = maxMessage
 	if q.MaxPageBytes == 0 || q.MaxPageBytes > MaxPageBytesCap {
 		q.MaxPageBytes = MaxPageBytesCap
 	}
 	return q, nil
 }
 
-// cursorOf is the page cursor q reads from: its PageCursor decoded, or a first
-// page's on the service's clock.
-func (s *Service) cursorOf(q FetchRequest) (pageCursor, error) {
-	if q.PageCursor != nil {
-		return decodePageCursor(*q.PageCursor)
+// errNegativeCap refuses a byte cap below 0.
+var errNegativeCap = refusal.New(refusal.CodeBadPage, "a byte cap is not negative")
+
+// messageCap is a request's MaxMessageBytes as it runs: 0, and anything over
+// MaxMessageBytesCap, is MaxMessageBytesCap; a negative is refused.
+func messageCap(n int) (int, error) {
+	switch {
+	case n < 0:
+		return 0, errNegativeCap
+	case n == 0, n > MaxMessageBytesCap:
+		return MaxMessageBytesCap, nil
 	}
-	return firstPage(q, s.now())
+	return n, nil
+}
+
+// cursorOf is the page cursor q reads from: its Cursor decoded, with q's Seen
+// merged into its entries, or a first page's on the service's clock. Seen goes
+// only beside a newer cursor, since an older page has nothing to read past, and
+// not in a window whose After is counted, since the cursor's count holds the
+// pages' padding lines alone and the merged start would deliver them again.
+func (s *Service) cursorOf(q FetchRequest) (pageCursor, error) {
+	if q.Cursor == nil {
+		return firstPage(q, s.now())
+	}
+	c, err := decodePageCursor(*q.Cursor)
+	if err != nil || len(q.Seen) == 0 {
+		return c, err
+	}
+	if !c.newer || c.counted(sideAfter) {
+		return pageCursor{}, refusal.New(refusal.CodeConflictingParameters, "seen goes beside a next or follow whose window has no counted after")
+	}
+	c.seen, err = mergeSeen(c.seen, q.Seen)
+	return c, err
 }
 
 // read is the page c reads with grep, q.PageSize lines: the range's merge alone,
@@ -266,7 +294,7 @@ func (s *Service) read(ctx context.Context, id cluster.ClusterID, c *pageCursor,
 	rng := pageQuery{scope: c.Scope, grep: grep, mode: c.dir(), cur: c, limit: q.PageSize}
 	var lookup *pageCursor
 	var lines int
-	if q.PageCursor == nil {
+	if q.Cursor == nil {
 		lookup, lines = c.lookup()
 	}
 	if lookup == nil {
@@ -321,13 +349,14 @@ func joinReads(pad, rng merge, newer bool, limit int) merge {
 // pageQuery is what one direction's page reads: the scope and its compiled grep,
 // the direction, the page cursor that says where each stream starts and which
 // edge it stops at, nil to read every stream from its start or its end, and the
-// limit.
+// limit. grepAll applies the grep to the padding too, as a follow does.
 type pageQuery struct {
-	scope Scope
-	grep  *regexp.Regexp
-	mode  logline.Direction
-	cur   *pageCursor
-	limit int
+	scope   Scope
+	grep    *regexp.Regexp
+	mode    logline.Direction
+	cur     *pageCursor
+	limit   int
+	grepAll bool
 }
 
 // need is the lines a stream answers: one past the limit, so the merge can tell a
@@ -352,7 +381,7 @@ func (q pageQuery) full(n, past int) bool {
 // the range alone: the padding, and what a look back past the window's edge
 // meets.
 func (q pageQuery) keep(ts int64, message string) bool {
-	if q.cur != nil && !q.cur.inRange(ts) {
+	if q.cur != nil && !q.grepAll && !q.cur.inRange(ts) {
 		return true
 	}
 	return logline.Matches(q.grep, message)
@@ -425,6 +454,12 @@ func (s *Service) page(ctx context.Context, id cluster.ClusterID, qs ...pageQuer
 	if err != nil {
 		return nil, err
 	}
+	return s.pageOver(ctx, id, t, file, streams, qs...)
+}
+
+// pageOver is one merge per query over streams, which t resolved or file alone
+// holds: their gaps filled from the backends, then each query walked and merged.
+func (s *Service) pageOver(ctx context.Context, id cluster.ClusterID, t target, file *logstore.Store, streams []pageStream, qs ...pageQuery) ([]merge, error) {
 	for i := range streams {
 		streams[i].tail, streams[i].committed = s.tailOf(t.cacheID, streams[i].row.ID)
 	}
@@ -485,13 +520,13 @@ func (p *page) backendsOf(ps pageStream) []string {
 }
 
 // fill fills each stream the resolve handed out for each query, over one claim on
-// the server the pods came from. A newer query fills first: an older one from the
-// same bound, a first page's padding read before Since or its range read before
-// Until, links each stream's read back from the bound up to the newer fill's first
-// line, so the two chunks join there.
+// the server the pods came from; with none to fill, it takes no claim. A newer
+// query fills first: an older one from the same bound, a first page's padding read
+// before Since or its range read before Until, links each stream's read back from
+// the bound up to the newer fill's first line, so the two chunks join there.
 func (p *page) fill(ctx context.Context, qs []pageQuery) ([][]streamFill, error) {
 	fills := make([][]streamFill, len(qs))
-	if len(p.t.streams) == 0 {
+	if !slices.ContainsFunc(p.streams, func(ps pageStream) bool { return !ps.exhausted() }) {
 		for i := range fills {
 			fills[i] = make([]streamFill, len(p.streams))
 		}
@@ -717,12 +752,33 @@ func seenOf(seen []string) (map[logline.ContainerName]logline.RunPlace, error) {
 		if c.IsMoment() {
 			return nil, errBadSeen
 		}
-		if e, ok := out[c.ContainerName]; ok && logline.CompareCursors(c, logline.Cursor{ContainerName: c.ContainerName, RunPlace: e}) < 0 {
-			continue
-		}
-		out[c.ContainerName] = c.RunPlace
+		keepNewer(out, c)
 	}
 	return out, nil
+}
+
+// keepNewer sets c's stream's entry in entries to c, unless the entry is newer.
+func keepNewer(entries map[logline.ContainerName]logline.RunPlace, c logline.Cursor) {
+	if e, ok := entries[c.ContainerName]; ok && logline.CompareCursors(c, logline.Cursor{ContainerName: c.ContainerName, RunPlace: e}) < 0 {
+		return
+	}
+	entries[c.ContainerName] = c.RunPlace
+}
+
+// mergeSeen is entries, which the caller owns, with a request's Seen merged in,
+// the newer line of a stream standing.
+func mergeSeen(entries map[logline.ContainerName]logline.RunPlace, seen []string) (map[logline.ContainerName]logline.RunPlace, error) {
+	more, err := seenOf(seen)
+	if err != nil {
+		return nil, err
+	}
+	if entries == nil {
+		return more, nil
+	}
+	for name, place := range more {
+		keepNewer(entries, logline.Cursor{ContainerName: name, RunPlace: place})
+	}
+	return entries, nil
 }
 
 // lookup is the padding read a first page runs beside its range read when its
@@ -793,8 +849,8 @@ func (c pageCursor) farEdge() logline.Bound {
 // keyFor is where ps's read starts: past its entry, else past at, else from the
 // window's edge that way, a counted edge still to be found read as its range
 // bound. A key short of the window's known near edge is clipped to it, so a page
-// never crosses the window's edge; no clip applies while that edge is a count
-// still to be found.
+// never crosses the window's edge. While that edge is unknown, a newer cursor's
+// entry short of at is passed over for at.
 func (c pageCursor) keyFor(ps pageStream) logstore.Pos {
 	run := ps.run()
 	b := c.nearEdge()
@@ -807,8 +863,14 @@ func (c pageCursor) keyFor(ps pageStream) logstore.Pos {
 	if !c.at.IsZero() {
 		b = logline.Bound{At: c.at, Inclusive: false}
 	}
+	// While a newer cursor's near edge is unknown, at is its floor: the lines before
+	// it are the older pages'.
+	floor := c.newer && c.nearEdge().At.IsZero() && !c.at.IsZero()
 	if e, ok := c.seen[run.ContainerName]; ok {
-		b = logline.Bound{At: logline.Cursor{ContainerName: run.ContainerName, RunPlace: e}, Inclusive: false}
+		entry := logline.Cursor{ContainerName: run.ContainerName, RunPlace: e}
+		if !floor || logline.CompareCursors(entry, c.at) >= 0 {
+			b = logline.Bound{At: entry, Inclusive: false}
+		}
 	}
 	key := logline.StreamPos(b, run, c.dir())
 	edge := c.nearEdge()
@@ -1425,27 +1487,42 @@ func (ps pageStream) run() logline.Cursor {
 }
 
 // pageStreams files t's streams in file, each as its instance's row, and answers
-// them, then each of view's Pod sources' streams the file holds that the resolve
-// handed out for no source, each once across the view. Every row is held from the
-// moment its id is known until release, which the caller owes even on an error.
+// them, then fileOnlyStreams. Every row is held from the moment its id is known
+// until release, which the caller owes even on an error.
 func pageStreams(ctx context.Context, file *logstore.Store, t target, scope Scope) (_ []pageStream, release func(), err error) {
+	rows, err := fileStreams(ctx, file, t.streams)
+	if err != nil {
+		return nil, func() {}, err
+	}
+	releaseRows := file.Hold(rowIDs(rows)...)
+	out := make([]pageStream, len(t.streams))
+	for i, st := range t.streams {
+		out[i] = pageStream{row: rows[i], st: &t.streams[i], key: st.key, place: st.place}
+	}
+	only, releaseOnly, err := fileOnlyStreams(ctx, file, t, scope)
+	release = func() {
+		releaseRows()
+		releaseOnly()
+	}
+	return append(out, only...), release, err
+}
+
+// fileOnlyStreams is each of scope's Pod sources' streams the file holds that the
+// resolve handed out for no source, each instance once across the scope. Every row
+// is held from the moment its id is known until release, which the caller owes
+// even on an error.
+func fileOnlyStreams(ctx context.Context, file *logstore.Store, t target, scope Scope) (_ []pageStream, release func(), err error) {
 	var releases []func()
 	release = func() {
 		for _, r := range releases {
 			r()
 		}
 	}
-	rows, err := fileStreams(ctx, file, t.streams)
-	if err != nil {
-		return nil, release, err
+	seen := map[logline.Cursor]bool{}
+	for _, st := range t.streams {
+		seen[st.run()] = true
 	}
-	releases = append(releases, file.Hold(rowIDs(rows)...))
-	out := make([]pageStream, len(t.streams))
-	seen := map[int64]bool{}
-	for i, st := range t.streams {
-		seen[rows[i].ID] = true
-		out[i] = pageStream{row: rows[i], st: &t.streams[i], key: st.key, place: st.place}
-	}
+	var out []pageStream
 	for _, src := range scope.Sources {
 		if src.Kind != SourcePod {
 			continue
@@ -1459,16 +1536,16 @@ func pageStreams(ctx context.Context, file *logstore.Store, t target, scope Scop
 		_, live := t.pods[key]
 		pod := podNow{live: live, def: t.defaults[key], place: t.places[key]}
 		for _, row := range fileRows(held, src, scope.Filters, t.current, pod) {
-			if seen[row.ID] {
-				continue
-			}
-			seen[row.ID] = true
 			current := t.current[containerKey(row.Namespace, row.Pod, row.Container)]
-			out = append(out, pageStream{
+			ps := pageStream{
 				row:   row,
 				key:   logline.StreamKey{Namespace: row.Namespace, Pod: row.Pod, Container: row.Container, Previous: row.ContainerID != current},
 				place: pod.placeOf(row),
-			})
+			}
+			if !seen[ps.run()] {
+				seen[ps.run()] = true
+				out = append(out, ps)
+			}
 		}
 	}
 	return out, release, nil

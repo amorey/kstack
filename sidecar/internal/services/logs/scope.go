@@ -101,6 +101,11 @@ func MirrorKind(kind SourceKind) (apiVersion, k string) {
 	return m.apiVersion, m.kind
 }
 
+// empty is whether v names nothing to read: no source, filter or grep.
+func (v Scope) empty() bool {
+	return len(v.Sources) == 0 && len(v.Filters) == 0 && v.Grep == ""
+}
+
 // namespaces is each namespace v's sources read, once: what a follow's pods watch
 // is narrowed to.
 func (v Scope) namespaces() []string {

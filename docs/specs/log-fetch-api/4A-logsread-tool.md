@@ -21,7 +21,7 @@ Read `tools/CLAUDE.md`'s *LogsRead* section, `logsread/parse.go`, `logsread/samp
 | --- | --- | --- | --- |
 | `sources` | array | required on a first page | What to read, as today: `namespace`, `resource` as `<kind>/<name>`, `containers`, `all_containers`, `previous` |
 | `filters` | object | none | Keep only lines from these nodes, as today: `node`, `region`, `zone`, `os`, `arch` |
-| `grep` | string | none | A regular expression each line's message must match, as today. Filters the whole window, context included |
+| `grep` | string | none | A regular expression each line's message must match, as today. Filters the range alone; a context line passes it unfiltered |
 | `since` | string | open | Start of the range: a time at any precision, or a duration back from now |
 | `until` | string | open | End of the range, the same forms |
 | `before` | integer or string | 0 | Context before the range: lines, or a duration as a span |
@@ -38,7 +38,7 @@ other range key is `BadInput` on `cursor`.
 
 `parse.go` maps the call onto `logs.FetchRequest`: a first page sets the scope from
 `logsinput.Resolve`, the range, the padding and `PageFrom`; a `cursor` is the request's
-`PageCursor`, passed through unread, beside the call's own `page_size`, `max_message_bytes` and
+`Cursor`, passed through unread, beside the call's own `page_size`, `max_message_bytes` and
 `max_page_bytes`. A service `Refusal` is a `logsinput.Refused` carrying the service's `Code` as
 it came, so `cursor-invalid` reaches the model as such; `refusedBy`'s own code block and its
 `errors.Is` ladder go. A `cursor` call skips `logsinput.Resolve`: the cursor holds the scope as
@@ -112,7 +112,8 @@ The GraphQL `LogsReadAction` and `LogsReadLine` types mirror this in step 4B.
 `since`, `End` for `until`) instead of `MomentOf`, and keeps its own checks about the future and
 the day cap. A `since` that is a time fills the `FollowRequest`'s `Since`; one that is a cursor
 fills its `Cursor`, unread, so the model's `since` key keeps both meanings and the service tells
-them apart. It takes `max_message_bytes` with `LogsRead`'s default and meaning, and passes it
+them apart. A watch from a `follow` token starts where that page stopped and ignores the
+window's `until` and `after`; the watch's own `until` and `limit` bound it, as for any watch. It takes `max_message_bytes` with `LogsRead`'s default and meaning, and passes it
 on the `logs.FollowRequest` with the resolved scope and the start. The watch holds each line as
 the service cut it: `hold` no longer calls `CutLine`, and a cut line ends with the same
 ` … [N bytes cut]` suffix the sample prints. An `Ended` frame's `Refusal` reaches the model with

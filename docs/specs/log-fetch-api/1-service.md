@@ -2,7 +2,7 @@
 
 **Package:** `services/logs` (paths relative to `sidecar/internal/`).
 **Prerequisites:** none.
-**Status:** Planned.
+**Status:** Landed (#382).
 
 ## Goal
 
@@ -173,7 +173,7 @@ with an empty `Code` is the backstop.
 | Code | Carried by | When |
 | --- | --- | --- |
 | `cursor-invalid` | refusal | a `PageCursor` that is not a page cursor this version of the service wrote: it does not decode, its `v` is another version, or its content fails a check; a `Seen` entry that is not a line cursor (`errBadCursor`) |
-| `conflicting-parameters` | refusal | `PageFrom` with `PageCursor` or neither; a continuation with a scope, window or `Seen`; `Seen` with `PageFromLast` or beside a `Padding`; a `Padding` with both `Lines` and `Span`; today's `Around` and mode refusals in `fetch.go` |
+| `conflicting-parameters` | refusal | `PageFrom` with `PageCursor` or neither; a continuation with a scope or window, or with `Seen` beside a `Prev` or when its window has a counted `After` (step 2, task 5); `Seen` with `PageFromLast` or beside a `Padding`; a `Padding` with both `Lines` and `Span`; today's `Around` and mode refusals in `fetch.go` |
 | `invalid-range` | refusal | `Since` after `Until` |
 | `bad-grep` | refusal | a `Grep` that does not compile, or one over `MaxGrep` |
 | `bad-page` | refusal | `PageSize` outside 0 to `MaxPageSize`, or a negative `MaxMessageBytes` or `MaxPageBytes` |
@@ -509,8 +509,10 @@ reads as a `newer` cursor would whose entries are the `Seen` lines, each at its 
 `at` is zero: a named stream reads past its line, or from `Start` when its line is older than
 `Start`, and every other stream from `Start`. An entry that is not a line cursor, or names a
 moment and not a line, is `cursor-invalid`; of two for one stream the later in the list stands;
-one whose stream is outside the scope is dropped. `Seen` beside `PageCursor`, `PageFromLast` or a
-`Padding` is `conflicting-parameters`: a counted `Before` reads its context in a second read back
+one whose stream is outside the scope is dropped. `Seen` beside `PageFromLast` or a
+`Padding` is `conflicting-parameters`, and so is `Seen` beside a `Prev` or beside a cursor whose
+window has a counted `After` (step 2, task 5; beside any other cursor it merges into the cursor's
+entries): a counted `Before` reads its context in a second read back
 from `Since` that no entry bounds, so a named stream's lines between the context's start and its
 line would come again. This is what the viewer's `Head` after a follow needs: a window from the
 follow's start, with no padding, with the lines it holds named, which reads the rest once and
@@ -625,8 +627,9 @@ Write these as the doc comment on `Fetch`. Each has a test.
 6. **A continuation.** `PageCursor` says which way the page reads, where it goes on from, and
    the window. A `Prev` reads newest first toward the window's start; a `Next` or `Follow` reads
    oldest first toward its end. The page never crosses the window's edge. Refused as
-   `conflicting-parameters`: both `PageFrom` and `PageCursor`, neither, or a continuation whose
-   `Scope`, `Window` or `Seen` is not zero. The cursor holds no `PageSize`, `MaxMessageBytes` or
+   `conflicting-parameters`: both `PageFrom` and `PageCursor`, neither, a continuation whose
+   `Scope` or `Window` is not zero, or one with `Seen` beside a `Prev` or a counted `After`
+   (step 2, task 5). The cursor holds no `PageSize`, `MaxMessageBytes` or
    `MaxPageBytes`: a continuation names its own, checked and defaulted as a first page's are, so a
    0 is the default on every page and never what the page before asked. A `PageCursor` that is not
    a page cursor this service wrote is `cursor-invalid`; a cursor whose scope the service now

@@ -24,10 +24,10 @@ needs.
 | Library query | Wire request |
 | --- | --- |
 | `Head`, no cursor | `pageFrom: First`, bounds open |
-| `Head`, cursor | `pageCursor`: the library's cursor, a page's `next` or `follow` |
-| `Head`, seen | `pageFrom: First`, `since` the follow's start, no padding, `seen` the lines held per stream |
+| `Head`, cursor | `cursor`: the library's cursor, a page's `next` or `follow` |
+| `Head`, seen | `cursor`: the follow's cursor, `seen` the lines held per stream |
 | `Tail`, no cursor | `pageFrom: Last`, bounds open |
-| `Tail`, cursor | `pageCursor`: the library's cursor, a page's `prev` |
+| `Tail`, cursor | `cursor`: the library's cursor, a page's `prev` |
 | `Around`, `at` | two pages at once: `since: at`, `pageFrom: First` and `until: at`, `pageFrom: Last` |
 
 `limit` is sent as `pageSize`; `maxMessageBytes` and `maxPageBytes` are left at 0 (the server's caps).
@@ -49,10 +49,10 @@ when that half is empty. One half failing fails the `Around`.
 **An edge's library cursor is the server's page cursor, as it came.** The library's `Cursor`
 stays an opaque string the client passes through: the cursor holds the window, the two halves of
 an `Around` included, so the client wraps nothing and sends no bounds on a continuation. A line's
-cursor is the server's token as it came, and the client never sends one as `pageCursor`: the
+cursor is the server's token as it came, and the client never sends one as `cursor`: the
 library's `FetchQuery` gains `seen: Cursor[]`, filled from its per-stream map of newest lines, and
-a `Head` with `seen` is a first page with `seen` (step 1), which is what catching up after a
-follow needs. A cursor never expires and survives a cache clear. A continuation the server refuses
+a `Head` with `seen` is the follow's cursor sent on with `seen` (step 2, task 4), which is what
+catching up after a follow needs. A cursor never expires and survives a cache clear. A continuation the server refuses
 arrives as a validation error whose `rule` is `cursor-invalid`, which happens only across a
 version of Kstack; the client surfaces it as the fetch's error, and the viewer recovers as it does
 from any failed fetch, by reading a first page again.
@@ -60,13 +60,12 @@ from any failed fetch, by reading a first page again.
 **`follow(cursor)` sends `cursor` through as it came,** on `LogsFollowInput` with
 `maxMessageBytes: 0` and no scope: a library edge cursor is a page's `follow`, which the server
 reads as that page's poll. The viewer never sends `since` to open a follow; a follow from a moment
-is a page over that window and then its `follow`. **A reconnect sends `seen`,** the last line the
-library holds of each stream, with the scope and `since` the moment the follow was first opened:
-the library keeps a map of stream key to the newest line's `cursor` as lines arrive, and the
-checkpoint state and frame go. **The page after a follow reads the same way.** The window's
-`resume` is no longer a cursor once a follow has run; the next `Head` carries `seen` from the same
-map, which the client sends as a first page with `seen`, `since` the follow's start. `FetchQuery`
-gains `seen: Cursor[]`, null on every other read. The frames map by `type`: `Line` to the
+is a page over that window and then its `follow`. **A reconnect sends the same `cursor` and
+`seen`,** the last line the library holds of each stream: the library keeps a map of stream key
+to the newest line's `cursor` as lines arrive, and the checkpoint state and frame go. **The page
+after a follow reads the same way.** The window's `resume` stays the follow's cursor once a
+follow has run; the next `Head` carries it with `seen` from the same map, which the client sends
+as a continuation with `seen`. `FetchQuery` gains `seen: Cursor[]`, null on every other read. The frames map by `type`: `Line` to the
 library's `Line` with `lineOf`; `Notice` to a new library frame `{ kind: 'Notice'; code; message
 }`, which the viewer shows where it shows a page's `skipped` text; `Ended` to `Ended` with the
 reason, the code dropped. A follow the server refuses to open calls `onFailed` as today, and the
@@ -124,7 +123,7 @@ held, from a stream whose clock runs behind, drawn where it lands.
    `follow` mapping; the edges from the three strings; the `Around` join; delete `edgeCursor`
    and `edgeOf`. Tests in
    `logs-client.test.ts` for each row of the table, for each state of the three strings, for
-   notices becoming `skipped`, for a `Head` with `seen` sent as a first page, for an edge passed
+   notices becoming `skipped`, for a `Head` with `seen` sent as the follow's cursor with `seen`, for an edge passed
    back as it came, for a refused cursor reaching the caller, for `Around`: the join's order, the line at
    `at` kept once, the anchor with and without a `First` half, and one half failing; and for
    `follow`: an edge cursor sent as `cursor`, a reconnect sending `seen` with one line per
