@@ -205,16 +205,6 @@ func ValidContainerID(id string) bool {
 	return id != "" && len(id) <= maxContainerID && !strings.ContainsFunc(id, unicode.IsControl)
 }
 
-// BoundAfter is the bound a read past the cursor after reads from, the cursor's own
-// line dropped; zero with none.
-func BoundAfter(after *string) (Bound, error) {
-	if after == nil {
-		return Bound{}, nil
-	}
-	p, err := Decode(*after)
-	return Bound{p, false}, err
-}
-
 // Bound is one end of a read's range. At is a moment, standing at every line
 // stamped then, or one line; Inclusive is whether a line at At is in range. A zero
 // Bound is no bound.
@@ -286,47 +276,6 @@ func StreamPos(b Bound, run Cursor, mode Direction) logstore.Pos {
 		return at(ord - 1)
 	}
 	return at(ord + 1)
-}
-
-// boundOf is p, the exclusive bound of a walk of run's stream, as a bound across
-// the scope: before every line of a moment, after every line of it, or past a line.
-func BoundOf(run Cursor, p logstore.Pos) Bound {
-	at := time.Unix(0, p.TS).UTC()
-	switch {
-	case p.Ord < 0:
-		return Bound{MomentAt(at), true}
-	case p.Ord == math.MaxInt:
-		return Bound{MomentAt(at), false}
-	}
-	return Bound{run.At(p), false}
-}
-
-// CompareBounds orders two lower bounds by where the lines past them start: by
-// moment, then before every line of it, at a line, or after every line of it, then
-// between two lines by position.
-func CompareBounds(a, b Bound) int {
-	return cmp.Or(a.At.Timestamp.Compare(b.At.Timestamp), cmp.Compare(boundRank(a), boundRank(b)), CompareCursors(a.At, b.At))
-}
-
-// boundRank is where b falls among the bounds at its moment: before every line, at a
-// line, or after every line.
-func boundRank(b Bound) int {
-	switch {
-	case !b.At.IsMoment():
-		return 0
-	case b.Inclusive:
-		return -1
-	}
-	return 1
-}
-
-// cursorOfBound is the cursor a read past which starts where b does. A cursor reads
-// past what it names, so a bound that keeps its moment names the moment before.
-func CursorOfBound(b Bound) string {
-	if b.At.IsMoment() && b.Inclusive {
-		return Encode(MomentAt(b.At.Timestamp.Add(-time.Nanosecond)))
-	}
-	return Encode(b.At)
 }
 
 // direction is which way a read goes: newer reads oldest first past its key, older

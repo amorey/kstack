@@ -213,7 +213,7 @@ func TestPagesJoinWithoutLossOrRepeat(t *testing.T) {
 				for _, page := range firsts[:k] {
 					before = append(before, page.Records...)
 				}
-				back, _, _ := walkPages(t, svc, FetchRequest{PageCursor: firsts[k].Page.Prev, PageSize: limit}, sizes)
+				back, _, _ := walkPages(t, svc, FetchRequest{Cursor: firsts[k].Page.Prev, PageSize: limit}, sizes)
 				joins(before, back, "back from a next")
 			}
 			if k := rng.Intn(len(lasts)); k > 0 && lasts[k].Page.Next != nil {
@@ -221,7 +221,7 @@ func TestPagesJoinWithoutLossOrRepeat(t *testing.T) {
 				for _, page := range lasts[:k] {
 					after = append(slices.Clone(page.Records), after...)
 				}
-				on, _, _ := walkPages(t, svc, FetchRequest{PageCursor: lasts[k].Page.Next, PageSize: limit}, sizes)
+				on, _, _ := walkPages(t, svc, FetchRequest{Cursor: lasts[k].Page.Next, PageSize: limit}, sizes)
 				joins(after, on, "on from a prev")
 			}
 
@@ -479,7 +479,7 @@ func walk(t *testing.T, svc *Service, req FetchRequest) []logline.Record {
 // sizes names each continuation's page size and byte cap; nil repeats req's.
 func walkPages(t *testing.T, svc *Service, req FetchRequest, sizes func() (int, int)) ([]logline.Record, []string, []FetchResponse) {
 	t.Helper()
-	newer := req.PageFrom == PageFromFirst || req.PageCursor != nil && cursorIn(t, req.PageCursor).newer
+	newer := req.PageFrom == PageFromFirst || req.Cursor != nil && cursorIn(t, req.Cursor).newer
 	out := []logline.Record{}
 	var skipped []string
 	var pages []FetchResponse
@@ -499,7 +499,7 @@ func walkPages(t *testing.T, svc *Service, req FetchRequest, sizes func() (int, 
 		if c == nil {
 			return out, skipped, pages
 		}
-		req = FetchRequest{PageCursor: c, PageSize: req.PageSize, MaxPageBytes: req.MaxPageBytes}
+		req = FetchRequest{Cursor: c, PageSize: req.PageSize, MaxPageBytes: req.MaxPageBytes}
 		if sizes != nil {
 			req.PageSize, req.MaxPageBytes = sizes()
 		}
@@ -939,7 +939,7 @@ func TestATailPageThatCannotAdvanceIsRefused(t *testing.T) {
 	assert.Equal(t, []string{"b0"}, messages(page.Records))
 	require.NotNil(t, page.Page.Prev, "web-1 is still to read")
 
-	_, err = svc.Fetch(t.Context(), "7", FetchRequest{PageCursor: page.Page.Prev, PageSize: 5})
+	_, err = svc.Fetch(t.Context(), "7", FetchRequest{Cursor: page.Page.Prev, PageSize: 5})
 	assert.EqualError(t, err, "Kstack could not read older lines of this view: web-1/app: unavailable")
 	assert.Equal(t, refusal.CodeReadFailed, codeOf(err))
 }
@@ -950,7 +950,7 @@ func TestFetchRefusesABadCursor(t *testing.T) {
 	t.Parallel()
 	svc, _ := serviceOver(t, webMirror(t), newLogServer())
 	bad := "yesterday"
-	_, err := svc.Fetch(t.Context(), "7", FetchRequest{PageCursor: &bad})
+	_, err := svc.Fetch(t.Context(), "7", FetchRequest{Cursor: &bad})
 	assert.EqualError(t, err, "this is not a page cursor a page handed back")
 	assert.Equal(t, refusal.CodeCursorInvalid, codeOf(err))
 	_, err = svc.Fetch(t.Context(), "7", FetchRequest{Scope: webScope, PageFrom: PageFromFirst, Seen: []string{bad}})
@@ -974,7 +974,7 @@ func TestAGrepPastMaxGrepIsRefused(t *testing.T) {
 
 	_, err := svc.Fetch(t.Context(), "7", FetchRequest{Scope: view, PageFrom: PageFromFirst, PageSize: 10})
 	assert.EqualError(t, err, "a grep is at most 1000 bytes")
-	_, err = svc.Follow(t.Context(), "7", view, nil)
+	_, err = svc.Follow(t.Context(), "7", FollowRequest{Scope: view})
 	assert.EqualError(t, err, "a grep is at most 1000 bytes")
 
 	view.Grep = strings.Repeat("a", logline.MaxGrep)
@@ -1097,7 +1097,7 @@ func TestAHeadPageThatCannotAdvanceIsRefused(t *testing.T) {
 	assert.Equal(t, []string{"b0"}, messages(page.Records))
 	require.NotNil(t, page.Page.Next, "web-1 is still to read")
 
-	_, err = svc.Fetch(t.Context(), "7", FetchRequest{PageCursor: page.Page.Next, PageSize: 5})
+	_, err = svc.Fetch(t.Context(), "7", FetchRequest{Cursor: page.Page.Next, PageSize: 5})
 	assert.EqualError(t, err, "Kstack could not read newer lines of this view: web-1/app: unavailable")
 }
 
@@ -1513,24 +1513,30 @@ func fetch(t *testing.T, svc *Service, req FetchRequest) FetchResponse {
 func goOn(t *testing.T, svc *Service, c *string, size int) FetchResponse {
 	t.Helper()
 	require.NotNil(t, c)
-	return fetch(t, svc, FetchRequest{PageCursor: c, PageSize: size})
+	return fetch(t, svc, FetchRequest{Cursor: c, PageSize: size})
 }
 
 // A request is a first page, from PageFromFirst or PageFromLast, or a continuation, a page
-// cursor alone; Seen goes with PageFromFirst and no padding. Anything else is
+// cursor alone or with Seen; Seen goes with PageFromFirst and no padding, or with a
+// newer cursor whose window has no counted After. Anything else is
 // conflicting-parameters (rule 6).
 func TestAMixedRequestIsRefused(t *testing.T) {
 	t.Parallel()
 	svc, _ := serviceOver(t, webMirror(t), newLogServer())
 	c := encodePageCursor(openCursor(true))
+	older := encodePageCursor(openCursor(false))
+	counted := openCursor(true)
+	counted.Window.After = Padding{Lines: 3}
+	countedAfter := encodePageCursor(counted)
 	seen := []string{line("web-1", "app", 0, "").Cursor()}
 	for name, req := range map[string]FetchRequest{
 		"neither":                 {Scope: webScope},
-		"both":                    {Scope: webScope, PageFrom: PageFromFirst, PageCursor: &c},
+		"both":                    {Scope: webScope, PageFrom: PageFromFirst, Cursor: &c},
 		"another page":            {Scope: webScope, PageFrom: "middle"},
-		"a continuation's scope":  {Scope: webScope, PageCursor: &c},
-		"a continuation's window": {Window: Window{Since: moment(0)}, PageCursor: &c},
-		"a continuation's seen":   {Seen: seen, PageCursor: &c},
+		"a continuation's scope":  {Scope: webScope, Cursor: &c},
+		"a continuation's window": {Window: Window{Since: moment(0)}, Cursor: &c},
+		"seen beside a prev":      {Seen: seen, Cursor: &older},
+		"seen beside a count":     {Seen: seen, Cursor: &countedAfter},
 		"seen from the last":      {Scope: webScope, PageFrom: PageFromLast, Seen: seen},
 		"seen beside padding":     {Scope: webScope, PageFrom: PageFromFirst, Seen: seen, Window: Window{Since: moment(0), After: Padding{Span: time.Second}}},
 	} {
@@ -1571,8 +1577,8 @@ func TestTheRequestIsEchoedAsItRan(t *testing.T) {
 	assert.Equal(t, svc.now(), first.ResolvedAt)
 	assert.NotNil(t, first.Notices)
 
-	cont := fetch(t, svc, FetchRequest{PageCursor: first.Page.Next, MaxPageBytes: 10})
-	assert.Equal(t, FetchRequest{Scope: webScope, Window: w, PageCursor: first.Page.Next, PageSize: DefaultPageSize, MaxMessageBytes: MaxMessageBytesCap, MaxPageBytes: 10}, cont.Request)
+	cont := fetch(t, svc, FetchRequest{Cursor: first.Page.Next, MaxPageBytes: 10})
+	assert.Equal(t, FetchRequest{Scope: webScope, Window: w, Cursor: first.Page.Next, PageSize: DefaultPageSize, MaxMessageBytes: MaxMessageBytesCap, MaxPageBytes: 10}, cont.Request)
 	assert.Equal(t, first.ResolvedAt, cont.ResolvedAt)
 }
 
@@ -1700,7 +1706,7 @@ func TestAContinuationResolvesItsScopeAgain(t *testing.T) {
 
 	bad := openCursor(true)
 	bad.Filters = []ScopeFilter{{Field: "color", Values: []string{"red"}}}
-	_, err := svc.Fetch(t.Context(), "7", FetchRequest{PageCursor: encoded(bad)})
+	_, err := svc.Fetch(t.Context(), "7", FetchRequest{Cursor: encoded(bad)})
 	assert.Equal(t, refusal.CodeBadScope, codeOf(err))
 
 	page := fetch(t, svc, FetchRequest{Scope: webScope, Window: Window{Since: moment(2 * time.Second)}, PageFrom: PageFromFirst})
@@ -1711,7 +1717,7 @@ func TestAContinuationResolvesItsScopeAgain(t *testing.T) {
 
 	s.Add("prod/web-3/app", logstest.Stamped(time.Second, "too old"), logstest.Stamped(3*time.Second, "w3"))
 	f.store.Apply(t, pod("web-3", "uid-web-3", "node-a", webReplicaSet(), container{name: "app"}))
-	poll := fetch(t, svc, FetchRequest{PageCursor: encoded(c)})
+	poll := fetch(t, svc, FetchRequest{Cursor: encoded(c)})
 
 	assert.Equal(t, []string{"w3"}, messages(poll.Records), "web-3 reads from the window's start")
 	after, err := decodePageCursor(*poll.Page.Follow)
@@ -2074,6 +2080,25 @@ func TestSeenReadsEachStreamPastItsLine(t *testing.T) {
 	assert.Equal(t, refusal.CodeCursorInvalid, codeOf(err), "a moment")
 }
 
+// Seen beside a Next merges into the cursor's entries, the newer line of a stream
+// standing, so a caller that followed from the cursor pages on from it.
+func TestSeenBesideANextMergesIntoItsEntries(t *testing.T) {
+	t.Parallel()
+	s := newLogServer()
+	s.Add("prod/web-1/app", logstest.Stamped(time.Second, "a1"), logstest.Stamped(3*time.Second, "a3"), logstest.Stamped(5*time.Second, "a5"))
+	s.Add("prod/web-2/app", logstest.Stamped(time.Second, "b1"), logstest.Stamped(3*time.Second, "b3"), logstest.Stamped(5*time.Second, "b5"))
+	svc, _ := serviceOver(t, webMirror(t), s)
+	page := fetch(t, svc, FetchRequest{Scope: webScope, Window: Window{Since: moment(0)}, PageFrom: PageFromFirst, PageSize: 2})
+	require.Equal(t, []string{"a1", "b1"}, messages(page.Records))
+
+	page = fetch(t, svc, FetchRequest{Cursor: page.Page.Next, PageSize: 10, Seen: []string{
+		line("web-1", "app", 3*time.Second, "").Cursor(),
+		line("web-2", "app", 0, "").Cursor(),
+	}})
+
+	assert.Equal(t, []string{"b3", "a5", "b5"}, messages(page.Records), "web-1 past the newer request entry, web-2 past its own")
+}
+
 // A page's caps apply as it reads: a message is cut and says by how much, a record
 // the page cap dropped sets the edge it lay past and is the next page's first, and
 // a PageFromLast keeps its newest (rules 8 and 9).
@@ -2087,13 +2112,13 @@ func TestAPagesCapsSetItsEdges(t *testing.T) {
 	page := fetch(t, svc, FetchRequest{Scope: webScope, Window: w, PageFrom: PageFromFirst, MaxPageBytes: 8, MaxMessageBytes: 3})
 	assert.Equal(t, []string{"aaa", "bbb"}, messages(page.Records))
 	assert.Equal(t, 1, page.Records[0].TruncatedBytes)
-	page = fetch(t, svc, FetchRequest{PageCursor: page.Page.Next})
+	page = fetch(t, svc, FetchRequest{Cursor: page.Page.Next})
 	assert.Equal(t, []string{"cccc"}, messages(page.Records))
 	assert.Equal(t, 0, page.Records[0].TruncatedBytes)
 
 	page = fetch(t, svc, FetchRequest{Scope: webScope, Window: w, PageFrom: PageFromLast, MaxPageBytes: 8})
 	assert.Equal(t, []string{"bbbb", "cccc"}, messages(page.Records))
-	page = fetch(t, svc, FetchRequest{PageCursor: page.Page.Prev})
+	page = fetch(t, svc, FetchRequest{Cursor: page.Page.Prev})
 	assert.Equal(t, []string{"aaaa"}, messages(page.Records))
 }
 
@@ -2149,6 +2174,48 @@ func TestAPollDeliversSkewedLinesOnce(t *testing.T) {
 	page = goOn(t, svc, page.Page.Follow, 10)
 	assert.Empty(t, page.Records)
 	assert.NotNil(t, page.Page.Follow)
+}
+
+// A follow opened from a poll's Follow delivers exactly the lines the poll does,
+// then the lines written since; one reopened from the same Follow with Seen built
+// from every record held delivers the rest, and none again: not web-2's, quiet
+// since before the first follow, nor web-3's, seen on the page alone.
+func TestAFollowFromAPollsFollowDeliversEachLineOnce(t *testing.T) {
+	t.Parallel()
+	s := newLogServer()
+	s.Add("prod/web-1/app", logstest.LineEvery(3)...)
+	s.Add("prod/web-2/app", logstest.Stamped(500*time.Millisecond, "b"))
+	s.Add("prod/web-3/app", logstest.Stamped(1500*time.Millisecond, "c"))
+	f := webMirror(t)
+	f.store.Apply(t, web3())
+	svc, _ := serviceOver(t, f, s)
+	page := fetch(t, svc, FetchRequest{Scope: webScope, PageFrom: PageFromLast, PageSize: 10})
+	require.Equal(t, []string{"0", "b", "1", "c", "2"}, messages(page.Records))
+	s.Add("prod/web-1/app", logstest.Stamped(20*time.Second, "20"))
+	s.Add("prod/web-2/app", logstest.Stamped(15*time.Second, "b15"))
+	poll := goOn(t, svc, page.Page.Follow, 10)
+	require.Equal(t, []string{"b15", "20"}, messages(poll.Records))
+
+	ctx, cancel := context.WithCancel(t.Context())
+	first, err := svc.Follow(ctx, "7", FollowRequest{Cursor: page.Page.Follow})
+	require.NoError(t, err)
+	held := slices.Concat(page.Records, recvRecords(t, first, 2))
+	assert.ElementsMatch(t, messages(poll.Records), messages(held[len(page.Records):]))
+	s.Add("prod/web-1/app", logstest.Stamped(21*time.Second, "21"))
+	held = append(held, recvLine(t, first, "the line written since"))
+	assert.Equal(t, "21", held[len(held)-1].Message)
+	cancel()
+
+	var seen []string
+	for _, rec := range held {
+		seen = append(seen, rec.Cursor())
+	}
+	s.Add("prod/web-1/app", logstest.Stamped(22*time.Second, "22"))
+	second, err := svc.Follow(t.Context(), "7", FollowRequest{Cursor: page.Page.Follow, Seen: seen})
+	require.NoError(t, err)
+	assert.Equal(t, "22", recvLine(t, second, "the rest").Message)
+	s.Add("prod/web-3/app", logstest.Stamped(23*time.Second, "c23"))
+	assert.Equal(t, "c23", recvLine(t, second, "a line written after").Message, "nothing again before it")
 }
 
 // A page in a window whose After is counted reads no more past Until than the count
@@ -2460,8 +2527,8 @@ func psOf(pod, container string) pageStream { return pageStream{row: rowOf(pod, 
 func pos(d time.Duration, ord int) logstore.Pos { return logstore.Pos{TS: at(d).UnixNano(), Ord: ord} }
 
 // A stream reads from its entry, else from at, else from the window's edge, each
-// clipped to the window's known edge; an older cursor from at, else the window's
-// end.
+// clipped to the window's known edge, an entry short of at passed over while a
+// newer cursor's edge is unknown; an older cursor from at, else the window's end.
 func TestAStreamsKeyIsItsEntryAtOrTheEdge(t *testing.T) {
 	t.Parallel()
 	c := webCursor()
@@ -2491,7 +2558,9 @@ func TestAStreamsKeyIsItsEntryAtOrTheEdge(t *testing.T) {
 	counted := pageCursor{resolvedWindow: resolvedWindow{Window: Window{Since: moment(10 * time.Second), Before: Padding{Lines: 3}}, ResolvedAt: at(time.Hour)}, newer: true}
 	assert.Equal(t, pos(10*time.Second, -1), counted.keyFor(web1), "a counted start not yet found reads from Since")
 	counted.at = logline.MomentAt(at(5 * time.Second))
-	assert.Equal(t, pos(5*time.Second, math.MaxInt), counted.keyFor(web1), "no clip while the edge is a count")
+	assert.Equal(t, pos(5*time.Second, math.MaxInt), counted.keyFor(web1), "past at while the edge is a count")
+	counted.seen = map[logline.ContainerName]logline.RunPlace{web1.run().ContainerName: {ContainerID: web1.row.ContainerID, Timestamp: at(2 * time.Second)}}
+	assert.Equal(t, pos(5*time.Second, math.MaxInt), counted.keyFor(web1), "an entry short of at is passed over while the edge is a count")
 }
 
 // Two runs of one name share one entry, so the restarted run reads on from the
@@ -3139,7 +3208,7 @@ func TestEachNodeFilterReadsAGonePodsPlace(t *testing.T) {
 
 	page, err := svc.Fetch(t.Context(), "7", FetchRequest{Scope: web1Scope, PageFrom: PageFromFirst, PageSize: 10})
 	require.NoError(t, err)
-	page, err = svc.Fetch(t.Context(), "7", FetchRequest{PageCursor: page.Page.Follow, PageSize: 10})
+	page, err = svc.Fetch(t.Context(), "7", FetchRequest{Cursor: page.Page.Follow, PageSize: 10})
 	require.NoError(t, err)
 	assert.Empty(t, page.Records)
 	assert.Empty(t, skippedOf(page))
@@ -3221,7 +3290,7 @@ func TestASparseGrepFillsBackUntilItHasAPage(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, page.Records)
 	assert.NotNil(t, page.Page.Prev)
-	next, err := svc.Fetch(t.Context(), "7", FetchRequest{PageCursor: page.Page.Prev, PageSize: 2})
+	next, err := svc.Fetch(t.Context(), "7", FetchRequest{Cursor: page.Page.Prev, PageSize: 2})
 	require.NoError(t, err)
 	assert.NotNil(t, next.Page.Prev)
 	assert.NotEqual(t, *page.Page.Prev, *next.Page.Prev, "reading on moves")
@@ -3341,7 +3410,7 @@ func TestAFinishedInstanceReadToItsEndIsNotReadAgain(t *testing.T) {
 	assert.True(t, chunks[0].AtEnd)
 	reads := len(s.Requests())
 
-	for _, q := range []FetchRequest{{Scope: web1Scope, PageFrom: PageFromFirst}, {Scope: web1Scope, PageFrom: PageFromLast}, {PageCursor: first.Page.Follow}} {
+	for _, q := range []FetchRequest{{Scope: web1Scope, PageFrom: PageFromFirst}, {Scope: web1Scope, PageFrom: PageFromLast}, {Cursor: first.Page.Follow}} {
 		page, err := svc.Fetch(t.Context(), "7", q)
 		require.NoError(t, err)
 		assert.NotNil(t, page.Page.Follow)
@@ -4060,7 +4129,7 @@ func TestTheFirstWindowOfAFinishedInstanceIsAtEnd(t *testing.T) {
 			assert.True(t, newest.AtEnd)
 
 			reads := len(s.Requests())
-			_, err = svc.Fetch(t.Context(), "7", FetchRequest{PageCursor: page.Page.Follow, PageSize: 10})
+			_, err = svc.Fetch(t.Context(), "7", FetchRequest{Cursor: page.Page.Follow, PageSize: 10})
 			require.NoError(t, err)
 			assert.Len(t, s.Requests(), reads)
 		})
@@ -4376,7 +4445,7 @@ func TestPagesReadBackThroughABurst(t *testing.T) {
 		if page.Page.Prev == nil {
 			break
 		}
-		q = FetchRequest{PageCursor: page.Page.Prev, PageSize: MaxPageSize}
+		q = FetchRequest{Cursor: page.Page.Prev, PageSize: MaxPageSize}
 	}
 	assert.Equal(t, want, got)
 
@@ -4663,7 +4732,7 @@ func (w *world) page() {
 		q.Window = Window{Since: &moment, Before: Padding{Lines: 1 + w.rng.Intn(20)}}
 		q.PageFrom = PageFromFirst
 	case n == 1 && len(w.cursors) > 0:
-		q = FetchRequest{PageCursor: w.cursors[w.rng.Intn(len(w.cursors))]}
+		q = FetchRequest{Cursor: w.cursors[w.rng.Intn(len(w.cursors))]}
 	case n == 2 && len(w.seen) > 0:
 		q.PageFrom, q.Seen = PageFromFirst, []string{w.seen[w.rng.Intn(len(w.seen))]}
 	}

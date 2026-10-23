@@ -33,8 +33,9 @@ Where this sequence departs from it, the decisions below say so and why.
 
 - **Scope** is what is read: `sources` (pods or workloads, their containers, `previous`),
   `filters` (node, region, zone, OS, architecture) and `grep` (a regular expression a line's
-  message must match). It is today's `logs.View`, renamed (decision 17). `filters` apply first,
-  then `grep`, to every line of the window, context included.
+  message must match). It is today's `logs.View`, renamed (decision 17). `filters` apply to
+  every line of the window; `grep` to the range's lines alone, so a context line passes it
+  unfiltered.
 - **Window** is when: the range's two bounds and its two paddings.
 - **Page** is one read of the window: at most `page_size` lines and `max_page_bytes` bytes, each
   message cut at `max_message_bytes`.
@@ -110,9 +111,11 @@ the ADR when the work lands.
    offset (`2026-10-21+03:00`) is refused with a message saying a date is UTC. The design reads
    it as that day in that offset, but one shape read two ways is one too many for a model to get
    right.
-10. **`grep` filters the whole window.** Context lines pass through the same grep as the range,
-    so a count of context counts matching lines. Unfiltered context, as `grep -C` gives, is a
-    later flag, noted in `docs/TODO.md` when this lands.
+10. **`grep` filters the range, not its context.** A context line passes unfiltered, so a
+    count of context counts every line and a padding costs its count whatever the grep. A
+    follow from a page cursor tests lines the same way (step 2, rule 4). The lines around each
+    match, as `grep -C` gives, are a later flag: the `docs/TODO.md` row *Give a grep its context
+    lines*.
 11. **The model's token is the service's page cursor, as it came.** A continuation is `cursor`
     alone, as the design says. The tool prints the cursor and passes it back; it wraps nothing
     and stores nothing. Today's `EncodeCursor` and `DecodeCursor` go.
@@ -173,13 +176,19 @@ the ADR when the work lands.
     The engine under the follow does not change. Its surface changes in this sequence because
     steps 4B and 5 rewrite the wire and the client once; a follow patched to compile now would
     have them rewritten twice.
-20. **A follow starts from a moment, the lines seen, or a page's `follow`.** `Follow` takes
-    `Since`, a time; `Seen`, the last line the caller has of each stream, each stream reading
-    past its own; or `Cursor`, a page's `Follow`, each stream starting where the page left it,
-    exactly as a poll of that page reads. The viewer's `follow(cursor)` sends its edge cursor
-    through, and a reconnect sends the last line it holds of each stream as `Seen`. `Since` is
-    inclusive, as a window's is, and has no exclusive twin: the lines past one a caller saw
-    are what `Seen` asks for.
+20. **A follow starts from a moment or a page's `follow`, and `Seen` rides beside either.**
+    `Follow` takes `Since`, a time, or `Cursor`, a page's `Follow`, each stream starting where
+    the page left it, exactly as a poll of that page reads, and then on past the window's end:
+    a follow takes a cursor's start and ignores its `until` and `after`, which say where a poll
+    stops; a caller that wants them honoured polls the cursor through `Fetch`. `Seen`, the last
+    line the caller has of each stream, rides beside either:
+    each named stream reads past its own line, and every other from the start. `Seen` alone is
+    refused, since a stream it does not name would read from now and lose what it wrote
+    meanwhile. `Fetch` takes `Seen` beside a page cursor the same way, so a caller that followed
+    from a cursor pages on from the same cursor. The viewer's `follow(cursor)` sends its edge
+    cursor through; a reconnect, and the page after the follow, send the same cursor and the
+    last line held of each stream as `Seen`. `Since` is inclusive, as a window's is, and has no
+    exclusive twin: the lines past one a caller saw are what `Seen` asks for.
     **A follow sends no checkpoint.** A checkpoint named the oldest watermark across the scope,
     so one quiet stream made every reconnect replay every busy stream from where the quiet one
     stopped. The caller already holds what a reconnect needs, its own last line per stream, so
@@ -187,6 +196,13 @@ the ADR when the work lands.
 21. **A follow takes the message cap.** `MaxMessageBytes` on the follow request cuts and counts
     in the service as a page's does. `LogsWatch` stops cutting at 2 KiB on its own, and
     `logsinput.CutLine` goes.
+22. **A request's page cursor is `Cursor` on both verbs.** `FetchRequest.PageCursor` becomes
+    `FetchRequest.Cursor`, matching `FollowRequest.Cursor`, the model's `cursor` key and the
+    wire's `cursor` argument on both inputs. The word is unambiguous on a request: a line cursor
+    travels only as `Seen`, so `Cursor` can only be a page cursor. The type `pageCursor` and
+    `encodePageCursor`, `decodePageCursor` and `errBadPageCursor` keep their names; they name the
+    kind of thing, not the field. Step 2 makes the rename its first commit; step 1's spec reads
+    `PageCursor` as the field was when that step landed.
 
 ## Open
 
@@ -198,7 +214,7 @@ the ADR when the work lands.
 | Step | Spec | What it builds |
 | --- | --- | --- |
 | 1 | [1-service.md](1-service.md) | The log service's one query: window, context, caps, page cursor, notices |
-| 2 | [2-follow.md](2-follow.md) | The follow on the same types: scope, a start that is a line cursor or a page's `follow`, the message cap, frames with notices and a coded end |
+| 2 | [2-follow.md](2-follow.md) | The follow on the same types: scope, a start that is a moment with the lines seen or a page's `follow`, the message cap, frames with notices and a coded end |
 | 3 | [3-logsinput.md](3-logsinput.md) | The tools' shared parser: precise times, context values, the printed token |
 | 4A | [4A-logsread-tool.md](4A-logsread-tool.md) | `LogsRead` on the new query, its prompt, its action; `LogsWatch` on the new follow |
 | 4B | [4B-graphql-wire.md](4B-graphql-wire.md) | `logsFetch` and `logsFollow` on the new types, generated code on both sides |

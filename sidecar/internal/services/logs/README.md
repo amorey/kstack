@@ -23,8 +23,11 @@ A **first page** names:
   last line you already have. That container resumes past its line. Every other container reads
   from the window's start.
 
-A **continuation** sends one `PageCursor` and nothing else. The cursor came from an earlier page's
-`Prev`, `Next` or `Follow`. It holds the scope and the window, so sending those again is refused.
+A **continuation** sends one `Cursor`. The cursor came from an earlier page's `Prev`, `Next` or
+`Follow`. It holds the scope and the window, so sending those again is refused. Beside a `Next` or
+`Follow` it may send **Seen**, merged into the cursor's own, the newer line of a container
+standing: how a caller that followed from the cursor pages on from it. Not when the window's
+`After` is a count.
 
 Every request may set three caps, and they are read on every page:
 
@@ -112,7 +115,7 @@ caller can act on:
 
 | Code | Why |
 | --- | --- |
-| `conflicting-parameters` | a first page and a cursor together, or neither; a cursor with a scope, window or `Seen`; `Seen` with `PageFromLast` or padding; padding with both `Lines` and `Span` |
+| `conflicting-parameters` | a first page and a cursor together, or neither; a cursor with a scope or window; `Seen` with `PageFromLast`, padding, a `Prev`, or a cursor whose `After` is counted; padding with both `Lines` and `Span` |
 | `invalid-range` | `Since` after `Until` |
 | `bad-padding` | more than 500 lines, or a span over 7 days |
 | `bad-page` | `PageSize` over 500, or a negative cap |
@@ -122,8 +125,12 @@ caller can act on:
 | `not-mirrored`, `no-cache`, `syncing` | the cluster cache cannot resolve the scope yet |
 | `read-failed` | every container failed to read and the page has nothing |
 
-## Follow is not Fetch
+## Follow
 
-`Service.Follow` is a separate call that streams lines as they are written. It takes the same
-scope and a cursor from one of its own earlier frames, or starts from now with none. Lines are
-ordered per container only. See `CLAUDE.md` for how it works.
+`Service.Follow` is the other verb: it streams lines as they are written. It takes the same scope,
+or a page's `Next` or `Follow` cursor, which holds one. It starts from now, from `Since`, or from
+that cursor, with `Seen` beside either. A follow from a cursor reads every line a poll of it would,
+then goes on past the window's end. Each frame carries a record, a notice, or, last, the
+refusal that ended it. `MaxMessageBytes` cuts each message as a page's does. A follow hands out no
+cursor: to reopen one, send the same start and the last line you hold of each container as
+`Seen`. Lines are ordered per container only. See `CLAUDE.md` for how it works.

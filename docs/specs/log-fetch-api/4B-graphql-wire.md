@@ -33,8 +33,8 @@ input LogsPaddingInput {
 """
 One page. A first page gives `scope`, what is read; `since` and `until`, the range's bounds, each
 including every line at that moment, null for open; `before` and `after`, its padding; and
-`pageFrom`. A continuation gives `pageCursor` alone, a page's `prev`, `next` or `follow` as it
-came: the cursor holds the rest. `pageSize` is 1 to 500, null or 0 for the server's default;
+`pageFrom`. A continuation gives `cursor`, a page's `prev`, `next` or `follow` as it came, and
+at most `seen` beside it: the cursor holds the rest. `pageSize` is 1 to 500, null or 0 for the server's default;
 `maxMessageBytes` cuts each message, 0 for the server's cap; `maxPageBytes` caps the page's
 messages together, 0 for the server's default. The three are read on every page.
 """
@@ -45,9 +45,9 @@ input LogsFetchInput {
   before: LogsPaddingInput
   after: LogsPaddingInput
   pageFrom: LogsPageFrom
-  "With `First`: the last line the caller has of each stream, by its `cursor`; that stream reads past it, the rest from the window's start."
+  "The last line the caller has of each stream, by its `cursor`: that stream reads past it. With `First`, the rest read from the window's start; with a `cursor`, from where the page left them."
   seen: [String!]
-  pageCursor: String
+  cursor: String
   pageSize: Int
   maxMessageBytes: Int
   maxPageBytes: Int
@@ -75,7 +75,7 @@ type LogsPadding {
 }
 
 """
-The page's place in the window, each a page cursor to pass back as `pageCursor`, null where there
+The page's place in the window, each a page cursor to pass back as `cursor`, null where there
 is none. A page cursor is an opaque string that holds everything the next page needs; it never
 expires. `prev` goes on toward older lines and `next` toward newer; `follow` polls a live
 window's end for lines written since. A page going on from `next` or `follow` may hold a line stamped
@@ -101,7 +101,7 @@ Add to `LogRecord`:
   truncatedBytes: Int!
 ```
 
-`cursor`'s doc becomes "Names this line: a fetch's `pageCursor` reads past it, and a follow's
+`cursor`'s doc becomes "Names this line: a fetch's `cursor` reads past it, and a follow's
 `seen` reads this stream past it. Opaque."
 
 `LogRecordsPage` becomes:
@@ -133,11 +133,12 @@ fields.
 ```graphql
 """
 One follow. `scope` is what is followed. It starts from now, or from `since`, that moment's
-lines included. `seen` is the last line the caller has of each stream, by its `cursor`: that
-stream reads past it, and a stream not in `seen` reads from `since`. `cursor` is a page's
-`follow`: each stream reads past where that page left it, and the scope is the cursor's, so
-`scope` is omitted. `cursor` with `since` or `seen` is refused. `maxMessageBytes` cuts each
-message, 0 for the server's cap.
+lines included, or from `cursor`, a page's `follow`: each stream reads past where that page
+left it, and on past that page's window, and the scope is the cursor's, so `scope` is omitted.
+`seen`, sent with either, is the last line the caller has of each stream, by its `cursor`:
+that stream reads past it, and a stream not in `seen` reads from the start. `cursor` with
+`since` is refused, and so is `seen` alone. `maxMessageBytes` cuts each message, 0 for the
+server's cap.
 """
 input LogsFollowInput {
   scope: LogsScopeInput
@@ -184,7 +185,7 @@ an errored line as nothing. The resolver sets `type` from whichever field the Go
 ## The resolver
 
 `logsFetch` in `schema.resolvers.go` maps `LogsFetchInput` onto `logs.FetchRequest` field by field
-in a small `requestOf(in) (logs.FetchRequest, error)` in `util.go`, with a test. `pageCursor` passes
+in a small `requestOf(in) (logs.FetchRequest, error)` in `util.go`, with a test. `cursor` passes
 through unread. A span string is parsed there with the same ISO 8601 reader `logsinput` uses;
 export that reader from `services/logs` if it lives in `logsinput` (the layering forbids `graph`
 importing `tools/internal`). A bad span or a `lines` and `span` both set is
@@ -206,11 +207,11 @@ a `followRequestOf(in)` beside `requestOf`, and each frame onto `LogsFollowFrame
 2. **Generate.** `cd sidecar && go run github.com/99designs/gqlgen generate`. Implement the
    stubs. Never edit `generated.go` or `models_gen.go`.
 3. **Resolver.** `requestOf` and `followRequestOf` and their tests, including a follow from
-   `since`, with `seen`, from `cursor`, and `cursor` beside either refused as
-   `conflicting-parameters`; the response and frame mappings; the action mappings.
+   `since`, with `seen`, from `cursor`, from `cursor` with `seen`, and `cursor` beside `since`
+   refused as `conflicting-parameters`; the response and frame mappings; the action mappings.
 4. **Resolver test.** In the existing `logsFetch` resolver test, add a first page with context,
    a continuation from a page's `next` passed back as it came, a `lines` and `span` conflict, a
-   bad span, and a `pageCursor` that does not decode, refused by the service. In the
+   bad span, and a `cursor` that does not decode, refused by the service. In the
    `logsFollow` resolver test, a follow from a page's `follow`, a `Notice` frame, and an
    `Ended` frame carrying its code.
 5. **Frontend codegen.** From the root, `pnpm codegen`. `pnpm build` fails until step 5 rewrites
