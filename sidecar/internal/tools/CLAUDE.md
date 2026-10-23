@@ -115,7 +115,7 @@ whose SDK it imports.
 
 **LogsView is a live view of logs the user looks at, opened by the model's call.** It is `Custom` and `Shown`, never `Gated`, and reads no log line: it checks the call
 against the mirror, hands back a `LogsViewAction` the row keeps, and answers a one-line receipt
-through `safe.Redact`. The action embeds `LogsViewInput` (`services/logs`' `View`, aliased in
+through `safe.Redact`. The action embeds `LogsScopeInput` (`services/logs`' `Scope`, aliased in
 `tools`) plus an `Anchor`, `PinToEnd` and `ResolvedAt`, the moment it resolved on the tool's clock, which a frozen card reads up to; the enums bind member by member in `gqlgen.yml`.
 It reads its own `anchor` and `pin_to_end` as `logsinput.Parse`'s `Fields`, then resolves the
 view with `logsinput.Resolve`. **A source the mirror does not hold yet opens**: a view waits for it.
@@ -154,7 +154,7 @@ strict walk (each key once, DNS names, at most 100 sources, `grep` compiled on o
 `MaxGrep`); `own` is the tool's `Fields`, each key's typed destination or the refusal it earns.
 `Resolve(ctx, svc, now, id, in)` checks each source inside one `ReadActive`, then runs
 `logs.Check`, so a view a tool takes is one the service reads. `MomentOf(s, now, dir)` reads an RFC 3339
-time or an ISO 8601 duration, applied on the calendar in UTC in the caller's `Direction` (`Behind`
+time or an ISO 8601 duration (read by `services/logs/iso8601`), applied on the calendar in UTC in the caller's `Direction` (`Behind`
 or `Ahead`), a month end clamped to the target month's last day, and nothing before the epoch or
 after 9999; `SourcesText` and `NotesText` how a tool names its sources; `Refusal` and `Result` how it
 answers; `sample.go` how a line reads (`LineText`, `CutLine`, `Stamp`, the caps
