@@ -303,7 +303,7 @@ models:
     model: github.com/kstackhq/kstack/sidecar/internal/tools.LogsViewAction
 
   LogsViewSource:
-    model: github.com/kstackhq/kstack/sidecar/internal/services/logs.ViewSource
+    model: github.com/kstackhq/kstack/sidecar/internal/services/logs.ScopeSource
 
   LogsViewSourceKind:
     model: github.com/kstackhq/kstack/sidecar/internal/services/logs.SourceKind
@@ -324,31 +324,25 @@ models:
         value: github.com/kstackhq/kstack/sidecar/internal/services/logs.SourceReplicaSet
 
   LogRecord:
-    model: github.com/kstackhq/kstack/sidecar/internal/services/logs.Record
+    model: github.com/kstackhq/kstack/sidecar/internal/services/logs/logline.Record
 
   LogGap:
-    model: github.com/kstackhq/kstack/sidecar/internal/services/logs.Gap
+    model: github.com/kstackhq/kstack/sidecar/internal/services/logs/logline.Gap
 
   LogStream:
-    model: github.com/kstackhq/kstack/sidecar/internal/services/logs.StreamKey
+    model: github.com/kstackhq/kstack/sidecar/internal/services/logs/logline.StreamKey
 
   LogPlace:
-    model: github.com/kstackhq/kstack/sidecar/internal/services/logs.Place
-
-  LogRecordsPage:
-    model: github.com/kstackhq/kstack/sidecar/internal/services/logs.Page
-
-  LogRecordsPageEdge:
-    model: github.com/kstackhq/kstack/sidecar/internal/services/logs.PageEdge
+    model: github.com/kstackhq/kstack/sidecar/internal/services/logs/logline.Place
 
   LogsViewInput:
-    model: github.com/kstackhq/kstack/sidecar/internal/services/logs.View
+    model: github.com/kstackhq/kstack/sidecar/internal/services/logs.Scope
 
   LogsViewSourceInput:
-    model: github.com/kstackhq/kstack/sidecar/internal/services/logs.ViewSource
+    model: github.com/kstackhq/kstack/sidecar/internal/services/logs.ScopeSource
 
   LogsViewFilterInput:
-    model: github.com/kstackhq/kstack/sidecar/internal/services/logs.ViewFilter
+    model: github.com/kstackhq/kstack/sidecar/internal/services/logs.ScopeFilter
 
   LogsFollowFrame:
     model: github.com/kstackhq/kstack/sidecar/internal/services/logs.FollowFrame
@@ -362,16 +356,6 @@ models:
         value: github.com/kstackhq/kstack/sidecar/internal/services/logs.FollowCheckpoint
       Ended:
         value: github.com/kstackhq/kstack/sidecar/internal/services/logs.FollowEnded
-
-  LogsFetchMode:
-    model: github.com/kstackhq/kstack/sidecar/internal/services/logs.FetchMode
-    enum_values:
-      Head:
-        value: github.com/kstackhq/kstack/sidecar/internal/services/logs.FetchHead
-      Tail:
-        value: github.com/kstackhq/kstack/sidecar/internal/services/logs.FetchTail
-      Around:
-        value: github.com/kstackhq/kstack/sidecar/internal/services/logs.FetchAround
 
   LogsViewAnchor:
     model: github.com/kstackhq/kstack/sidecar/internal/tools.LogsViewAnchor
@@ -414,7 +398,7 @@ models:
         value: github.com/kstackhq/kstack/sidecar/internal/tools.LogsAnchorAt
 
   LogsViewFilter:
-    model: github.com/kstackhq/kstack/sidecar/internal/services/logs.ViewFilter
+    model: github.com/kstackhq/kstack/sidecar/internal/services/logs.ScopeFilter
 
   LogsViewFilterField:
     model: github.com/kstackhq/kstack/sidecar/internal/services/logs.FilterField

@@ -548,12 +548,8 @@ func (r *queryResolver) ChatGrants(ctx context.Context, chatID apimeta.ChatID) (
 }
 
 // LogsFetch is the resolver for the logsFetch field.
-func (r *queryResolver) LogsFetch(ctx context.Context, id apimeta.ClusterID, view logs.View, mode logs.FetchMode, cursor *string, at *time.Time, limit int) (*logs.Page, error) {
-	page, err := r.Logs.Fetch(ctx, id, view, logs.FetchQuery{Mode: mode, Cursor: cursor, At: at, Limit: limit})
-	if err != nil {
-		return nil, logsErr(err)
-	}
-	return &page, nil
+func (r *queryResolver) LogsFetch(ctx context.Context, id apimeta.ClusterID, view logs.Scope, mode model.LogsFetchMode, cursor *string, at *time.Time, limit int) (*model.LogRecordsPage, error) {
+	panic("not implemented")
 }
 
 // AuthState is the resolver for the authState field. auth.State binds directly to the
@@ -721,7 +717,7 @@ func (r *subscriptionResolver) MemoriesWatch(ctx context.Context, clusterID apim
 }
 
 // LogsFollow is the resolver for the logsFollow field.
-func (r *subscriptionResolver) LogsFollow(ctx context.Context, id apimeta.ClusterID, view logs.View, after *string) (<-chan *logs.FollowFrame, error) {
+func (r *subscriptionResolver) LogsFollow(ctx context.Context, id apimeta.ClusterID, view logs.Scope, after *string) (<-chan *logs.FollowFrame, error) {
 	st, err := r.Logs.Follow(ctx, id, view, after)
 	if err != nil {
 		return nil, logsErr(err)

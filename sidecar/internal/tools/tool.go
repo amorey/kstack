@@ -33,6 +33,7 @@ import (
 	"github.com/kstackhq/kstack/sidecar/internal/run/permissions"
 	"github.com/kstackhq/kstack/sidecar/internal/run/session"
 	"github.com/kstackhq/kstack/sidecar/internal/services/logs"
+	"github.com/kstackhq/kstack/sidecar/internal/services/logs/logline"
 )
 
 const (
@@ -411,12 +412,12 @@ type LogsReadLine struct {
 // The view's backend half is the log service's vocabulary, named here as the tool
 // spells it.
 type (
-	LogsViewInput   = logs.View
-	LogsViewSource  = logs.ViewSource
+	LogsViewInput   = logs.Scope
+	LogsViewSource  = logs.ScopeSource
 	LogsSourceKind  = logs.SourceKind
-	LogsViewFilter  = logs.ViewFilter
+	LogsViewFilter  = logs.ScopeFilter
 	LogsFilterField = logs.FilterField
-	LogsGap         = logs.Gap
+	LogsGap         = logline.Gap
 )
 
 const (

@@ -22,6 +22,7 @@ import (
 
 	"github.com/kstackhq/kstack/sidecar/internal/services/cluster"
 	"github.com/kstackhq/kstack/sidecar/internal/services/logs"
+	"github.com/kstackhq/kstack/sidecar/internal/services/logs/refusal"
 	"github.com/kstackhq/kstack/sidecar/internal/tools"
 )
 
@@ -36,20 +37,12 @@ const (
 // concerns (-1 for the whole view), and for a container it does not have, the
 // ones it does.
 type Refused struct {
-	Code       string
+	Code       refusal.Code
 	Source     int
 	Containers []string
 }
 
-func (e *Refused) Error() string { return "logs: refused: " + e.Code }
-
-// The codes a view is refused with.
-const (
-	codeNoContainer = "no-container"
-	codeTooMany     = "too-many"
-	codeNotMirrored = "not-mirrored"
-	codeNoNodes     = "no-nodes"
-)
+func (e *Refused) Error() string { return "logs: refused: " + string(e.Code) }
 
 // Note is what a tool says of one source beyond its name: what the mirror holds of
 // it now, the containers it has, the default container the mirror shows now when
@@ -115,18 +108,19 @@ func resolveIn(q cluster.CacheReading, in Input) (tools.LogsViewAction, []Note, 
 	return view, notes, nil
 }
 
-// refusedBy is the logs service's refusal of a view as the model reads it.
+// refusedBy is the logs service's refusal of a view as the model reads it, with
+// the refusal's own code.
 func refusedBy(err error) error {
-	var unmirrored logs.Unmirrored
-	switch {
-	case errors.As(err, &unmirrored):
-		return &Refused{Code: codeNotMirrored, Source: unmirrored.Source}
-	case errors.Is(err, logs.ErrTooMany):
-		return &Refused{Code: codeTooMany, Source: -1}
-	case errors.As(err, new(logs.NoNodes)):
-		return &Refused{Code: codeNoNodes, Source: -1}
+	r, ok := refusal.As(err)
+	if !ok {
+		return err
 	}
-	return err
+	out := &Refused{Code: r.Code, Source: -1}
+	var unmirrored refusal.Unmirrored
+	if errors.As(err, &unmirrored) {
+		out.Source = unmirrored.Source
+	}
+	return out
 }
 
 // resolveSource is one source checked against the mirror: each container named
@@ -145,7 +139,7 @@ func resolveSource(q cluster.CacheReading, i int, s Source) (tools.LogsViewSourc
 	case len(s.Containers) > 0:
 		for _, c := range s.Containers {
 			if f.uid != "" && !slices.Contains(f.names, c) {
-				return tools.LogsViewSource{}, Note{}, &Refused{Code: codeNoContainer, Source: i, Containers: f.names}
+				return tools.LogsViewSource{}, Note{}, &Refused{Code: refusal.CodeNoContainer, Source: i, Containers: f.names}
 			}
 		}
 		src.Containers = s.Containers
