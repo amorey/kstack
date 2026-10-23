@@ -13,7 +13,7 @@
 // limitations under the License.
 
 // The contract between the window and whatever feeds it. Each type mirrors the wire's
-// (`LogRecord`, `LogRecordsPage`, `LogRecordsPageEdge`, `LogsFollowFrame`) field for field.
+// (`LogRecord`, `LogRecordsPage`, `LogNotice`, `LogsFollowFrame`) field for field.
 
 /** Opaque. The library hands a cursor back to the client that issued it and reads nothing from it. */
 export type Cursor = string;
@@ -25,6 +25,8 @@ export type LogLine = {
   cursor: Cursor;
   /** The text. The library draws nothing and strips nothing: the client hands it text fit to show. */
   message: string;
+  /** The bytes the server cut off `message` at the request's cap, 0 when whole. */
+  truncatedBytes: number;
   /** The log the line came from. Its four fields together name it. */
   stream: { namespace: string; pod: string; container: string; previous: boolean };
   /** Where the stream's pod runs. Empty where unknown, and no part of the stream's name. */
@@ -40,48 +42,46 @@ export type LogLine = {
 export type Anchor = { kind: 'Head' | 'Tail' | 'At'; at: string | null };
 
 /**
- * `Head` reads oldest first after `cursor`, from the start with none; `Tail` reads newest first
- * before `cursor`, from the end with none; `Around` reads `limit` lines before `at` and `limit`
- * from it on, and takes `at` and no cursor.
+ * One read. `First` and `Last` read from an end, `At` reads `limit` lines either side of a
+ * moment, and `Continue` reads on from a page's edge, past each line in `seen` for its container.
  */
-export type FetchMode = 'Head' | 'Tail' | 'Around';
+export type FetchQuery =
+  | { kind: 'First'; limit: number }
+  | { kind: 'Last'; limit: number }
+  | { kind: 'At'; at: string; limit: number }
+  | { kind: 'Continue'; cursor: Cursor; seen: Cursor[] | null; limit: number };
 
-export type FetchQuery = {
-  mode: FetchMode;
-  /** A page's edge cursor, a checkpoint's, or a line's. Null reads from the start or the end, and always for `Around`. */
-  cursor: Cursor | null;
-  /** For `Around` alone: the anchor's moment, RFC 3339. */
-  at: string | null;
-  limit: number;
-};
-
-/** One side of a page: where the next page that way continues, and whether there is one. Null on a `before` edge with nothing older. */
-export type PageEdge = { cursor: Cursor | null; more: boolean };
+export type Notice = { code: string; message: string };
 
 export type Page = {
-  /** Oldest first, as the client sorted them, whatever the mode. */
+  /** Oldest first, as the client sorted them, whatever the query. */
   lines: LogLine[];
-  before: PageEdge;
-  after: PageEdge;
-  /** For `Around`: the index of the first line at or after the moment, `lines.length` with none. Null otherwise. */
+  /** Where a page that way goes on, null with nothing that way. `follow` is the live end: set on a page that read every stream to its end. */
+  edges: { prev: Cursor | null; next: Cursor | null; follow: Cursor | null };
+  /** For `At`: the index of the first line at or after the moment, `lines.length` with none. Null otherwise. */
   anchor: number | null;
-  /** Streams the page could not read, one line of text each, for the viewer to show. */
-  skipped: string[];
+  /** What the page could not do, one per notice, for the viewer to show. */
+  notices: Notice[];
 };
 
 /** `Ended` is the last frame: the follow is over, and following again would end the same way. */
 export type FollowFrame =
   | { kind: 'Line'; line: LogLine }
-  | { kind: 'Checkpoint'; cursor: Cursor }
+  | { kind: 'Notice'; notice: Notice }
   | { kind: 'Ended'; reason: string };
 
 /** Where lines come from. Anything that implements it can feed the window. */
 export type Client = {
   fetch: (query: FetchQuery) => Promise<Page>;
   /**
-   * Calls back per frame written after `after`, until the function it answers is called. A
-   * follow that cannot open throws, or, when it learns so later, calls `onFailed` once and
-   * sends nothing after.
+   * Calls back per frame from a page's `next` or `follow`, past each line in `seen` for its
+   * container, until the function it answers is called. A follow that cannot open throws, or,
+   * when it learns so later, calls `onFailed` once and sends nothing after.
    */
-  follow: (after: Cursor, onFrame: (frame: FollowFrame) => void, onFailed: (error: unknown) => void) => () => void;
+  follow: (
+    cursor: Cursor,
+    seen: Cursor[],
+    onFrame: (frame: FollowFrame) => void,
+    onFailed: (error: unknown) => void,
+  ) => () => void;
 };

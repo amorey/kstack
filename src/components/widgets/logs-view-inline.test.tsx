@@ -17,7 +17,7 @@ import { describe, expect, it } from 'vitest';
 import type { InlineState } from '@/lib/inline-log-lines';
 import type { LogLine } from '@/lib/log-viewer';
 import type { LogsViewAction } from '@/lib/logs-view';
-import { LogsViewInline } from './logs-view-inline';
+import { LineRow, LogsViewInline } from './logs-view-inline';
 
 const action = (over: Partial<LogsViewAction> = {}): LogsViewAction => ({
   sources: [{ namespace: 'prod', kind: 'Pod', name: 'web-0', containers: [], allContainers: false, previous: false }],
@@ -40,6 +40,7 @@ const line = (i: number, over: Partial<LogLine> = {}): LogLine => ({
   timestamp: `2026-10-08T14:00:${String(i).padStart(2, '0')}Z`,
   cursor: `c${i}`,
   message: `line ${i}`,
+  truncatedBytes: 0,
   stream: { namespace: 'prod', pod: 'web-0', container: 'app', previous: false },
   place: { node: 'n', region: '', zone: '', os: 'linux', arch: 'amd64' },
   gap: null,
@@ -134,5 +135,26 @@ describe('LogsViewInline', () => {
   it('says a failed read failed', () => {
     draw(state({ failed: true }));
     expect(screen.getByTestId('logs-inline')).toHaveTextContent('Couldn’t read these logs');
+  });
+});
+
+describe('LineRow', () => {
+  const row = () => screen.getByTestId('logs-inline-row');
+
+  it('ends a cut line with what the server cut', () => {
+    render(<LineRow line={line(1, { truncatedBytes: 2048 })} oneStream />);
+    expect(row()).toHaveTextContent('line 1 … 2 KiB cut');
+  });
+
+  it('mutes a tagged line and names its tag before its time', () => {
+    render(<LineRow line={line(1)} oneStream tag="after" />);
+    expect(row()).toHaveClass('text-muted-foreground');
+    expect(row().firstElementChild).toHaveTextContent(/^after$/);
+  });
+
+  it('draws an untagged line as it is', () => {
+    render(<LineRow line={line(1)} oneStream tag={null} />);
+    expect(row()).not.toHaveClass('text-muted-foreground');
+    expect(row().firstElementChild).toHaveTextContent('14:00:01');
   });
 });

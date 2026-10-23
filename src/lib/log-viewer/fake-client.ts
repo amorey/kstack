@@ -13,11 +13,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import { compareTimestamps } from './lines';
-import type { Client, Cursor, FetchQuery, FollowFrame, LogLine, Page, PageEdge } from './types';
+import { compareTimestamps, containerKey } from './lines';
+import type { Client, Cursor, FetchQuery, FollowFrame, LogLine, Notice, Page } from './types';
 
 // A `Client` over a log it invents, for the tests. It models what that wire does to a viewer — edges and repeats, a follow whose
-// streams interleave, latency, failures, a stream it could not read — so a viewer that
+// streams interleave, `seen`, latency, failures, a stream it could not read — so a viewer that
 // holds against it holds against the sidecar.
 
 export type FakeStream = {
@@ -38,10 +38,12 @@ export type FakeClientOptions = {
   rate?: number;
   /** How long every fetch, and a follow's replay, takes. */
   delayMs?: number;
-  /** How far before the newest line the live end and each checkpoint sit. */
+  /** How far before the newest line the live end sits. */
   repeat?: number;
   /** The hole each line carries, by its index. None by default. */
   gaps?: Record<number, NonNullable<LogLine['gap']>>;
+  /** The bytes cut off each line, by its index. None by default. */
+  truncate?: Record<number, number>;
 };
 
 class Follower {
@@ -55,17 +57,12 @@ class Follower {
 
   constructor(
     private readonly onFrame: (frame: FollowFrame) => void,
-    /** Where the last checkpoint sat: the next is never earlier. */
-    private checkpoint: number,
+    /** Whether the follow sends the line at an index. */
+    readonly wants: (index: number) => boolean,
   ) {}
 
   send(frame: FollowFrame): void {
     if (this.open) this.onFrame(frame);
-  }
-
-  checkpointAt(position: number): void {
-    this.checkpoint = Math.max(position, this.checkpoint);
-    this.send({ kind: 'Checkpoint', cursor: positionCursor(this.checkpoint) });
   }
 
   close(): void {
@@ -104,11 +101,13 @@ export class FakeClient implements Client {
 
   private readonly gaps: Record<number, NonNullable<LogLine['gap']>>;
 
+  private readonly truncate: Record<number, number>;
+
   private lastMs = -Infinity;
 
   private readonly followers = new Set<Follower>();
 
-  private readonly skipped = new Map<string, string>();
+  private readonly skipped = new Map<string, Notice>();
 
   private readonly passed: { from: number; to: number }[] = [];
 
@@ -126,6 +125,7 @@ export class FakeClient implements Client {
     this.delayMs = options.delayMs ?? 0;
     this.repeat = options.repeat ?? 20;
     this.gaps = options.gaps ?? {};
+    this.truncate = options.truncate ?? {};
     const count = options.lines ?? 1000;
     const spacing = options.spacingMs ?? 1;
     const now = Date.now();
@@ -160,14 +160,17 @@ export class FakeClient implements Client {
     return page;
   }
 
-  follow(after: Cursor, onFrame: (frame: FollowFrame) => void): () => void {
-    if (!this.wrote(after)) throw new Error(`fake: a cursor it did not write: ${after}`);
+  follow(cursor: Cursor, seen: Cursor[], onFrame: (frame: FollowFrame) => void): () => void {
+    const parsed = this.writtenPage(cursor);
+    if (parsed === null || parsed.kind === 'prev') throw new Error(`fake: not a next or follow it wrote: ${cursor}`);
+    const refused = this.refuseSeen(seen);
+    if (refused !== null) throw new Error(refused);
     if (this.failFollow) {
       this.failFollow = false;
       throw new Error('fake: the follow failed');
     }
-    const start = positionAfter(after);
-    const follower = new Follower(onFrame, start);
+    const start = parsed.index;
+    const follower = new Follower(onFrame, this.reader(start, seen));
     this.followers.add(follower);
     // What is appended before the replay is held back and sent with it.
     follower.timer = setTimeout(() => {
@@ -191,11 +194,11 @@ export class FakeClient implements Client {
     this.emptyPending = true;
   }
 
-  /** Keeps a stream's lines out of every page and follow, and names it in each page's `skipped`. */
+  /** Keeps a stream's lines out of every page and follow, and names it in each page's notices. */
   skip(stream: LogLine['stream']): void {
     const { namespace, pod, container, previous } = stream;
     const name = `${namespace}/${pod}/${container}${previous ? ' (previous)' : ''}`;
-    this.skipped.set(streamKey(stream), `${name}: the fake skipped it`);
+    this.skipped.set(streamKey(stream), { code: 'stream-skipped', message: `${name}: the fake skipped it` });
   }
 
   unskip(stream: LogLine['stream']): void {
@@ -225,68 +228,93 @@ export class FakeClient implements Client {
   }
 
   // The window must send only what it was given, so the fake refuses anything else.
-  private refuse({ mode, cursor, at, limit }: FetchQuery): string | null {
-    if (cursor !== null && !this.wrote(cursor)) return `fake: a cursor it did not write: ${cursor}`;
-    if (mode === 'Around' && (at === null || cursor !== null)) return 'fake: Around takes `at` and no cursor';
-    if (mode !== 'Around' && at !== null) return `fake: ${mode} takes no \`at\``;
-    if (limit < 1) return `fake: a limit of ${limit}`;
-    return null;
+  private refuse(query: FetchQuery): string | null {
+    if (query.limit < 1) return `fake: a limit of ${query.limit}`;
+    if (query.kind !== 'Continue') return null;
+    const parsed = this.writtenPage(query.cursor);
+    if (parsed === null) return `fake: not a page cursor it wrote: ${query.cursor}`;
+    if (query.seen === null) return null;
+    if (parsed.kind === 'prev') return 'fake: `seen` beside a `prev`';
+    return this.refuseSeen(query.seen);
   }
 
-  private wrote(cursor: Cursor): boolean {
+  private refuseSeen(seen: Cursor[]): string | null {
+    const unwritten = seen.find((cursor) => {
+      const parsed = parse(cursor);
+      return parsed === null || parsed.kind !== 'line' || parsed.index >= this.log.length;
+    });
+    return unwritten === undefined ? null : `fake: a seen line it did not write: ${unwritten}`;
+  }
+
+  /** A page cursor it wrote, parsed; null for any other string. */
+  private writtenPage(cursor: Cursor): ParsedCursor | null {
     const parsed = parse(cursor);
-    if (parsed === null) return false;
-    return parsed.kind === 'line' ? parsed.index < this.log.length : parsed.index <= this.log.length;
+    return parsed !== null && parsed.kind !== 'line' && parsed.index <= this.log.length ? parsed : null;
   }
 
-  private read({ mode, cursor, at, limit }: FetchQuery): Page {
+  // Whether a read on from position `start` takes the line at an index: each container named in
+  // `seen` past the newer of its lines there, the rest from `start`.
+  private reader(start: number, seen: Cursor[]): (index: number) => boolean {
+    const past = new Map<string, number>();
+    seen.forEach((cursor) => {
+      const { index } = parse(cursor) as ParsedCursor;
+      const key = containerKey(this.log[index].stream);
+      past.set(key, Math.max(index, past.get(key) ?? -1));
+    });
+    return (index) => index >= start && index > (past.get(containerKey(this.log[index].stream)) ?? -1);
+  }
+
+  private read(query: FetchQuery): Page {
     const empty = this.emptyPending;
     this.emptyPending = false;
     const n = this.log.length;
-    // The read starts at `start` and covers lines `low`..`high`: Head reads on from the start,
-    // Tail back from it, and Around both ways from the moment.
+    // The read starts at `start` and covers the lines it takes, `low` up to `high`: First and a
+    // `next` or `follow` read on from the start, Last and a `prev` back from it, and At both ways.
     let start: number;
     let low: number;
     let high: number;
-    if (mode === 'Head') {
-      start = cursor === null ? 0 : positionAfter(cursor);
-      low = start;
-      high = Math.min(start + limit, n);
-    } else if (mode === 'Tail') {
-      start = cursor === null ? n : positionBefore(cursor);
+    let taken: number[];
+    const { limit } = query;
+    const continued = query.kind === 'Continue' ? (parse(query.cursor) as ParsedCursor) : null;
+    if (query.kind === 'Last' || continued?.kind === 'prev') {
+      start = continued === null ? n : continued.index;
       low = Math.max(start - limit, 0);
       high = start;
-    } else {
-      start = this.firstAtOrAfter(at as string);
+      taken = indexRange(low, high);
+    } else if (query.kind === 'At') {
+      start = this.firstAtOrAfter(query.at);
       low = Math.max(start - limit, 0);
       high = Math.min(start + limit, n);
+      taken = indexRange(low, high);
+    } else {
+      start = continued === null ? 0 : continued.index;
+      const wants = this.reader(start, query.kind === 'Continue' ? (query.seen ?? []) : []);
+      const ahead = indexRange(start, n).filter(wants);
+      taken = ahead.slice(0, limit);
+      low = start;
+      high = ahead.length > limit ? taken[limit - 1] + 1 : n;
     }
 
-    // A Head or Around read the limit cut short continues from the cut. Any other after edge
-    // is the live end, `repeat` lines before the newest, so a page or a follow from it sends
-    // some again — never from before where the read started, or, for an empty read, before
-    // what it passed over.
-    const cut = mode !== 'Tail' && start + limit < n;
-    const afterAt = cut ? start + limit : Math.max(n - this.repeat, empty ? start : low);
-    let before: PageEdge;
-    if (mode === 'Head') before = { cursor, more: cursor !== null };
-    else before = low > 0 ? { cursor: positionCursor(low), more: true } : { cursor: null, more: false };
-    let after: PageEdge;
-    if (mode === 'Tail' && cursor !== null) after = { cursor, more: true };
-    else after = { cursor: positionCursor(afterAt), more: cut };
-
+    // A read the limit cut short goes on from the cut. Any other is the live end, `repeat` lines
+    // before the newest, so a page or a follow from it sends some again — never from before
+    // where the read started, or, for an empty read, before what it passed over.
+    const cut = high < n;
+    const liveAt = Math.max(n - this.repeat, empty ? start : low);
     if (empty) {
-      const to = mode === 'Tail' ? high : afterAt;
+      const to = cut ? high : liveAt;
       if (to > low) this.passed.push({ from: low, to });
     }
-    const kept = (from: number, to: number) =>
-      empty ? [] : this.log.slice(from, to).filter((line) => !this.isSkipped(line));
+    const kept = (indexes: number[]) =>
+      empty ? [] : indexes.map((i) => this.log[i]).filter((line) => !this.isSkipped(line));
     return {
-      lines: kept(low, high),
-      before,
-      after,
-      anchor: mode === 'Around' ? kept(low, start).length : null,
-      skipped: [...this.skipped.values()],
+      lines: kept(taken),
+      edges: {
+        prev: low > 0 ? pageCursor('prev', low) : null,
+        next: cut ? pageCursor('next', high) : null,
+        follow: cut ? null : pageCursor('follow', liveAt),
+      },
+      anchor: query.kind === 'At' ? kept(indexRange(low, start)).length : null,
+      notices: [...this.skipped.values()],
     };
   }
 
@@ -306,15 +334,16 @@ export class FakeClient implements Client {
     return low;
   }
 
-  // Sends lines `from`..`to` one stream's batch after another, as the sidecar's per-stream
-  // reads do, then a checkpoint `repeat` lines before the newest.
+  // Sends the lines `from`..`to` the follow wants, one stream's batch after another, as the
+  // sidecar's per-stream reads do.
   private send(follower: Follower, from: number, to: number): void {
-    if (from >= to) return;
-    const lines = this.log.slice(from, to).filter((line) => !this.isSkipped(line));
+    const lines = indexRange(from, to)
+      .filter(follower.wants)
+      .map((i) => this.log[i])
+      .filter((line) => !this.isSkipped(line));
     this.streams.forEach(({ stream }) => {
       lines.filter((line) => line.stream === stream).forEach((line) => follower.send({ kind: 'Line', line }));
     });
-    follower.checkpointAt(this.log.length - this.repeat);
   }
 
   private addLine(clock: number): void {
@@ -326,6 +355,7 @@ export class FakeClient implements Client {
       timestamp: new Date(ms).toISOString(),
       cursor: lineCursor(index),
       message: `fake line ${index} from ${stream.pod}/${stream.container}`,
+      truncatedBytes: this.truncate[index] ?? 0,
       stream,
       place,
       gap: this.gaps[index] ?? null,
@@ -333,30 +363,21 @@ export class FakeClient implements Client {
   }
 }
 
-// A line's cursor names its index; a position's names the gap before index `p`, so `p`
-// runs 0..length. Both carry a prefix nothing else writes.
+// A line's cursor names its index; a page's names the gap before index `p`, so `p` runs
+// 0..length, and the edge it came from. Each carries a prefix nothing else writes.
 const lineCursor = (index: number): Cursor => `fake:line:${index}`;
-const positionCursor = (position: number): Cursor => `fake:position:${position}`;
+const pageCursor = (edge: 'prev' | 'next' | 'follow', position: number): Cursor => `fake:${edge}:${position}`;
 
-const CURSOR = /^fake:(line|position):(\d+)$/;
+const CURSOR = /^fake:(line|prev|next|follow):(\d+)$/;
 
-type ParsedCursor = { kind: 'line' | 'position'; index: number };
+type ParsedCursor = { kind: 'line' | 'prev' | 'next' | 'follow'; index: number };
 
 function parse(cursor: Cursor): ParsedCursor | null {
   const match = CURSOR.exec(cursor);
   return match ? { kind: match[1] as ParsedCursor['kind'], index: Number(match[2]) } : null;
 }
 
-// A read on from a cursor starts after the line it names, or at the position; one back from
-// it ends before the line, or at the position.
-function positionAfter(cursor: Cursor): number {
-  const { kind, index } = parse(cursor) as ParsedCursor;
-  return kind === 'line' ? index + 1 : index;
-}
-
-function positionBefore(cursor: Cursor): number {
-  return (parse(cursor) as ParsedCursor).index;
-}
+const indexRange = (from: number, to: number) => Array.from({ length: Math.max(to - from, 0) }, (_, k) => from + k);
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => {

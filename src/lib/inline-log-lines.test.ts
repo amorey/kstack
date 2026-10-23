@@ -15,7 +15,7 @@ import { act, renderHook } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { FakeClient } from '@/lib/log-viewer/fake-client';
-import type { Client, LogLine } from '@/lib/log-viewer';
+import type { Client, LogLine, Page } from '@/lib/log-viewer';
 import type { LogsViewAction } from '@/lib/logs-view';
 import { InlineLines, appendLine, inlinePlan, readInline, useInlineLogLines } from './inline-log-lines';
 
@@ -37,7 +37,7 @@ const action = (over: Partial<LogsViewAction> = {}): LogsViewAction => ({
 describe('inlinePlan', () => {
   it('reads a live pinned tail as the newest eight, following', () => {
     expect(inlinePlan(action(), null)).toEqual({
-      first: { mode: 'Tail', cursor: null, at: null, limit: 8 },
+      first: { kind: 'Last', limit: 8 },
       keep: 'all',
       end: 'tail',
       follow: true,
@@ -47,7 +47,7 @@ describe('inlinePlan', () => {
 
   it('reads a frozen pinned tail up to where it stopped being live', () => {
     expect(inlinePlan(action(), NEXT)).toEqual({
-      first: { mode: 'Around', cursor: null, at: NEXT, limit: 8 },
+      first: { kind: 'At', at: NEXT, limit: 8 },
       keep: 'before',
       end: 'tail',
       follow: false,
@@ -57,14 +57,14 @@ describe('inlinePlan', () => {
 
   it('reads an unpinned tail up to its own moment, never live though newest', () => {
     const plan = inlinePlan(action({ pinToEnd: false }), null);
-    expect(plan.first).toEqual({ mode: 'Around', cursor: null, at: RESOLVED, limit: 8 });
+    expect(plan.first).toEqual({ kind: 'At', at: RESOLVED, limit: 8 });
     expect(plan.follow).toBe(false);
     expect(plan.until).toBe(RESOLVED);
   });
 
   it('reads a head view as its first eight, never live though pinned and newest', () => {
     expect(inlinePlan(action({ anchor: { kind: 'Head', at: null } }), null)).toEqual({
-      first: { mode: 'Head', cursor: null, at: null, limit: 8 },
+      first: { kind: 'First', limit: 8 },
       keep: 'all',
       end: 'head',
       follow: false,
@@ -75,7 +75,7 @@ describe('inlinePlan', () => {
   it('reads a moment as the eight from it, never live though pinned and newest', () => {
     const at = '2026-10-08T00:00:00Z';
     expect(inlinePlan(action({ anchor: { kind: 'At', at } }), null)).toEqual({
-      first: { mode: 'Around', cursor: null, at, limit: 8 },
+      first: { kind: 'At', at, limit: 8 },
       keep: 'from',
       end: 'head',
       follow: false,
@@ -104,6 +104,17 @@ describe('readInline', () => {
     expect(indexes(read.lines)).toEqual(range(42, 50));
   });
 
+  it('keeps every line at until out, however many there are', async () => {
+    // The clock alone stands still, so the appended lines share the newest line's stamp.
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const fake = log();
+    // Ten more lines at the clock's time, the newest line's: eleven at until, more than a page.
+    fake.append(10);
+    const read = await readInline(fake, inlinePlan(action(), fake.lineAt(99).timestamp));
+    expect(indexes(read.lines)).toEqual(range(91, 99));
+    vi.useRealTimers();
+  });
+
   it('reads the eight from the moment', async () => {
     const fake = log();
     const at = fake.lineAt(50).timestamp;
@@ -125,14 +136,22 @@ describe('readInline reading on', () => {
     fake.emptyNext();
     const read = await readInline({ fetch, follow: fake.follow.bind(fake) }, inlinePlan(action(), null));
     expect(indexes(read.lines)).toEqual(range(84, 92));
-    expect(read.after).toBe((await fetch.mock.results[0].value).after.cursor);
+    const first = (await fetch.mock.results[0].value) as Page;
+    expect(fetch.mock.calls[1][0]).toEqual({ kind: 'Continue', cursor: first.edges.prev, seen: null, limit: 8 });
+    expect(read.after).toBe(first.edges.follow);
   });
 
   it('reads a short head page on forward', async () => {
     const fake = log();
+    const fetch = vi.fn((query: Parameters<Client['fetch']>[0]) => fake.fetch(query));
     fake.emptyNext();
-    const read = await readInline(fake, inlinePlan(action({ anchor: { kind: 'Head', at: null } }), null));
+    const read = await readInline(
+      { fetch, follow: fake.follow.bind(fake) },
+      inlinePlan(action({ anchor: { kind: 'Head', at: null } }), null),
+    );
     expect(indexes(read.lines)).toEqual(range(8, 16));
+    const first = (await fetch.mock.results[0].value) as Page;
+    expect(fetch.mock.calls[1][0]).toEqual({ kind: 'Continue', cursor: first.edges.next, seen: null, limit: 8 });
   });
 
   it('stops where the edge says no more', async () => {
@@ -369,6 +388,7 @@ describe('useInlineLogLines', () => {
     const { unmount } = renderHook(() => useInlineLogLines({ fetch: fake.fetch.bind(fake), follow }, action(), null));
     await settle();
     expect(follow).toHaveBeenCalledTimes(1);
+    expect(follow).toHaveBeenCalledWith(expect.any(String), [], expect.any(Function), expect.any(Function));
     unmount();
     expect(stop).toHaveBeenCalled();
   });

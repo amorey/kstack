@@ -118,6 +118,7 @@ function line(i: number, over: Partial<LogLine['stream']> = {}): LogLine {
     timestamp: new Date(2026, 9, 15, 9, 0, i).toISOString(),
     cursor: `c${i}`,
     message: `line ${i}`,
+    truncatedBytes: 0,
     stream: { namespace: 'prod', pod: 'webapp', container: 'app', previous: false, ...over },
     place: { node: '', region: '', zone: '', os: '', arch: '' },
     gap: null,
@@ -126,19 +127,19 @@ function line(i: number, over: Partial<LogLine['stream']> = {}): LogLine {
 
 const lines = (from: number, to: number) => Array.from({ length: to - from }, (_, k) => line(from + k));
 
-function page(from: number, to: number, over: Partial<Page> = {}): Page {
+type PageOver = { edges?: Partial<Page['edges']>; anchor?: number | null; notices?: Page['notices'] };
+
+function page(from: number, to: number, over: PageOver = {}): Page {
   return {
     lines: lines(from, to),
-    before: { cursor: `before-${from}`, more: true },
-    after: { cursor: `after-${to}`, more: true },
-    anchor: null,
-    skipped: [],
-    ...over,
+    edges: { prev: `before-${from}`, next: `after-${to}`, follow: null, ...over.edges },
+    anchor: over.anchor ?? null,
+    notices: over.notices ?? [],
   };
 }
 
-const START = { cursor: null, more: false };
-const END = { cursor: 'live-end', more: false };
+const START = { prev: null };
+const END = { next: null, follow: 'live-end' };
 
 type Fetch = { query: FetchQuery; resolve: (p: Page) => void; reject: (error: unknown) => void };
 type Follow = { onFrame: (frame: FollowFrame) => void; onFailed: (error: unknown) => void; closed: boolean };
@@ -152,7 +153,7 @@ function scripted() {
       new Promise<Page>((resolve, reject) => {
         fetches.push({ query, resolve, reject });
       }),
-    follow: (_after, onFrame, onFailed) => {
+    follow: (_cursor, _seen, onFrame, onFailed) => {
       if (refusal.next) {
         const error = refusal.next;
         refusal.next = null;
@@ -268,9 +269,9 @@ describe('LogViewer', () => {
     const s = scripted();
     mount();
     expect(built.calls[0]).toEqual([urql, 'cluster-1', action()]);
-    expect(s.fetches[0].query).toEqual({ mode: 'Tail', cursor: null, at: null, limit: 300 });
+    expect(s.fetches[0].query).toEqual({ kind: 'Last', limit: 300 });
 
-    await answer(s.fetches[0], page(0, 20, { before: START, after: END }));
+    await answer(s.fetches[0], page(0, 20, { edges: { ...START, ...END } }));
     expect(rowTexts().at(-1)).toContain('line 19');
     expect(rowTexts().at(-1)).toContain('09:00:19.000');
   });
@@ -279,19 +280,19 @@ describe('LogViewer', () => {
     const s = scripted();
     mount();
     expect(screen.getByText('Loading')).toBeInTheDocument();
-    await answer(s.fetches[0], page(0, 20, { before: START, after: END }));
+    await answer(s.fetches[0], page(0, 20, { edges: { ...START, ...END } }));
     expect(screen.queryByText('Loading')).not.toBeInTheDocument();
   });
 
   it('lands around a time picked from the toolbar, unpinned', async () => {
     const s = scripted();
     const { viewport } = mount();
-    await answer(s.fetches[0], page(0, 20, { before: START, after: END }));
+    await answer(s.fetches[0], page(0, 20, { edges: { ...START, ...END } }));
     fireEvent.click(screen.getByRole('button', { name: 'Jump to a time' }));
     fireEvent.change(screen.getByPlaceholderText('Timestamp'), { target: { value: line(5).timestamp } });
     fireEvent.keyDown(screen.getByPlaceholderText('Timestamp'), { key: 'Enter' });
     await frame();
-    expect(s.last().query).toEqual({ mode: 'Around', cursor: null, at: line(5).timestamp, limit: 300 });
+    expect(s.last().query).toEqual({ kind: 'At', at: line(5).timestamp, limit: 300 });
     await answer(s.last(), page(0, 20, { anchor: 5 }));
     expect(viewport.get().pinnedToEnd).toBe(false);
   });
@@ -300,7 +301,7 @@ describe('LogViewer', () => {
     const s = scripted();
     const at = line(30).timestamp;
     mount(action({ anchor: { kind: 'At', at }, pinToEnd: false }));
-    expect(s.fetches[0].query).toEqual({ mode: 'Around', cursor: null, at, limit: 300 });
+    expect(s.fetches[0].query).toEqual({ kind: 'At', at, limit: 300 });
 
     await answer(s.fetches[0], page(20, 40, { anchor: 10 }));
     const landed = screen.getAllByTestId('log-row').find((row) => row.textContent?.includes('line 30'))!;
@@ -311,7 +312,7 @@ describe('LogViewer', () => {
   it('adds a row for a followed line and keeps the bottom while pinned', async () => {
     const s = scripted();
     const { container } = mount();
-    await answer(s.fetches[0], page(0, 20, { before: START, after: END }));
+    await answer(s.fetches[0], page(0, 20, { edges: { ...START, ...END } }));
     expect(s.follows.filter((f) => !f.closed)).toHaveLength(1);
 
     await act(async () => {
@@ -326,7 +327,7 @@ describe('LogViewer', () => {
   it('writes what is on screen into the viewport, with nothing selected', async () => {
     const s = scripted();
     const { viewport } = mount();
-    await answer(s.fetches[0], page(0, 20, { before: START, after: END }));
+    await answer(s.fetches[0], page(0, 20, { edges: { ...START, ...END } }));
 
     // Pinned to the end of 20 lines, the view shows the last it has room for.
     const shown = Math.ceil(VIEW / LOG_ROW_PX);
@@ -343,7 +344,7 @@ describe('LogViewer', () => {
   it('empties the viewport on unmount', async () => {
     const s = scripted();
     const { viewport, unmount } = mount();
-    await answer(s.fetches[0], page(0, 20, { before: START, after: END }));
+    await answer(s.fetches[0], page(0, 20, { edges: { ...START, ...END } }));
 
     unmount();
     expect(viewport.get()).toEqual({
@@ -360,7 +361,7 @@ describe('LogViewer', () => {
     it('keeps the rows when a page fails and says so, until a page lands', async () => {
       const s = scripted();
       mount(action({ pinToEnd: false }));
-      await answer(s.fetches[0], page(100, 120, { after: END }));
+      await answer(s.fetches[0], page(100, 120, { edges: END }));
       // Unpinned, it pages both ways at once.
       expect(s.fetches).toHaveLength(3);
       const [, before, after] = s.fetches;
@@ -371,7 +372,7 @@ describe('LogViewer', () => {
       // The operation's error reached the bus through `errorReportExchange`, not the viewer.
       expect(reportError).not.toHaveBeenCalled();
 
-      await answer(after, page(120, 120, { after: { cursor: 'on', more: false } }));
+      await answer(after, page(120, 120, { edges: { next: null, follow: 'on' } }));
       expect(screen.queryByText('Could not load more lines.')).not.toBeInTheDocument();
     });
 
@@ -379,7 +380,7 @@ describe('LogViewer', () => {
       const s = scripted();
       s.refusal.next = new Error('follow refused: pod\u202Egone');
       mount();
-      await answer(s.fetches[0], page(0, 20, { before: START, after: END }));
+      await answer(s.fetches[0], page(0, 20, { edges: { ...START, ...END } }));
       const reason = screen.getByText(/follow refused: pod/);
       expect(reason.querySelector('mark')).not.toBeNull();
     });
@@ -387,7 +388,7 @@ describe('LogViewer', () => {
     it('draws why a follow failed after it opened, and stops following', async () => {
       const s = scripted();
       const { viewport } = mount();
-      await answer(s.fetches[0], page(0, 20, { before: START, after: END }));
+      await answer(s.fetches[0], page(0, 20, { edges: { ...START, ...END } }));
       const follow = s.follows.find((f) => !f.closed)!;
       await act(async () => {
         follow.onFailed(new Error('the cluster cache is gone'));
@@ -401,7 +402,7 @@ describe('LogViewer', () => {
     it('draws why the follow ended', async () => {
       const s = scripted();
       mount();
-      await answer(s.fetches[0], page(0, 20, { before: START, after: END }));
+      await answer(s.fetches[0], page(0, 20, { edges: { ...START, ...END } }));
       await act(async () => {
         s.follows[s.follows.length - 1].onFrame({ kind: 'Ended', reason: 'the pod was deleted' });
       });
@@ -418,11 +419,11 @@ describe('LogViewer', () => {
 
       fireEvent.click(screen.getByRole('button', { name: 'Try again' }));
       await frame();
-      expect(s.last().query).toEqual({ mode: 'Tail', cursor: null, at: null, limit: 300 });
+      expect(s.last().query).toEqual({ kind: 'Last', limit: 300 });
       expect(screen.queryByText('Could not load more lines.')).not.toBeInTheDocument();
       expect(screen.queryByText('Could not load lines.')).not.toBeInTheDocument();
 
-      await answer(s.last(), page(0, 20, { before: START, after: END }));
+      await answer(s.last(), page(0, 20, { edges: { ...START, ...END } }));
       expect(rowTexts().length).toBeGreaterThan(0);
       expect(viewport.get().pinnedToEnd).toBe(false);
       expect(screen.queryByText('Could not load more lines.')).not.toBeInTheDocument();
@@ -431,7 +432,7 @@ describe('LogViewer', () => {
     it('says when a view has no lines', async () => {
       const s = scripted();
       mount();
-      await answer(s.fetches[0], page(0, 0, { before: START, after: END }));
+      await answer(s.fetches[0], page(0, 0, { edges: { ...START, ...END } }));
       expect(screen.getByText('No lines.')).toBeInTheDocument();
     });
   });
@@ -440,13 +441,13 @@ describe('LogViewer', () => {
     it('say Loading… only while a page that way is in flight', async () => {
       const s = scripted();
       mount(action({ pinToEnd: false }));
-      await answer(s.fetches[0], page(100, 120, { after: END }));
+      await answer(s.fetches[0], page(100, 120, { edges: END }));
       expect(screen.getAllByText('Loading…')).toHaveLength(2);
 
       // Behind, the after edge still has more, and says nothing with no page asked.
       await answer(
-        s.fetches.find((f) => f.query.mode === 'Head')!,
-        page(120, 120, { after: { cursor: 'on', more: false } }),
+        s.fetches.find((f) => f.query.kind === 'Continue' && f.query.seen !== null)!,
+        page(120, 120, { edges: { next: null, follow: 'on' } }),
       );
       expect(screen.getAllByText('Loading…')).toHaveLength(1);
     });
@@ -454,9 +455,9 @@ describe('LogViewer', () => {
     it('offer Keep looking after an empty page, which pages that way', async () => {
       const s = scripted();
       mount(action({ pinToEnd: false }));
-      await answer(s.fetches[0], page(100, 120, { after: END }));
+      await answer(s.fetches[0], page(100, 120, { edges: END }));
       await answer(
-        s.fetches.find((f) => f.query.mode === 'Tail' && f.query.cursor !== null)!,
+        s.fetches.find((f) => f.query.kind === 'Continue' && f.query.seen === null)!,
         page(100, 100),
       );
       expect(screen.getByText('No more in the last read')).toBeInTheDocument();
@@ -464,22 +465,23 @@ describe('LogViewer', () => {
       const asked = s.fetches.length;
       fireEvent.click(screen.getByRole('button', { name: 'Keep looking' }));
       expect(s.fetches.length).toBe(asked + 1);
-      expect(s.last().query).toMatchObject({ mode: 'Tail', cursor: 'before-100' });
+      expect(s.last().query).toMatchObject({ kind: 'Continue', cursor: 'before-100', seen: null });
     });
   });
 
-  it('names the streams a page could not read', async () => {
+  it('draws what a page could not do, its code in a title', async () => {
     const s = scripted();
     mount();
-    await answer(s.fetches[0], page(0, 20, { before: START, after: END, skipped: ['prod/db-0/app: forbidden'] }));
-    expect(screen.getByText(/Not read:/)).toHaveTextContent('Not read: prod/db-0/app: forbidden');
+    const notices = [{ code: 'stream-skipped', message: 'prod/db-0/app: forbidden' }];
+    await answer(s.fetches[0], page(0, 20, { edges: { ...START, ...END }, notices }));
+    expect(screen.getByText('prod/db-0/app: forbidden').closest('[title]')).toHaveAttribute('title', 'stream-skipped');
   });
 
   it('draws the pod and the container as separate cells once both are picked', async () => {
     localStorage.setItem('kstack:log-viewer-columns', '["Pod","Container"]');
     const s = scripted();
     mount(action({ sources: [source({ allContainers: true })] }));
-    await answer(s.fetches[0], page(0, 20, { before: START, after: END }));
+    await answer(s.fetches[0], page(0, 20, { edges: { ...START, ...END } }));
     const last = screen.getAllByTestId('log-row').at(-1)!;
     expect(last.querySelector('[data-col="Pod"]')).toHaveTextContent(/^webapp$/);
     expect(last.querySelector('[data-col="Container"]')).toHaveTextContent(/^app$/);
@@ -498,25 +500,25 @@ describe('LogViewer', () => {
     it('jumps to the start, and to the end, which pins', async () => {
       const s = scripted();
       const { viewport } = mount(action({ pinToEnd: false }));
-      await answer(s.fetches[0], page(0, 20, { before: START, after: END }));
+      await answer(s.fetches[0], page(0, 20, { edges: { ...START, ...END } }));
 
       press('Jump to the start');
       await frame();
-      expect(s.last().query).toMatchObject({ mode: 'Head', cursor: null });
-      await answer(s.last(), page(0, 20, { before: START, after: END }));
+      expect(s.last().query).toEqual({ kind: 'First', limit: 300 });
+      await answer(s.last(), page(0, 20, { edges: { ...START, ...END } }));
       expect(viewport.get().pinnedToEnd).toBe(false);
 
       press('Jump to the end');
       await frame();
-      expect(s.last().query).toMatchObject({ mode: 'Tail', cursor: null });
-      await answer(s.last(), page(0, 20, { before: START, after: END }));
+      expect(s.last().query).toEqual({ kind: 'Last', limit: 300 });
+      await answer(s.last(), page(0, 20, { edges: { ...START, ...END } }));
       expect(viewport.get().pinnedToEnd).toBe(true);
     });
 
     it('pauses at the bottom with no lines arriving, and plays again from there', async () => {
       const s = scripted();
       const { viewport } = mount();
-      await answer(s.fetches[0], page(0, 20, { before: START, after: END }));
+      await answer(s.fetches[0], page(0, 20, { edges: { ...START, ...END } }));
       expect(open(s)).toHaveLength(1);
 
       press('Pause');
@@ -539,7 +541,7 @@ describe('LogViewer', () => {
     it('keeps the columns and wrap the user picks for the next window', async () => {
       const s = scripted();
       mount();
-      await answer(s.fetches[0], page(0, 20, { before: START, after: END }));
+      await answer(s.fetches[0], page(0, 20, { edges: { ...START, ...END } }));
       press('View');
       await frame(2);
       fireEvent.click(screen.getByRole('checkbox', { name: 'Pod' }));
@@ -581,12 +583,10 @@ describe('LogViewer', () => {
       );
     });
 
-    const withLong = () =>
-      page(0, 20, {
-        before: START,
-        after: END,
-        lines: lines(0, 20).map((l, i) => (i === 18 ? { ...l, message: `long ${'x'.repeat(300)}` } : l)),
-      });
+    const withLong = () => ({
+      ...page(0, 20, { edges: { ...START, ...END } }),
+      lines: lines(0, 20).map((l, i) => (i === 18 ? { ...l, message: `long ${'x'.repeat(300)}` } : l)),
+    });
     const topOf = (text: string) =>
       screen.getAllByTestId('log-row').find((row) => row.textContent?.includes(text))!.style.transform;
 
@@ -614,14 +614,14 @@ describe('LogViewer', () => {
   it('names the columns over the rows', async () => {
     const s = scripted();
     mount();
-    await answer(s.fetches[0], page(0, 20, { before: START, after: END }));
+    await answer(s.fetches[0], page(0, 20, { edges: { ...START, ...END } }));
     expect(screen.getByTestId('log-header')).toHaveTextContent('PositionTimestampSourceMessage');
   });
 
   it('draws the default columns, with no pod', async () => {
     const s = scripted();
     mount();
-    await answer(s.fetches[0], page(0, 20, { before: START, after: END }));
+    await answer(s.fetches[0], page(0, 20, { edges: { ...START, ...END } }));
     const last = screen.getAllByTestId('log-row').at(-1)!;
     expect([...last.querySelectorAll<HTMLElement>('[data-col]')].map((el) => el.dataset.col)).toEqual([
       'Pos',
@@ -649,7 +649,7 @@ describe('LogViewer', () => {
     async function landed() {
       const s = scripted();
       const view = mount();
-      await answer(s.fetches[0], page(0, 20, { before: START, after: END }));
+      await answer(s.fetches[0], page(0, 20, { edges: { ...START, ...END } }));
       return { s, ...view };
     }
 
@@ -680,7 +680,7 @@ describe('LogViewer', () => {
       const s = scripted();
       mount();
       const gap = { after: line(10).timestamp, before: line(18).timestamp };
-      const landing = page(0, 20, { before: START, after: END });
+      const landing = page(0, 20, { edges: { ...START, ...END } });
       landing.lines[18] = { ...landing.lines[18], gap };
       await answer(s.fetches[0], landing);
       fireEvent.mouseDown(cellOf('line 17', 'Message'));
@@ -737,7 +737,7 @@ describe('LogViewer', () => {
 
       fireEvent.click(screen.getByRole('button', { name: 'Jump to the end' }));
       await frame();
-      await answer(s.last(), page(0, 20, { before: START, after: END }));
+      await answer(s.last(), page(0, 20, { edges: { ...START, ...END } }));
       expect(bands()).toHaveLength(0);
       expect(viewport.get().selection).toEqual([]);
     });
@@ -746,8 +746,8 @@ describe('LogViewer', () => {
       const s = scripted();
       const a = mount();
       const b = mount();
-      await answer(s.fetches[0], page(0, 20, { before: START, after: END }));
-      await answer(s.fetches[1], page(0, 20, { before: START, after: END }));
+      await answer(s.fetches[0], page(0, 20, { edges: { ...START, ...END } }));
+      await answer(s.fetches[1], page(0, 20, { edges: { ...START, ...END } }));
 
       fireEvent.mouseDown(posOf('line 19', a.container));
       fireEvent.mouseUp(document);
@@ -763,12 +763,12 @@ describe('LogViewer', () => {
     it('selects with Space on a position cell without reading it as a scroll to the bottom', async () => {
       const s = scripted();
       const { viewport } = mount(action({ anchor: { kind: 'Head', at: null }, pinToEnd: false }));
-      await answer(s.fetches[0], page(0, 5, { before: START, after: END }));
+      await answer(s.fetches[0], page(0, 5, { edges: { ...START, ...END } }));
       // A short Head landing sits at the bottom, unpinned, paging after.
-      expect(s.last().query).toMatchObject({ mode: 'Head', cursor: 'live-end' });
+      expect(s.last().query).toMatchObject({ kind: 'Continue', cursor: 'live-end' });
 
       fireEvent.keyDown(posOf('line 4'), { key: ' ' });
-      await answer(s.last(), page(5, 5, { before: { cursor: 'live-end', more: true }, after: END }));
+      await answer(s.last(), page(5, 5, { edges: { prev: 'live-end', ...END } }));
       expect(viewport.get().selection).toEqual([line(4)]);
       expect(viewport.get().pinnedToEnd).toBe(false);
     });

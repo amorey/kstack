@@ -159,6 +159,7 @@ function line(i: number): LogLine {
     timestamp: `2026-10-15T00:${String(Math.floor(second / 60)).padStart(2, '0')}:${String(second % 60).padStart(2, '0')}Z`,
     cursor: `c${i}`,
     message: `line ${i}`,
+    truncatedBytes: 0,
     stream: { namespace: 'ns', pod: 'p', container: 'app', previous: false },
     place: { node: '', region: '', zone: '', os: '', arch: '' },
     gap: null,
@@ -167,25 +168,26 @@ function line(i: number): LogLine {
 
 const lines = (from: number, to: number) => Array.from({ length: to - from }, (_, k) => line(from + k));
 
-function page(from: number, to: number, over: Partial<Page> = {}): Page {
+type PageOver = { edges?: Partial<Page['edges']>; anchor?: number | null; notices?: Page['notices'] };
+
+function page(from: number, to: number, over: PageOver = {}): Page {
   return {
     lines: lines(from, to),
-    before: { cursor: `before-${from}`, more: true },
-    after: { cursor: `after-${to}`, more: true },
-    anchor: null,
-    skipped: [],
-    ...over,
+    edges: { prev: `before-${from}`, next: `after-${to}`, follow: null, ...over.edges },
+    anchor: over.anchor ?? null,
+    notices: over.notices ?? [],
   };
 }
 
-const START = { cursor: null, more: false };
-const END = { cursor: 'live-end', more: false };
+const START = { prev: null };
+const END = { next: null, follow: 'live-end' };
 
 // --- A client the test answers by hand. ---
 
 type Fetch = { query: FetchQuery; resolve: (page: Page) => void; reject: (error: unknown) => void };
 type Follow = {
-  after: Cursor;
+  cursor: Cursor;
+  seen: Cursor[];
   onFrame: (frame: FollowFrame) => void;
   onFailed: (error: unknown) => void;
   closed: boolean;
@@ -200,12 +202,12 @@ function scripted() {
       new Promise<Page>((resolve, reject) => {
         fetches.push({ query, resolve, reject });
       }),
-    follow: (after, onFrame, onFailed) => {
+    follow: (cursor, seen, onFrame, onFailed) => {
       if (state.refuseFollow) {
         state.refuseFollow = false;
         throw new Error('refused');
       }
-      const follow: Follow = { after, onFrame, onFailed, closed: false };
+      const follow: Follow = { cursor, seen, onFrame, onFailed, closed: false };
       follows.push(follow);
       return () => {
         follow.closed = true;
@@ -393,8 +395,8 @@ describe('the landing', () => {
     const s = scripted();
     const m = mount({ client: s.client, anchor: HEAD, firstPageSize: 30 });
     await flush();
-    expect(s.fetches.map((f) => f.query)).toEqual([{ mode: 'Head', cursor: null, at: null, limit: 30 }]);
-    await answer(s.fetches[0], page(0, 30, { before: START }));
+    expect(s.fetches.map((f) => f.query)).toEqual([{ kind: 'First', limit: 30 }]);
+    await answer(s.fetches[0], page(0, 30, { edges: START }));
     expect(m.keys().slice(0, 10)).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
     expect(m.view.queryByText('line 0')).toBeInTheDocument();
     expect(m.state().loading).toBe(true);
@@ -409,7 +411,7 @@ describe('the landing', () => {
     const m = mount({ client: s.client, anchor: HEAD });
     await flush();
     vi.spyOn(window, 'requestAnimationFrame').mockImplementation(() => 0);
-    await answer(s.fetches[0], page(0, 30, { before: START }));
+    await answer(s.fetches[0], page(0, 30, { edges: START }));
     await act(async () => {
       await vi.advanceTimersByTimeAsync(249);
     });
@@ -426,8 +428,8 @@ describe('where a landing puts the scroller', () => {
     const s = scripted();
     const m = mount({ client: s.client, anchor: TAIL });
     await flush();
-    expect(s.fetches[0].query).toEqual({ mode: 'Tail', cursor: null, at: null, limit: 150 });
-    await answer(s.fetches[0], page(0, 150, { after: END }));
+    expect(s.fetches[0].query).toEqual({ kind: 'Last', limit: 150 });
+    await answer(s.fetches[0], page(0, 150, { edges: END }));
     expect(m.scroller().scrollTop).toBe(150 * 20 - VIEW);
     expect(m.keys()).toContain(0);
     expect(m.startOf(0)).toBe(149 * 20);
@@ -438,7 +440,7 @@ describe('where a landing puts the scroller', () => {
     const s = scripted();
     const m = mount({ client: s.client, anchor: AT });
     await flush();
-    expect(s.fetches[0].query).toEqual({ mode: 'Around', cursor: null, at: AT.at, limit: 150 });
+    expect(s.fetches[0].query).toEqual({ kind: 'At', at: AT.at, limit: 150 });
     await answer(s.fetches[0], page(0, 150, { anchor: 60 }));
     await frame(3);
     expect(m.startOf(0)).toBe(60 * 20);
@@ -471,12 +473,12 @@ describe('landing again', () => {
     await flush();
     act(() => m.ref.current!.jumpTo(TAIL));
     await flush();
-    expect(s.fetches.map((f) => f.query.mode)).toEqual(['Head', 'Tail']);
+    expect(s.fetches.map((f) => f.query.kind)).toEqual(['First', 'Last']);
     await act(async () => {
       s.fetches[0].reject(new Error('late'));
     });
     expect(onError).not.toHaveBeenCalled();
-    await answer(s.fetches[1], page(0, 150, { after: END }));
+    await answer(s.fetches[1], page(0, 150, { edges: END }));
     expect(m.state().pinnedToEnd).toBe(true);
   });
 
@@ -484,20 +486,20 @@ describe('landing again', () => {
     const s = scripted();
     const m = mount({ client: s.client, anchor: HEAD, pinToEnd: false });
     await flush();
-    await answer(s.fetches[0], page(0, 150, { before: START }));
+    await answer(s.fetches[0], page(0, 150, { edges: START }));
     act(() => m.ref.current!.jumpTo(TAIL));
     await flush();
-    await answer(s.last(), page(0, 150, { after: END }));
-    expect(s.last().query.mode).toBe('Tail');
+    await answer(s.last(), page(0, 150, { edges: END }));
+    expect(s.last().query.kind).toBe('Last');
     expect(m.state().pinnedToEnd).toBe(true);
     act(() => m.ref.current!.jumpTo(AT));
     await flush();
-    expect(s.last().query).toEqual({ mode: 'Around', cursor: null, at: AT.at, limit: 150 });
+    expect(s.last().query).toEqual({ kind: 'At', at: AT.at, limit: 150 });
     await answer(s.last(), page(0, 150, { anchor: 10 }));
     expect(m.state().pinnedToEnd).toBe(false);
     act(() => m.ref.current!.jumpTo(HEAD));
     await flush();
-    expect(s.last().query.mode).toBe('Head');
+    expect(s.last().query.kind).toBe('First');
   });
 
   it('hands each landing’s scroller to scrollerRef', async () => {
@@ -525,8 +527,8 @@ describe('landing again', () => {
     });
     act(() => m.ref.current!.retry());
     await flush();
-    expect(s.last().query.mode).toBe('Tail');
-    await answer(s.last(), page(0, 150, { after: END }));
+    expect(s.last().query.kind).toBe('Last');
+    await answer(s.last(), page(0, 150, { edges: END }));
     expect(m.state().pinnedToEnd).toBe(false);
     expect(m.scroller().scrollTop).toBe(150 * 20 - VIEW);
   });
@@ -536,14 +538,14 @@ describe('landing again', () => {
     const b = scripted();
     const m = mount({ client: a.client, anchor: TAIL });
     await flush();
-    await answer(a.fetches[0], page(0, 150, { after: END }));
+    await answer(a.fetches[0], page(0, 150, { edges: END }));
     act(() => m.ref.current!.jumpTo(AT));
     await flush();
     await answer(a.last(), page(0, 150, { anchor: 10 }));
     const asked = a.fetches.length;
     m.rerender({ client: b.client });
     await flush();
-    expect(b.fetches.map((f) => f.query)).toEqual([{ mode: 'Around', cursor: null, at: AT.at, limit: 150 }]);
+    expect(b.fetches.map((f) => f.query)).toEqual([{ kind: 'At', at: AT.at, limit: 150 }]);
     await answer(b.fetches[0], page(0, 150, { anchor: 10 }));
     await frame(3);
     expect(a.fetches.length).toBe(asked);
@@ -628,7 +630,7 @@ describe('the store under a parent', () => {
 
   async function landPinned(s: ReturnType<typeof scripted>, box: { last: CoreState | null }) {
     await flush();
-    await answer(s.last(), page(0, 150, { after: END }));
+    await answer(s.last(), page(0, 150, { edges: END }));
     await frame();
     expect(box.last).toMatchObject({ loading: false, pinnedToEnd: true, following: true });
   }
@@ -666,7 +668,7 @@ async function send(follow: Follow, frames: FollowFrame[]) {
 
 async function landTail(s: ReturnType<typeof scripted>, over: Partial<Page> = {}) {
   await flush();
-  await answer(s.last(), page(0, 150, { after: END, ...over }));
+  await answer(s.last(), page(0, 150, { ...over, edges: { ...END, ...over.edges } }));
   await frame();
 }
 
@@ -677,7 +679,7 @@ describe('the follow', () => {
     await flush();
     expect(s.follows).toEqual([]);
     await landTail(s);
-    expect(s.open().map((f) => f.after)).toEqual(['live-end']);
+    expect(s.open().map((f) => f.cursor)).toEqual(['live-end']);
     expect(m.state().following).toBe(true);
   });
 
@@ -686,7 +688,7 @@ describe('the follow', () => {
     const m = mount({ client: s.client });
     await landTail(s);
     const [follow] = s.open();
-    await send(follow, [lineFrame(150), lineFrame(151), { kind: 'Checkpoint', cursor: 'cp' }]);
+    await send(follow, [lineFrame(150), lineFrame(151), { kind: 'Notice', notice: { code: 'n', message: 'n' } }]);
     expect(m.view.queryByText('line 151')).toBeNull();
     await frame();
     expect(m.view.queryByText('line 151')).toBeInTheDocument();
@@ -750,7 +752,7 @@ describe('the pause', () => {
     expect(m.state().following).toBe(false);
     m.rerender({ paused: false });
     await flush();
-    expect(s.open().map((f) => f.after)).toEqual(['live-end']);
+    expect(s.open().map((f) => f.cursor)).toEqual(['live-end']);
   });
 
   it('lands a jump paused, opening no follow and paging nothing after', async () => {
@@ -780,14 +782,14 @@ describe('paging', () => {
     const s = scripted();
     const m = mount({ client: s.client, anchor: HEAD });
     await flush();
-    await answer(s.fetches[0], page(0, 150, { before: START }));
+    await answer(s.fetches[0], page(0, 150, { edges: START }));
     await frame();
     expect(s.fetches.length).toBe(1);
     await scrollTo(m.scroller(), 2000);
     await flush();
     expect(s.fetches.map((f) => f.query)).toEqual([
-      { mode: 'Head', cursor: null, at: null, limit: 150 },
-      { mode: 'Head', cursor: 'after-150', at: null, limit: 100 },
+      { kind: 'First', limit: 150 },
+      expect.objectContaining({ kind: 'Continue', cursor: 'after-150', limit: 100 }),
     ]);
   });
 
@@ -800,7 +802,7 @@ describe('paging', () => {
     expect(s.fetches.length).toBe(1);
     await scrollTo(m.scroller(), 400);
     await flush();
-    expect(s.last().query).toEqual({ mode: 'Tail', cursor: 'before-0', at: null, limit: 100 });
+    expect(s.last().query).toEqual({ kind: 'Continue', cursor: 'before-0', seen: null, limit: 100 });
   });
 
   it('asks no page before on a Tail landing until the user scrolls near it', async () => {
@@ -811,18 +813,18 @@ describe('paging', () => {
     expect(s.fetches.length).toBe(1);
     await scrollTo(m.scroller(), 400);
     await flush();
-    expect(s.last().query).toEqual({ mode: 'Tail', cursor: 'before-0', at: null, limit: 100 });
+    expect(s.last().query).toEqual({ kind: 'Continue', cursor: 'before-0', seen: null, limit: 100 });
   });
 
   it('reads the next page toward an edge when the render function asks', async () => {
     const s = scripted();
     const m = mount({ client: s.client, anchor: HEAD });
     await flush();
-    await answer(s.fetches[0], page(0, 150, { before: START }));
+    await answer(s.fetches[0], page(0, 150, { edges: START }));
     await frame();
     act(() => m.view.getByTestId('more-after').click());
     await flush();
-    expect(s.last().query).toEqual({ mode: 'Head', cursor: 'after-150', at: null, limit: 100 });
+    expect(s.last().query).toMatchObject({ kind: 'Continue', cursor: 'after-150', limit: 100 });
   });
 });
 
@@ -840,7 +842,7 @@ describe('keeping the reader’s place across pages', () => {
     await scrollTo(m.scroller(), 407);
     await flush();
     expect(s.fetches.length).toBe(2);
-    await answer(s.last(), page(-100, 0, { after: { cursor: 'x', more: true } }));
+    await answer(s.last(), page(-100, 0, { edges: { next: 'x' } }));
     expect(m.startOf(-55)).toBe(120 * 20);
     expect(m.scroller().scrollTop).toBe(120 * 20 + 7);
     await frame(2);
@@ -851,37 +853,37 @@ describe('keeping the reader’s place across pages', () => {
     const s = scripted();
     const m = mount({ client: s.client, anchor: HEAD });
     await flush();
-    await answer(s.fetches[0], page(0, 150, { before: START }));
+    await answer(s.fetches[0], page(0, 150, { edges: START }));
     await frame();
     await scrollTo(m.scroller(), 2000);
     await flush();
-    await answer(s.last(), page(140, 150, { after: { cursor: 'after-repeats', more: true } }));
+    await answer(s.last(), page(140, 150, { edges: { next: 'after-repeats' } }));
     expect(s.fetches.length).toBe(2);
     await frame();
-    expect(s.last().query).toEqual({ mode: 'Head', cursor: 'after-repeats', at: null, limit: 100 });
+    expect(s.last().query).toMatchObject({ kind: 'Continue', cursor: 'after-repeats', limit: 100 });
   });
 
   it('leaves the edge after an empty page, and pages again only on the next scroll or loadMore', async () => {
     const s = scripted();
     const m = mount({ client: s.client, anchor: HEAD });
     await flush();
-    await answer(s.fetches[0], page(0, 150, { before: START }));
+    await answer(s.fetches[0], page(0, 150, { edges: START }));
     await frame();
     await scrollTo(m.scroller(), 2000);
     await flush();
-    await answer(s.last(), { ...page(0, 0), after: { cursor: 'after-empty', more: true } });
+    await answer(s.last(), page(0, 0, { edges: { next: 'after-empty' } }));
     await frame(3);
     expect(s.fetches.length).toBe(2);
     expect(m.state().after).toEqual({ more: true, empty: true, loading: false });
     await scrollTo(m.scroller(), 2020);
     await flush();
     expect(s.fetches.length).toBe(3);
-    expect(s.last().query.cursor).toBe('after-empty');
-    await answer(s.last(), { ...page(0, 0), after: { cursor: 'after-empty-2', more: true } });
+    expect(s.last().query).toMatchObject({ cursor: 'after-empty' });
+    await answer(s.last(), page(0, 0, { edges: { next: 'after-empty-2' } }));
     await frame(3);
     act(() => m.view.getByTestId('more-after').click());
     await flush();
-    expect(s.last().query.cursor).toBe('after-empty-2');
+    expect(s.last().query).toMatchObject({ cursor: 'after-empty-2' });
   });
 
   it('leaves the scroller where the user put it after a page of repeats before', async () => {
@@ -890,7 +892,7 @@ describe('keeping the reader’s place across pages', () => {
     await landAt(s);
     await scrollTo(m.scroller(), 400);
     await flush();
-    await answer(s.last(), page(0, 10, { before: { cursor: 'before-r', more: true } }));
+    await answer(s.last(), page(0, 10, { edges: { prev: 'before-r' } }));
     await frame(2);
     await scrollTo(m.scroller(), 900);
     await frame(3);
@@ -904,7 +906,7 @@ describe('a page that fails', () => {
     const onError = vi.fn();
     const m = mount({ client: s.client, anchor: HEAD, onError });
     await flush();
-    await answer(s.fetches[0], page(0, 150, { before: START }));
+    await answer(s.fetches[0], page(0, 150, { edges: START }));
     await frame();
     const fail = async () => {
       act(() => m.view.getByTestId('more-after').click());
@@ -1031,7 +1033,7 @@ describe('the user’s intent', () => {
     await input(el, () => {}, BOTTOM - 300);
     await input(el, () => {}, BOTTOM);
     expect(s.fetches.length).toBe(asked + 1);
-    await answer(s.last(), page(150, 160, { after: END }));
+    await answer(s.last(), page(150, 160, { edges: END }));
     expect(m.state().pinnedToEnd).toBe(true);
   });
 
@@ -1048,7 +1050,7 @@ describe('the user’s intent', () => {
     await scrollTo(el, BOTTOM - 100);
     await scrollTo(el, BOTTOM);
     expect(s.fetches.length).toBe(asked + 1);
-    await answer(s.last(), page(150, 160, { after: END }));
+    await answer(s.last(), page(150, 160, { edges: END }));
     expect(m.state().pinnedToEnd).toBe(false);
   });
 
@@ -1089,7 +1091,7 @@ describe('the user’s intent', () => {
       const s = scripted();
       const m = mount({ client: s.client, anchor: HEAD, loadMoreThreshold: 0 });
       await flush();
-      await answer(s.fetches[0], page(0, 150, { before: START }));
+      await answer(s.fetches[0], page(0, 150, { edges: START }));
       await frame();
       return { s, m, el: m.scroller() };
     }
@@ -1098,8 +1100,8 @@ describe('the user’s intent', () => {
       const { s, m, el } = await behind();
       await input(el, () => fireEvent.wheel(el, { deltaY: 100 }), BOTTOM);
       await flush();
-      expect(s.last().query).toEqual({ mode: 'Head', cursor: 'after-150', at: null, limit: 100 });
-      await answer(s.last(), page(150, 160, { after: END }));
+      expect(s.last().query).toMatchObject({ kind: 'Continue', cursor: 'after-150', limit: 100 });
+      await answer(s.last(), page(150, 160, { edges: END }));
       expect(m.state()).toMatchObject({ pinnedToEnd: true, following: true });
       expect(el.scrollTop).toBe(160 * 20 - VIEW);
     });
@@ -1112,7 +1114,7 @@ describe('the user’s intent', () => {
       await input(el, () => fireEvent.wheel(el, { deltaY: 100 }));
       // The wheel's layout read waits for the frame.
       await frame();
-      await answer(s.last(), page(150, 160, { after: END }));
+      await answer(s.last(), page(150, 160, { edges: END }));
       expect(m.state().pinnedToEnd).toBe(true);
     });
 
@@ -1126,7 +1128,7 @@ describe('the user’s intent', () => {
       });
       expect(reads).not.toHaveBeenCalled();
       await frame();
-      await answer(s.last(), page(150, 160, { after: END }));
+      await answer(s.last(), page(150, 160, { edges: END }));
       expect(m.state().pinnedToEnd).toBe(true);
     });
 
@@ -1134,7 +1136,7 @@ describe('the user’s intent', () => {
       const { s, m, el } = await behind();
       await scrollTo(el, BOTTOM);
       await flush();
-      await answer(s.last(), page(150, 160, { after: END }));
+      await answer(s.last(), page(150, 160, { edges: END }));
       expect(m.state().pinnedToEnd).toBe(false);
     });
 
@@ -1147,7 +1149,7 @@ describe('the user’s intent', () => {
       await input(el, () => fireEvent.keyDown(el, { key: 'End' }), 160 * 20 - VIEW);
       await flush();
       expect(s.fetches.length).toBe(asked + 1);
-      await answer(s.last(), page(160, 170, { after: END }));
+      await answer(s.last(), page(160, 170, { edges: END }));
       expect(m.state().pinnedToEnd).toBe(true);
     });
 
@@ -1160,10 +1162,10 @@ describe('the user’s intent', () => {
       const el = m.scroller();
       await input(el, () => fireEvent.wheel(el, { deltaY: 100 }));
       await frame();
-      expect(s.last().query).toEqual({ mode: 'Head', cursor: 'live-end', at: null, limit: 100 });
-      await answer(s.last(), page(150, 150, { after: END }));
+      expect(s.last().query).toMatchObject({ kind: 'Continue', cursor: 'live-end', limit: 100 });
+      await answer(s.last(), page(150, 150, { edges: END }));
       expect(m.state().following).toBe(true);
-      expect(s.open().map((f) => f.after)).toEqual(['live-end']);
+      expect(s.open().map((f) => f.cursor)).toEqual(['live-end']);
     });
   });
 });
@@ -1210,7 +1212,7 @@ describe('measure', () => {
     rowHeight = () => 30;
     m.rerender({ estimateRowHeight: () => 30 });
     await act(async () => {
-      s.last().resolve(page(-100, 0, { after: { cursor: 'x', more: true } }));
+      s.last().resolve(page(-100, 0, { edges: { next: 'x' } }));
       await Promise.resolve();
       m.ref.current!.measure();
     });
@@ -1227,7 +1229,7 @@ describe('measure', () => {
     await flush();
     expect(s.fetches.length).toBe(1);
     await frame();
-    expect(s.last().query.mode).toBe('Tail');
+    expect(s.last().query).toMatchObject({ kind: 'Continue', seen: null });
   });
 
   it('does nothing on a second call while one is in flight', async () => {

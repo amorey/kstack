@@ -16,4 +16,4 @@
 // parts of a row the transcript's inline window draws the same way.
 export { LogViewer, type LogViewerProps } from './log-viewer';
 export { lineTime } from './line-time';
-export { Dot, GapNotice, LOG_ROW_PX } from './row';
+export { CutNotice, Dot, GapNotice, LOG_ROW_PX } from './row';

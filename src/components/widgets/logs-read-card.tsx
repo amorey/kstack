@@ -13,21 +13,22 @@
 // limitations under the License.
 // A LogsRead call in the transcript: one block naming what the model read and over
 // which range, the model's description, and the lines it read as the action holds
-// them, stripped, redacted and cut. Nothing is fetched, so a reload, an evicted log
-// or a gone cluster draws the same lines. A footer says what the model saw beyond
-// them. View around this makes the read's view the focused view, as a LogsView
-// card's Expand does, in chat mode alone.
+// them, stripped, redacted and cut, a line outside the range tagged with its side.
+// Nothing is fetched, so a reload, an evicted log or a gone cluster draws the same
+// lines. A footer says what the model saw beyond them. View around this makes the
+// read's view the focused view, as a LogsView card's Expand does, in chat mode alone.
 import { useState } from 'react';
 
 import { Button } from '@kubetail/ui/elements/button';
 
-import { GapRow, LineRow, readsOneStream } from '@/components/widgets/logs-view-inline';
+import { GapRow, LineRow, type LineTag, readsOneStream } from '@/components/widgets/logs-view-inline';
 import { SourceLine } from '@/components/widgets/logs-view-lines';
 import { ModelDescription } from '@/components/widgets/model-description';
 import { VisibleText } from '@/components/widgets/visible-text';
 import type { AppMode } from '@/lib/app-mode';
 import type { ChatToolCall } from '@/lib/chats';
 import { INLINE_LINES } from '@/lib/inline-log-lines';
+import { compareTimestamps, previousNanosecond } from '@/lib/log-viewer';
 import type { LogLine } from '@/lib/log-viewer';
 import type { LogsReadAction } from '@/lib/logs-view';
 import { useLogsView } from '@/lib/logs-view';
@@ -41,41 +42,66 @@ const NO_PLACE = { node: '', region: '', zone: '', os: '', arch: '' };
 // A sample's line as the viewer's rows draw one, a watch's too. Lines are keyed by
 // index: a sample holds no cursor.
 export function logLine(line: Line, i: number): LogLine {
-  const { timestamp, namespace, pod, container, previous, message, gap } = line;
+  const { timestamp, namespace, pod, container, previous, message, truncatedBytes, gap } = line;
   return {
     timestamp,
     cursor: String(i),
     message,
+    truncatedBytes,
     stream: { namespace, pod, container, previous },
     place: NO_PLACE,
     gap,
   };
 }
 
-// The range as the model's header names it, and which end of it was read.
-function rangeLine({ since, until, mode }: LogsReadAction): string {
-  const ends = [since && `from ${since}`, until && `up to ${until}`].filter(Boolean);
-  return [...ends, mode === 'Head' ? 'oldest first' : 'the newest'].join(', ');
+type Padding = LogsReadAction['before'];
+
+const padded = ({ lines, span }: Padding) => lines > 0 || span !== '';
+
+function paddingWords({ lines, span }: Padding, side: 'before' | 'after'): string {
+  if (lines > 0) return `${lines} ${lines === 1 ? 'line' : 'lines'} ${side}`;
+  return span === '' ? '' : `${span} ${side}`;
 }
 
-const OLDER = { End: '', More: 'older lines exist', Unread: 'older lines may exist' };
-const NEWER = { End: '', More: 'newer lines exist', Unread: 'newer lines may exist' };
+const PAGE_FROM = { First: 'oldest first', Last: 'the newest' };
 
-// What the model saw beyond the lines, in the header's words.
-function Beyond({ dropped, before, after, skipped }: LogsReadAction) {
-  const words = [
-    dropped > 0 && `${dropped} more ${dropped === 1 ? 'line was' : 'lines were'} left out`,
-    OLDER[before],
-    NEWER[after],
-  ].filter(Boolean);
-  if (words.length === 0 && skipped.length === 0) return null;
+// The range as the model's header names it, its padding, and which end of it was read.
+function rangeLine({ since, until, before, after, pageFrom }: LogsReadAction): string {
+  return [
+    since && `from ${since}`,
+    until && `up to ${until}`,
+    paddingWords(before, 'before'),
+    paddingWords(after, 'after'),
+    pageFrom && PAGE_FROM[pageFrom],
+  ]
+    .filter(Boolean)
+    .join(', ');
+}
+
+// Where the range ends, null with none: `until`, else, with padding after an open end, the
+// nanosecond before `resolvedAt`, where the sidecar ended it.
+function rangeEnd({ until, after, resolvedAt }: LogsReadAction): string | null {
+  if (until !== null) return until;
+  return padded(after) ? previousNanosecond(resolvedAt) : null;
+}
+
+function tagOf({ timestamp }: Line, since: string | null, end: string | null): LineTag {
+  if (since !== null && compareTimestamps(timestamp, since) < 0) return 'before';
+  if (end !== null && compareTimestamps(timestamp, end) > 0) return 'after';
+  return null;
+}
+
+// What the model saw beyond the lines, in the header's words, then what the page said.
+function Beyond({ olderMore, newerMore, notices }: LogsReadAction) {
+  const words = [olderMore && 'Older lines exist.', newerMore && 'Newer lines exist.'].filter(Boolean);
+  if (words.length === 0 && notices.length === 0) return null;
   return (
     <p data-testid="logs-read-beyond" className="mt-1 opacity-70">
-      {words.join('; ')}
-      {skipped.map((line, i) => (
-        <span key={line}>
-          {(words.length > 0 || i > 0) && '; '}
-          could not read <VisibleText text={line} />
+      {words.join(' ')}
+      {notices.map(({ code, message }, i) => (
+        <span key={`${code}:${message}`} title={code}>
+          {(words.length > 0 || i > 0) && ' '}
+          <VisibleText text={message} />
         </span>
       ))}
     </p>
@@ -105,7 +131,8 @@ export function LogsReadCard({
   const shown = mode === 'chat' && open && view?.chatId === chatID && view.callId === call.id;
   const oneStream = readsOneStream(action);
   const lines = all ? action.lines : action.lines.slice(0, INLINE_LINES);
-  const { viewAround } = action;
+  const { viewAround, since } = action;
+  const end = rangeEnd(action);
   return (
     <div className="mt-1 rounded-md border px-3 py-2">
       <div className="flex items-start gap-2">
@@ -156,7 +183,7 @@ export function LogsReadCard({
           return (
             <div key={row.cursor}>
               {row.gap && <GapRow line={row} />}
-              <LineRow line={row} oneStream={oneStream} />
+              <LineRow line={row} oneStream={oneStream} tag={tagOf(read, since, end)} />
             </div>
           );
         })}

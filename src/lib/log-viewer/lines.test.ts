@@ -13,7 +13,7 @@
 // limitations under the License.
 import { describe, expect, it } from 'vitest';
 
-import { Lines, compareTimestamps } from './lines';
+import { Lines, compareTimestamps, previousNanosecond } from './lines';
 import type { LogLine } from './types';
 
 function line(cursor: string, timestamp = '2026-10-15T00:00:00Z', container = 'app'): LogLine {
@@ -21,6 +21,7 @@ function line(cursor: string, timestamp = '2026-10-15T00:00:00Z', container = 'a
     timestamp,
     cursor,
     message: `m-${cursor}`,
+    truncatedBytes: 0,
     stream: { namespace: 'ns', pod: 'p', container, previous: false },
     place: { node: '', region: '', zone: '', os: '', arch: '' },
     gap: null,
@@ -124,5 +125,18 @@ describe('compareTimestamps', () => {
     expect(compareTimestamps('2026-10-15T02:00:00+02:00', '2026-10-15T00:00:00Z')).toBe(0);
     expect(compareTimestamps('2026-10-15T01:59:59.999999999+02:00', '2026-10-15T00:00:00Z')).toBeLessThan(0);
     expect(compareTimestamps('2026-10-14T23:00:00.000000001-01:00', '2026-10-15T00:00:00Z')).toBeGreaterThan(0);
+  });
+});
+
+describe('previousNanosecond', () => {
+  it('steps a stamp back one nanosecond, in UTC with nine digits', () => {
+    expect(previousNanosecond('2026-10-15T00:00:00.000000002Z')).toBe('2026-10-15T00:00:00.000000001Z');
+    expect(previousNanosecond('2026-10-15T00:00:00.5Z')).toBe('2026-10-15T00:00:00.499999999Z');
+    expect(previousNanosecond('2026-10-15T02:00:00.25+02:00')).toBe('2026-10-15T00:00:00.249999999Z');
+  });
+
+  it('borrows a second when the fraction is zero', () => {
+    expect(previousNanosecond('2026-10-15T00:00:00Z')).toBe('2026-10-14T23:59:59.999999999Z');
+    expect(previousNanosecond('2026-10-15T00:00:01.000Z')).toBe('2026-10-15T00:00:00.999999999Z');
   });
 });

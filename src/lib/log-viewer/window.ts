@@ -12,20 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import { Lines, compareTimestamps } from './lines';
-import type { Anchor, Cursor, FetchQuery, FollowFrame, LogLine, Page } from './types';
+import { Lines, compareTimestamps, containerKey } from './lines';
+import type { Anchor, Cursor, FetchQuery, FollowFrame, LogLine, Notice, Page } from './types';
 
-// A window of a log, with no React in it. It holds the lines, both edges, the pin, the pause
-// and where the after edge resumes; it takes every event — a landing, a page, a follow's
-// frames, the user's scroll, a pause — and answers what the scroller must do next. The
-// adapter performs the answers and never decides anything itself.
+// A window of a log, with no React in it. It holds the lines, both edges, the pin, the pause,
+// where the after edge resumes and the newest line of each container; it takes every event —
+// a landing, a page, a follow's frames, the user's scroll, a pause — and answers what the
+// scroller must do next. The adapter performs the answers and never decides anything itself.
 
 export type Edge = 'before' | 'after';
 
 export type EdgeState = {
   /** Whether there are more lines that way. */
   more: boolean;
-  /** Whether the last page that way held no line at all but said there are more: a budget spent, read on by hand. */
+  /** Whether the last page that way held no line at all but had a page on: a budget spent, read on by hand. */
   empty: boolean;
   /** Whether a page that way is in flight. Only an edge with more has one. */
   loading: boolean;
@@ -62,8 +62,8 @@ export type CoreState = {
   /** The edges, as `edges()` answers them. */
   before: EdgeState;
   after: EdgeState;
-  /** Every stream a page of this landing could not read, once each, first seen first. */
-  skipped: string[];
+  /** What this landing's pages and follow could not do, once per code and message, first seen first. */
+  notices: Notice[];
 };
 
 export type LogWindowOptions = {
@@ -89,16 +89,23 @@ export const CORE_INITIAL_STATE: CoreState = {
   length: 0,
   before: NO_MORE,
   after: NO_MORE,
-  skipped: [],
+  notices: [],
 };
 
 const NONE: Effect = { kind: 'none' };
 
-// An edge's state off a page's edge that way: empty when the page held no line and said more.
+// The page on that way. After, `next` alone: a poll of the live end through `follow` spends no
+// budget and pages on to nothing.
+const onward = (page: Page, edge: Edge): Cursor | null => (edge === 'before' ? page.edges.prev : page.edges.next);
+
+// An edge's state off a page: empty when the page held no line and had a page on that way.
 function edgeOf(page: Page, edge: Edge): PageSaid {
-  const { more } = page[edge];
+  const more = onward(page, edge) !== null;
   return { more, empty: more && page.lines.length === 0 };
 }
+
+/** Where a page's after edge goes on: its `next`, else its `follow`, the live end. */
+export const resumeOf = (page: Page): Cursor | null => page.edges.next ?? page.edges.follow;
 
 export class LogWindow {
   private readonly lines = new Lines();
@@ -121,8 +128,11 @@ export class LogWindow {
   /** Where the before edge continues. */
   private beforeCursor: Cursor | null = null;
 
-  /** Where the after edge continues: the last page's after cursor, or the last checkpoint. */
+  /** Where the after edge continues, and the follow opens: the last page's `resumeOf`. */
   private resume: Cursor | null = null;
+
+  /** Each container's newest line held, by its cursor: what a page on from `resume` reads past. */
+  private newest = new Map<string, Cursor>();
 
   /** The user's last scroll reached the bottom of a window that is behind; the next page after that finds no more pins. */
   private wantsPin = false;
@@ -138,7 +148,7 @@ export class LogWindow {
   /** The first and last index on screen, as the adapter last told it. */
   private visibleRange: { start: number; end: number } | null = null;
 
-  private skipped: string[] = [];
+  private notices: Notice[] = [];
 
   private snapshot: CoreState = CORE_INITIAL_STATE;
 
@@ -183,24 +193,26 @@ export class LogWindow {
     };
   }
 
+  // `seen` goes on every page after, followed or not: the server keeps the newer of a container's
+  // line and the cursor's own, so one it already passed is harmless.
   query(edge: Edge): FetchQuery | null {
     if (!this.edges()[edge].more) return null;
     const { pageSize: limit } = this.options;
     if (edge === 'before') {
-      return this.beforeCursor === null ? null : { mode: 'Tail', cursor: this.beforeCursor, at: null, limit };
+      return this.beforeCursor === null ? null : { kind: 'Continue', cursor: this.beforeCursor, seen: null, limit };
     }
-    return { mode: 'Head', cursor: this.resume, at: null, limit };
+    return this.resume === null ? null : { kind: 'Continue', cursor: this.resume, seen: this.seen(), limit };
   }
 
-  /** Only called while following, when it is never null. */
-  followFrom(): Cursor {
-    return this.resume as Cursor;
+  /** Only called while following, when `resume` is never null. */
+  followFrom(): { cursor: Cursor; seen: Cursor[] } {
+    return { cursor: this.resume as Cursor, seen: this.seen() };
   }
 
   landing(anchor: Anchor): FetchQuery {
     const limit = this.options.firstPageSize;
-    if (anchor.kind === 'At') return { mode: 'Around', cursor: null, at: anchor.at, limit };
-    return { mode: anchor.kind, cursor: null, at: null, limit };
+    if (anchor.kind === 'At') return { kind: 'At', at: anchor.at as string, limit };
+    return { kind: anchor.kind === 'Head' ? 'First' : 'Last', limit };
   }
 
   landed(page: Page, anchor: Anchor): Effect {
@@ -210,10 +222,12 @@ export class LogWindow {
     else if (anchor.kind === 'At') zeroAt = page.anchor ?? 0;
     this.lines.reset(page.lines, zeroAt);
     this.edge = { before: edgeOf(page, 'before'), after: edgeOf(page, 'after') };
-    this.beforeCursor = page.before.cursor;
-    this.resume = page.after.cursor;
-    this.skipped = [];
-    this.joinSkipped(page.skipped);
+    this.beforeCursor = page.edges.prev;
+    this.resume = resumeOf(page);
+    this.newest = new Map();
+    this.noteNewest(page.lines);
+    this.notices = [];
+    this.joinNotices(page.notices);
     this.repeats = { before: false, after: false };
     this.ticket = { before: null, after: null };
     this.isLanded = true;
@@ -248,16 +262,17 @@ export class LogWindow {
     // Only the edge paged toward reads the page's edges; the other side is ignored.
     this.edge[edge] = edgeOf(page, edge);
     const added = edge === 'before' ? this.lines.prepend(page.lines) : this.lines.append(page.lines);
-    this.repeats[edge] = page.lines.length > 0 && added === 0 && page[edge].more;
-    this.joinSkipped(page.skipped);
+    this.repeats[edge] = page.lines.length > 0 && added === 0 && onward(page, edge) !== null;
+    this.joinNotices(page.notices);
     let effect: Effect = NONE;
     if (edge === 'before') {
-      this.beforeCursor = page.before.cursor;
+      this.beforeCursor = page.edges.prev;
       // Keys are stable across a prepend, so the adapter holds the first visible row by its key.
       effect = { kind: 'hold' };
     } else {
-      this.resume = page.after.cursor;
-      if (this.wantsPin && !page.after.more) {
+      this.noteNewest(page.lines);
+      this.resume = resumeOf(page);
+      if (this.wantsPin && page.edges.next === null) {
         // The newest lines: a follow would have brought them the same way.
         this.pinned = true;
         this.wantsPin = false;
@@ -303,10 +318,11 @@ export class LogWindow {
     const lines: LogLine[] = [];
     taken.forEach((frame) => {
       if (frame.kind === 'Line') lines.push(frame.line);
-      else if (frame.kind === 'Checkpoint') this.resume = frame.cursor;
+      else if (frame.kind === 'Notice') this.joinNotices([frame.notice]);
       else this.ended = frame.reason;
     });
     this.lines.append(lines);
+    this.noteNewest(lines);
     this.emit();
     return { kind: 'toEnd' };
   }
@@ -362,9 +378,26 @@ export class LogWindow {
     return null;
   }
 
-  private joinSkipped(streams: readonly string[]): void {
-    const joined = [...new Set([...this.skipped, ...streams])];
-    if (joined.length > this.skipped.length) this.skipped = joined;
+  // A follow sends a notice once per container generation and a page may repeat one, so a
+  // notice is held once per code and message.
+  private joinNotices(notices: readonly Notice[]): void {
+    const held = new Set(this.notices.map(noticeKey));
+    const fresh = notices.filter((notice) => {
+      const key = noticeKey(notice);
+      if (held.has(key)) return false;
+      held.add(key);
+      return true;
+    });
+    if (fresh.length > 0) this.notices = [...this.notices, ...fresh];
+  }
+
+  // Lines on the after side come in each container's log order, so the last of one is its newest.
+  private noteNewest(lines: readonly LogLine[]): void {
+    lines.forEach((line) => this.newest.set(containerKey(line.stream), line.cursor));
+  }
+
+  private seen(): Cursor[] {
+    return [...this.newest.values()];
   }
 
   // A follow's lines keep their arrival order, so the first and last visible need not be the bounds.
@@ -402,13 +435,15 @@ export class LogWindow {
       length: this.lines.length,
       before: same(prev.before, before) ? prev.before : before,
       after: same(prev.after, after) ? prev.after : after,
-      skipped: this.skipped,
+      notices: this.notices,
     };
     if (same(prev, next)) return;
     this.snapshot = next;
     this.listeners.forEach((listener) => listener());
   }
 }
+
+const noticeKey = ({ code, message }: Notice) => JSON.stringify([code, message]);
 
 // Whether two objects hold the same values field for field.
 function same(a: object | null, b: object | null): boolean {
