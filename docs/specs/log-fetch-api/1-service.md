@@ -2,7 +2,7 @@
 
 **Package:** `services/logs` (paths relative to `sidecar/internal/`).
 **Prerequisites:** none.
-**Status:** Planned.
+**Status:** Landed (#382).
 
 ## Goal
 
@@ -173,7 +173,7 @@ with an empty `Code` is the backstop.
 | Code | Carried by | When |
 | --- | --- | --- |
 | `cursor-invalid` | refusal | a `PageCursor` that is not a page cursor this version of the service wrote: it does not decode, its `v` is another version, or its content fails a check; a `Seen` entry that is not a line cursor (`errBadCursor`) |
-| `conflicting-parameters` | refusal | `PageFrom` with `PageCursor` or neither; a continuation with a scope, window or `Seen`; `Seen` with `PageFromLast` or beside a `Padding`; a `Padding` with both `Lines` and `Span`; today's `Around` and mode refusals in `fetch.go` |
+| `conflicting-parameters` | refusal | `PageFrom` with `PageCursor` or neither; a continuation with a scope or window, or with `Seen` when its window has a counted `After` (step 2, task 4); `Seen` with `PageFromLast` or beside a `Padding`; a `Padding` with both `Lines` and `Span`; today's `Around` and mode refusals in `fetch.go` |
 | `invalid-range` | refusal | `Since` after `Until` |
 | `bad-grep` | refusal | a `Grep` that does not compile, or one over `MaxGrep` |
 | `bad-page` | refusal | `PageSize` outside 0 to `MaxPageSize`, or a negative `MaxMessageBytes` or `MaxPageBytes` |
