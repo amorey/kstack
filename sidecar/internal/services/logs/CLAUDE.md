@@ -32,7 +32,8 @@ cache at `<cache>/logs/<cache id>.db` (schema `migrations/0001_init.sql`: `strea
   both still work after `Close`. A delete removes `-wal` and `-shm` first, or a fresh database
   would replay the old WAL.
 - `Retention` (`retention.go`) holds every knob. Ids never come back (`AUTOINCREMENT`).
-- **A chunk's `read_at_ms` is a page's stamp alone**; tailers and follows stamp nothing.
+- **Only the page engine stamps a chunk's `read_at_ms`**; tailers and a follow's own walks stamp
+  nothing.
   `Store.WriteHeld` holds a follow's gap fill from commit until its walk returns.
 - **The janitor** (`janitor.go`) sweeps on `Interval` and past `SweepBytes`: it first retries
   closing the chunks of ended tails whose close failed, then protects open, recently read and held
@@ -138,7 +139,8 @@ built in `app` as `logs.New`, which owns the log store and is the cluster servic
   the page engine, the page cursor, the resolved window, the streams a page reads, the filler, the
   walker, the merge, the caps). A `FetchRequest` is a first page, its `Scope`, its `Window`
   (`Since`/`Until`, inclusive moments, padded `Before`/`After` by lines or a span) and `PageFrom`
-  (`PageFromFirst`, `PageFromLast`), or a continuation, a `PageCursor` alone. `PageSize`,
+  (`PageFromFirst`, `PageFromLast`), or a continuation, a `Cursor`, with `Seen` beside a newer
+  one merged into its entries (`mergeSeen`). `PageSize`,
   `MaxMessageBytes` and `MaxPageBytes` are named on every page. A `FetchResponse` echoes the
   request as it ran, with `ResolvedAt`, the first page's clock, its records oldest first, its
   `Notices` (never nil), and its place as `Page{Prev, Next, Follow}`. The rules are `Fetch`'s doc
@@ -160,8 +162,8 @@ built in `app` as `logs.New`, which owns the log store and is the cluster servic
   (`fillGap`), so `reader.lines` stays the one place a bound is applied. A newer page in a window
   whose After is counted reads, in the fill and the walk, no more lines past the range's end than
   the count leaves (`pageQuery.full`). A page resolves, files streams, adds gone pods' streams the
-  file holds (`pageStreams`), fills gaps from the backends (`filler`), walks (`walker`) and merges
-  (`mergePage`). **A read is written a batch at a time as it arrives** (`window`, `WriteBatch`),
+  file holds (`pageStreams`), then over those streams (`pageOver`) fills gaps from the backends
+  (`filler`), walks (`walker`) and merges (`mergePage`). **A read is written a batch at a time as it arrives** (`window`, `WriteBatch`),
   each batch checked against the mirror first and stamped. A forward read is one window: its first
   batch links down, its last links up only when it read its range whole, and it is cancelled once
   the stream holds the page. A backward read's windows (`Item.WindowEnd`) arrive newest first,
@@ -184,8 +186,23 @@ built in `app` as `logs.New`, which owns the log store and is the cluster servic
   a hole between two records to the later; its older edge's record, and a follow's first line on
   a stream, look back past the edge (`looker`, under `Retention.LookBytes`). → [ADR: a head read
   never links](../../../../docs/adr/2026-10-17-a-head-read-never-links.md).
-- **`Service.Follow` walks the file from a watermark per stream** (`follow.go`, in sections: the
-  follow, the tailer, the registry). One **tailer** per stream is shared through the file's
+- **`Service.Follow` speaks the page's vocabulary** (`follow.go`, in sections: the follow, the
+  tailer, the registry). A `FollowRequest` is a `Scope` and a start: now, `Since` (an inclusive
+  moment, as a window's), or `Cursor` (a page's `Next` or `Follow`, whose scope it reads), with
+  `Seen` beside either; and `MaxMessageBytes`, cut through `capMessage` as a page's. Its rules are
+  `Follow`'s doc comment. **Either start is one page cursor** (`followStart`): a first page from
+  `Since`, or the cursor with `Seen` merged in and its `Until` and `After` cleared, since a follow
+  does not stop. Every stream, at open or joining later, starts at its `keyFor`. A `FollowFrame`
+  carries a `Record`, a `Notice` or, last, `Ended`, a `Refusal`. A follow hands out no cursor: a
+  caller goes on from its start and the lines it holds, as `Seen`. **A follow whose start is not
+  now reads the instances only the file holds first** (`follow.open` files them through
+  `fileOnlyStreams`; `readOnly` reads them through `pageOver` with `grepAll`, a page of
+  `MaxPageSize` at a time from the start cursor): its streams are keyed by `StreamKey` and cannot
+  hold them, and they never grow, so one read is enough. The open defers `NoNodes` as a page does,
+  refusing it only with no such instance to read; once they are read, a scope of gone pods alone
+  ends with it. A stream `failed` ends on an error says so once a generation, a `stream-skipped`
+  notice, unless its container is waiting to start.
+- **A follow walks the file from a watermark per stream.** One **tailer** per stream is shared through the file's
   **registry** and outlives its last follow by `TailGrace`. Tailers hand lines to **the file's
   writer** (`logstore/writer.go`) in batches; a tailer the writer cannot take from within
   `WriteWait` closes its chunk and reads from now, or ends with no follow. Every commit pings the
@@ -193,14 +210,13 @@ built in `app` as `logs.New`, which owns the log store and is the cluster servic
   walk that meets a live gap starts its fill on a goroutine of its own and stops** (`follow.fill`);
   the fill's end comes back to the follow's loop, which walks the stream on (`filledGap`). Until
   then the stream is `filling`: no walk reads it, its watermark waits at the gap, and the view
-  counts it as waiting. Lines are ordered per container only. After each walk that sent a line
-  the follow sends a `Checkpoint` (the oldest watermark); a follow opened `after` it misses no
-  line. With no cursor it reads from `sinceTime`, never `tailLines=0`.
+  counts it as waiting. Lines are ordered per container only. From now it reads from
+  `sinceTime`, never `tailLines=0`.
 - **A follow's streams are one reconcile** (`follow.reconcile`), run after every mirror event
   (settled by `followSettle`), node change, stream end or retry. A container is tailed unless it
   ended at the `generation` the view sees now. A dropped container is held for a backoff up to
   `followRetryCap`. A `Pod` source leaves the view once its pod is gone by UID. **An ending the user
-  can read is a `FollowEnded` frame, not an error** (any `Refusal`, via `refusal.As`); any other
+  can read is an `Ended` frame, not an error** (any `Refusal`, via `refusal.As`); any other
   ending sets `Err`, and a cancel sets none. **Its caller is the viewer's `logsFollow`.**
 
 ## Test fixtures (`logstest`)

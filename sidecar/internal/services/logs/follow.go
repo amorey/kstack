@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"regexp"
 	"slices"
 	"strings"
@@ -53,26 +54,28 @@ const (
 // resolves its view again, so a burst of frames costs one resolve.
 const followSettle = 250 * time.Millisecond
 
-// FollowFrame is one frame of a follow: a line; a checkpoint, whose cursor a follow
-// opened after misses no line; or the follow's end, with its code and the reason in
-// the user's words. The end is the last frame.
-type FollowFrame struct {
-	Type   FollowFrameType
-	Record *logline.Record
-	Cursor *string
-	Code   refusal.Code
-	Reason string
+// FollowRequest is one follow. It starts from now, or from Since, that moment's
+// lines included, or from Cursor, a page's Next or Follow: each stream reads past
+// where the page left it, and the scope is the cursor's. Seen, sent with either,
+// is the last line the caller has of each stream: that stream reads past its
+// line, and a stream not in Seen reads from the start. MaxMessageBytes cuts each
+// message, 0 for the service's own cap.
+type FollowRequest struct {
+	Scope
+	Since           *time.Time
+	Seen            []string
+	Cursor          *string
+	MaxMessageBytes int
 }
 
-// FollowFrameType is what a follow frame carries. The GraphQL LogsFollowFrameType
-// enum binds member by member onto it.
-type FollowFrameType string
-
-const (
-	FollowLine       FollowFrameType = "line"
-	FollowCheckpoint FollowFrameType = "checkpoint"
-	FollowEnded      FollowFrameType = "ended"
-)
+// FollowFrame is one frame of a follow, exactly one field set. Record is a line.
+// Notice is something the follow wants the caller to know. Ended is why the
+// follow ended, and is the last frame: following again would end the same way.
+type FollowFrame struct {
+	Record *logline.Record
+	Notice *Notice
+	Ended  *refusal.Refusal
+}
 
 // followBatch and followBatchBytes are the most lines the follow's walks read, and
 // the most bytes of lines they keep, across every stream, before it sends them and
@@ -82,27 +85,51 @@ const (
 	followBatchBytes = 4 << 20
 )
 
-// Follow is view's new lines on cluster id as they are written: after the cursor,
-// or from the moment it started with none. The lines are read from the cluster
-// cache's log file, which a tailer per stream writes, shared by every follow of it:
-// each stream is walked from a watermark on every commit to it, and its lines go
-// out in line order, so lines are ordered per container. After each walk that
-// sent a line a Checkpoint names the oldest watermark across the view, and a follow
-// opened after it misses no line. A view with no container yet — a Job not
+// Follow is q's scope's lines on cluster id as they are written, from q's start.
+// The lines are read from the cluster cache's log file, which a tailer per stream
+// writes, shared by every follow of it: each stream is walked from its own
+// watermark on every commit to it, and its lines go out in line order, so lines
+// are ordered per container. A scope with no container yet — a Job not
 // scheduled, a Deployment at zero — waits for its pods.
 //
+//  1. A follow starts from now, from Since, a moment whose lines are in, or from
+//     Cursor, a page's Next or Follow, whose scope it reads. Cursor beside Since,
+//     or Seen beside neither, is conflicting-parameters.
+//  2. Seen is the last line the caller has of each stream: that stream reads
+//     past it, never before the start; every other from the start. Beside a
+//     Cursor it merges into the cursor's entries, the newer line standing.
+//  3. A follow from a Cursor reads every line a poll of it would, then goes on
+//     past the window's end: it ignores the cursor's Until and After.
+//  4. The grep applies to every line sent, padding included, and each message
+//     is cut at MaxMessageBytes, saying the bytes cut in TruncatedBytes.
+//  5. A stream the server refuses, ends or finds too loud sends a stream-skipped
+//     Notice once, unless the server ends it because its container is waiting to
+//     start.
+//  6. A follow hands out no cursor: what a caller needs to go on is its start
+//     and the lines it saw, sent back as Seen.
+//  7. A follow whose start is not now first reads the instances of its Pod
+//     sources that only the file holds, from its start to their ends, then
+//     tails. A scope of gone pods alone under a label filter the mirror has no
+//     nodes for then ends no-nodes.
+//
 // A follow that ends for a reason the user can read — the claim revoked, the
-// cluster refusing the user's credentials, every container of the view stopped,
-// every source of the view a Pod whose pod was deleted, the view grown past what
+// cluster refusing the user's credentials, every container of the scope stopped,
+// every source of it a Pod whose pod was deleted, a label filter with no nodes
+// to apply it over, the scope grown past what
 // Kstack reads at once, a kind the cache no longer mirrors — sends one Ended frame
 // saying so and ends clean, since following again would end the same way. Any
 // other ending sets Err, the log file closing under it included, and its context
 // ending is a clean end with no frame.
-func (s *Service) Follow(ctx context.Context, id cluster.ClusterID, scope Scope, after *string) (*cluster.Stream[FollowFrame], error) {
-	since, err := logline.BoundAfter(after)
+func (s *Service) Follow(ctx context.Context, id cluster.ClusterID, q FollowRequest) (*cluster.Stream[FollowFrame], error) {
+	maxMessage, err := messageCap(q.MaxMessageBytes)
 	if err != nil {
 		return nil, err
 	}
+	start, err := followStart(q, s.now())
+	if err != nil {
+		return nil, err
+	}
+	scope := start.Scope
 	grep, err := logline.CompileGrep(scope.Grep)
 	if err != nil {
 		return nil, err
@@ -111,42 +138,23 @@ func (s *Service) Follow(ctx context.Context, id cluster.ClusterID, scope Scope,
 	if err != nil {
 		return nil, err
 	}
-	c, err := kubelet.Open(ctx, s.clusters, id, t.serverUID, s.retry)
-	if err != nil {
-		return nil, err
-	}
-	file, err := s.files.OpenOrCreate(int64(t.cacheID))
-	if err != nil {
-		c.Close()
-		return nil, err
-	}
-	if since.At.IsZero() {
-		since = logline.Bound{At: logline.MomentAt(s.now()), Inclusive: true}
-	}
 	// owned ends the mirror watches and every tailer's watch on any ending. The
 	// stream itself runs on ctx: one ended by its own context files no error.
 	owned, stop := context.WithCancel(ctx)
 	f := &follow{
-		s: s, id: id, scope: scope, since: since, grep: grep, claim: c, file: file, tails: s.registryFor(id, t), target: t,
+		s: s, id: id, scope: scope, start: start, maxMessage: maxMessage, grep: grep, tails: s.registryFor(id, t), target: t,
 		streams: map[logline.StreamKey]*tracked{}, nodes: map[string]logline.Place{},
 		deleted: map[string]string{}, podUIDs: map[string]string{}, gone: map[string]bool{}, held: map[int64]func(){},
 		dueHub: mpsc.New[logline.StreamKey](0, mpsc.WithKeepOpen()), endedHub: mpsc.New[*handle](0, mpsc.WithKeepOpen()),
 		filled: make(chan fillDone),
 	}
-	for _, b := range s.backends {
-		f.backends, f.names = append(f.backends, b.build(c.Get)), append(f.names, b.name)
-	}
-	f.notePods(t)
-	if err := f.watch(owned, t.cacheID); err != nil {
+	if err := f.open(owned, q.Since == nil && q.Cursor == nil); err != nil {
 		stop()
-		file.Close()
-		c.Close()
+		f.close()
 		return nil, err
 	}
 	return cluster.NewStream(ctx, func(ctx context.Context, out chan<- FollowFrame) error {
-		defer c.Close()
-		defer file.Close()
-		defer f.letGo()
+		defer f.close()
 		// A fill in flight reads over the claim and writes the file: both outlive it.
 		defer f.fills.Wait()
 		defer stop()
@@ -156,23 +164,102 @@ func (s *Service) Follow(ctx context.Context, id cluster.ClusterID, scope Scope,
 		if ctx.Err() != nil {
 			return nil
 		}
-		if refusal, ok := refusal.As(err); ok {
-			send(ctx, out, FollowFrame{Type: FollowEnded, Code: refusal.Code, Reason: refusal.Reason})
+		if r, ok := refusal.As(err); ok {
+			send(ctx, out, FollowFrame{Ended: &r})
 			return nil
 		}
 		return err
 	}), nil
 }
 
-// letGo releases every row the follow holds.
-// keep is the follow's test of a line: the grep, since a follow has no padding.
-func (f *follow) keep(_ int64, message string) bool { return logline.Matches(f.grep, message) }
+// followStart is q's start cursor, which holds its scope and seeds every stream:
+// from a moment, a first page from Since, now with none, with q's Seen as its
+// entries; from a page cursor, the cursor with q's Seen merged into its entries.
+func followStart(q FollowRequest, now time.Time) (pageCursor, error) {
+	switch {
+	case q.Cursor != nil && q.Since != nil:
+		return pageCursor{}, refusal.New(refusal.CodeConflictingParameters, "a follow starts from since or from a page cursor, not both")
+	case q.Cursor != nil && !q.Scope.empty():
+		return pageCursor{}, refusal.New(refusal.CodeConflictingParameters, "a page cursor holds its scope, so a follow from one sends none")
+	case q.Cursor != nil:
+		return cursorStart(*q.Cursor, q.Seen)
+	case len(q.Sources) == 0:
+		return pageCursor{}, refusal.New(refusal.CodeConflictingParameters, "a follow sends a scope or a page cursor")
+	case q.Since == nil && len(q.Seen) > 0:
+		return pageCursor{}, refusal.New(refusal.CodeConflictingParameters, "seen goes with since or a page cursor: a stream it does not name would read from now")
+	}
+	since := now
+	if q.Since != nil {
+		since = *q.Since
+	}
+	return firstPage(FetchRequest{Scope: q.Scope, Window: Window{Since: &since}, PageFrom: PageFromFirst, Seen: q.Seen}, now)
+}
 
-func (f *follow) letGo() {
+// cursorStart is the start cursor a follow from the page cursor s reads from, seen
+// merged into its entries. A follow does not stop, so the window's end goes: its
+// Until, its After and the count past the range.
+func cursorStart(s string, seen []string) (pageCursor, error) {
+	c, err := decodePageCursor(s)
+	if err != nil {
+		return pageCursor{}, err
+	}
+	if !c.newer {
+		return pageCursor{}, refusal.New(refusal.CodeCursorInvalid, "a follow goes on from a page's next or follow, not its prev")
+	}
+	if c.seen, err = mergeSeen(c.seen, seen); err != nil {
+		return pageCursor{}, err
+	}
+	c.Until, c.Window.After, c.after = nil, Padding{}, 0
+	return c, nil
+}
+
+// open takes what the follow reads over: a claim on the cluster, the cache's log
+// file, the rows of the instances only the file holds, which it reads first, and
+// its mirror watches. A follow from now reads no such instance, since nothing of
+// one is stamped after now. A label filter the mirror has no nodes for is refused
+// here only with no such instance to read; with one, run reads it first.
+func (f *follow) open(ctx context.Context, fromNow bool) error {
+	t := f.target
+	var err error
+	if f.claim, err = kubelet.Open(ctx, f.s.clusters, f.id, t.serverUID, f.s.retry); err != nil {
+		return err
+	}
+	for _, b := range f.s.backends {
+		f.backends, f.names = append(f.backends, b.build(f.claim.Get)), append(f.names, b.name)
+	}
+	if f.file, err = f.s.files.OpenOrCreate(int64(t.cacheID)); err != nil {
+		return err
+	}
+	if !fromNow {
+		if f.only, f.releaseOnly, err = fileOnlyStreams(ctx, f.file, t, f.scope); err != nil {
+			return err
+		}
+	}
+	if t.noNodes != nil && len(f.only) == 0 {
+		return t.noNodes
+	}
+	f.notePods(t)
+	return f.watch(ctx, t.cacheID)
+}
+
+// close lets go of what open took, as far as it got, and every row the follow holds.
+func (f *follow) close() {
 	for _, release := range f.held {
 		release()
 	}
+	if f.releaseOnly != nil {
+		f.releaseOnly()
+	}
+	if f.file != nil {
+		f.file.Close()
+	}
+	if f.claim != nil {
+		f.claim.Close()
+	}
 }
+
+// keep is the follow's test of a line: the grep, every line, padding included.
+func (f *follow) keep(_ int64, message string) bool { return logline.Matches(f.grep, message) }
 
 // objectWatch is a watch of mirrored objects.
 type objectWatch = *cluster.Stream[cluster.ClusterCachedDataObjectWatchFrame]
@@ -266,9 +353,10 @@ type follow struct {
 	scope Scope
 	grep  *regexp.Regexp
 	claim *kubelet.Claim
-	// since is where a stream that joins starts before any checkpoint: the follow's
-	// cursor, or the moment it started.
-	since logline.Bound
+	// start is the follow's start cursor: every stream, at open or joining later,
+	// starts at its keyFor. maxMessage is where each message is cut.
+	start      pageCursor
+	maxMessage int
 	// file is the follow's claim on the cache's log file, tails its tailers, and
 	// backends and names the cluster's backends over the follow's claim, which fill a
 	// live gap a walk meets.
@@ -277,7 +365,11 @@ type follow struct {
 	backends []kubelet.Backend
 	names    []string
 	target   target
-	out      chan<- FollowFrame
+	// only is the instances of the scope's Pod sources only the file holds, read
+	// once before anything is tailed, and releaseOnly lets go of their rows.
+	only        []pageStream
+	releaseOnly func()
+	out         chan<- FollowFrame
 	// w is the follow's mirror watches, nil while they are to be opened again.
 	w *watches
 	// streams is what the follow knows of each stream it has wanted, and wanted the
@@ -290,10 +382,8 @@ type follow struct {
 	// held is the release of each row the follow has filed, which it holds until it
 	// ends so no sweep takes a row it may fill.
 	held map[int64]func()
-	// batch is the lines walked and not yet sent, and checkpoint the last checkpoint
-	// sent, zero before the first.
-	batch      []logline.Record
-	checkpoint logline.Bound
+	// batch is the lines walked and not yet sent.
+	batch []logline.Record
 	// lines and bytes are what the walks may still read and keep before the next send.
 	lines, bytes int
 	// again fires when a resolve the mirror refused is due to be asked again, or
@@ -347,7 +437,8 @@ type follow struct {
 // release are what the walk after a fill takes: that the gap at its watermark was
 // read, and the hold on what the fill wrote. looked is set once the follow has sent
 // a line of the stream, the first looking back for its holes, and gap is the holes
-// its walks crossed since the last line it sent, which the next carries.
+// its walks crossed since the last line it sent, which the next carries. skipped is
+// the generation whose failure the follow last sent a notice for, zero for none.
 type tracked struct {
 	st        stream
 	row       int64
@@ -366,6 +457,7 @@ type tracked struct {
 	release   func()
 	looked    bool
 	gap       *logline.Gap
+	skipped   generation
 }
 
 // tail is where tr's tailer reads on from, every gap past which is the tailer's;
@@ -402,8 +494,9 @@ func (tr *tracked) record(l logstore.Line) logline.Record {
 	return recordOf(l, tr.st.key, tr.st.place, tr.st.gen.instance)
 }
 
-// run brings the target's streams up, then follows the view's pods and walks its
-// streams on every commit until an ending.
+// run reads the instances only the file holds, brings the target's streams up,
+// then follows the view's pods and walks its streams on every commit until an
+// ending.
 func (f *follow) run(ctx context.Context) error {
 	defer func() {
 		for _, tr := range f.streams {
@@ -413,10 +506,74 @@ func (f *follow) run(ctx context.Context) error {
 			f.pings.Close()
 		}
 	}()
+	if err := f.readOnly(ctx); err != nil {
+		return err
+	}
+	if f.target.noNodes != nil {
+		// No resolve judges a pod gone without nodes, so a scope of gone pods alone
+		// would wait for nodes forever.
+		if f.onlyGonePods() {
+			return f.target.noNodes
+		}
+		f.askAgain()
+	}
 	if err := f.bring(ctx, f.target); err != nil {
 		return err
 	}
 	return f.relay(ctx)
+}
+
+// readOnly sends the lines of the instances only the file holds, from the start
+// cursor to their ends, then lets their rows go: one newer read through the page
+// engine, a page of MaxPageSize at a time, each going on from the last's edge as
+// a Next does. They never grow, so they are read once, and no backend serves them.
+func (f *follow) readOnly(ctx context.Context) error {
+	if len(f.only) == 0 {
+		return nil
+	}
+	defer func() {
+		f.releaseOnly()
+		f.releaseOnly = nil
+	}()
+	cur := f.start
+	for {
+		q := pageQuery{scope: f.scope, grep: f.grep, mode: logline.Newer, cur: &cur, limit: MaxPageSize, grepAll: true}
+		ms, err := f.s.pageOver(ctx, f.id, f.target, f.file, f.only, q)
+		if err != nil {
+			return err
+		}
+		m := ms[0]
+		for _, line := range m.skipped {
+			if !send(ctx, f.out, FollowFrame{Notice: &Notice{refusal.CodeStreamSkipped, line}}) {
+				return ctx.Err()
+			}
+		}
+		for _, rec := range m.records {
+			if !f.sendLine(ctx, rec) {
+				return ctx.Err()
+			}
+		}
+		if m.cut.IsZero() {
+			return nil
+		}
+		next, _ := cur.edges(m)
+		// A cut page that moves no stream would be read again forever.
+		if maps.Equal(next.seen, cur.seen) {
+			return errors.New("follow: a page of the instances only the file holds did not move")
+		}
+		cur = next
+	}
+}
+
+// onlyGonePods is whether every source of the scope is a Pod source whose pod the
+// mirror no longer holds.
+func (f *follow) onlyGonePods() bool {
+	for _, src := range f.scope.Sources {
+		if _, live := f.target.pods[src.Namespace+"/"+src.Name]; src.Kind != SourcePod || live {
+			return false
+		}
+	}
+	return true
 }
 
 // relay walks the streams each ping names and reconciles the streams on every event
@@ -515,9 +672,11 @@ func (f *follow) settle() bool {
 	return false
 }
 
-// sendLine sends rec as a line, and is false once ctx has ended.
-func sendLine(ctx context.Context, out chan<- FollowFrame, rec logline.Record) bool {
-	return send(ctx, out, FollowFrame{Type: FollowLine, Record: &rec})
+// sendLine sends rec, its message cut at the follow's cap, and is false once ctx
+// has ended.
+func (f *follow) sendLine(ctx context.Context, rec logline.Record) bool {
+	rec = capMessage(rec, f.maxMessage)
+	return send(ctx, f.out, FollowFrame{Record: &rec})
 }
 
 // send puts frame on out, and is false once ctx has ended.
@@ -538,15 +697,6 @@ func (f *follow) track(key logline.StreamKey) *tracked {
 		f.streams[key] = t
 	}
 	return t
-}
-
-// cursor is where a stream that joins the view starts: the last checkpoint, else
-// the follow's own start.
-func (f *follow) cursor() logline.Bound {
-	if f.checkpoint.At.IsZero() {
-		return f.since
-	}
-	return f.checkpoint
 }
 
 // attach holds st's tailer for tr, its row's, and tells endedHub once it ends.
@@ -615,7 +765,9 @@ func (f *follow) ended(ctx context.Context, h *handle) error {
 // server failed, is held for its backoff, and so is a clean end on a container the
 // view sees running, since a proxy or the API server can close an idle stream. Any
 // other end is the server's answer for this log: the stream is tailed again once the
-// view sees a later generation of it, and the view's end is judged again.
+// view sees a later generation of it, and the view's end is judged again. One that
+// ended on an error says so in a stream-skipped notice, once a generation, unless
+// the server only answered that its container is waiting to start.
 func (f *follow) failed(ctx context.Context, tr *tracked, err error) error {
 	ran := time.Duration(0)
 	if tr.h != nil {
@@ -636,6 +788,13 @@ func (f *follow) failed(ctx context.Context, tr *tracked, err error) error {
 	}
 	tr.ended, tr.endedAt, tr.refused = true, tr.st.gen, refused
 	f.rejudge = true
+	// A waiting container's log is still to come, so its refusal is no skip.
+	waiting := kind == kubelet.FailEnded && tr.st.gen.state == stateWaiting
+	if kind == kubelet.FailNone || waiting || tr.skipped == tr.st.gen {
+		return nil
+	}
+	tr.skipped = tr.st.gen
+	send(ctx, f.out, FollowFrame{Notice: &Notice{refusal.CodeStreamSkipped, skippedLine(tr.st.key, err)}}) // false is the follow ending, which the loop sees
 	return nil
 }
 
@@ -794,7 +953,7 @@ func (f *follow) reconcile(ctx context.Context) error {
 // another node replaced, while a restarted container's tailer runs on until its log
 // ends. A stream the view wants is tailed unless it is tailed already, held for its
 // backoff, or ended at the generation the view sees; one that joins starts at the
-// follow's cursor. An instance that has finished gets no tailer: its log never grows,
+// follow's start. An instance that has finished gets no tailer: its log never grows,
 // so it is walked to its end once. Then each stream just tailed is walked, and every
 // one when the bus's receiver was made anew for the streams the view wants. A view whose every stream has ended, none of them
 // waiting to start or held and no container of it starting, ends the follow; one
@@ -855,7 +1014,7 @@ func (f *follow) bring(ctx context.Context, t target) error {
 		}
 		if tr.row != rows[i].ID {
 			// A hold was the instance before's, whose end was its log's.
-			tr.row, tr.wm = rows[i].ID, logline.StreamPos(f.cursor(), st.run(), logline.Newer)
+			tr.row, tr.wm = rows[i].ID, f.start.keyFor(pageStream{row: rows[i]})
 			tr.held, tr.restarted, tr.filling = false, false, false
 		}
 		tr.st, tr.ended, tr.refused = st, false, ""
@@ -951,8 +1110,7 @@ func (f *follow) walkRows(ctx context.Context, rows []int64) error {
 }
 
 // walkStreams walks each of streams, one at a time, sends what they read in line
-// order, then a checkpoint, and walks again at once each that stopped with more to
-// read.
+// order, and walks again at once each that stopped with more to read.
 func (f *follow) walkStreams(ctx context.Context, streams []*tracked) error {
 	for len(streams) > 0 {
 		f.lines, f.bytes = followBatch, followBatchBytes
@@ -1032,9 +1190,9 @@ func (f *follow) walk(ctx context.Context, tr *tracked) (bool, error) {
 		if first < 0 {
 			return nil
 		}
-		// The follow may start past a hole no page carried: after the last line a
-		// page sent, or a checkpoint past the hole. A look its bytes cut keeps what
-		// the walk crossed.
+		// The follow may start past a hole no page carried: past the last line a
+		// page sent, or a moment past the hole. A look its bytes cut keeps what the
+		// walk crossed.
 		l := looker{
 			r: r, row: tr.row, cov: cov, committed: committed, held: held, keep: f.keep,
 			bytes: f.s.files.Retention().LookBytes,
@@ -1191,31 +1349,18 @@ func (f *follow) filledGap(ctx context.Context, d fillDone) error {
 	return nil
 }
 
-// flush sends the lines walked in line order, then, when it sent any, a
-// checkpoint naming the oldest watermark across the view. It is false once the
-// follow's context has ended.
+// flush sends the lines walked in line order. It is false once the follow's
+// context has ended.
 func (f *follow) flush(ctx context.Context) bool {
-	if len(f.batch) == 0 {
-		return true
-	}
 	slices.SortStableFunc(f.batch, logline.CompareLines)
 	for _, rec := range f.batch {
-		if !sendLine(ctx, f.out, rec) {
+		if !f.sendLine(ctx, rec) {
 			return false
 		}
 		f.streams[rec.Stream].drops = 0
 	}
 	f.batch = f.batch[:0]
-	var oldest logline.Bound
-	for _, key := range f.wanted {
-		tr := f.streams[key]
-		if b := logline.BoundOf(tr.st.run(), tr.wm); oldest.At.IsZero() || logline.CompareBounds(b, oldest) < 0 {
-			oldest = b
-		}
-	}
-	f.checkpoint = oldest
-	cursor := logline.CursorOfBound(oldest)
-	return send(ctx, f.out, FollowFrame{Type: FollowCheckpoint, Cursor: &cursor})
+	return true
 }
 
 // stopped is the ending of a follow whose every stream ended: the cluster's
@@ -1249,9 +1394,8 @@ func (f *follow) noteDeleted(frame cluster.ClusterCachedDataObjectWatchFrame) {
 func (f *follow) resolve(ctx context.Context) (target, bool, error) {
 	for {
 		t, err := resolve(ctx, f.s.clusters, f.id, f.live(), true)
-		var noNodes refusal.NoNodes
 		switch {
-		case errors.Is(err, ErrNoCache), errors.Is(err, ErrSyncing), errors.As(err, &noNodes):
+		case errors.Is(err, ErrNoCache), errors.Is(err, ErrSyncing), err == nil && t.noNodes != nil:
 			f.askAgain()
 			return target{}, false, nil
 		case err != nil:

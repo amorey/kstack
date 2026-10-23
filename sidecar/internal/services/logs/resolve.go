@@ -69,9 +69,9 @@ const (
 // source's state. pods is the UID of each Pod source's pod the mirror holds, by
 // "<ns>/<name>", whether or not it has a log to read, defaults its default container,
 // places where it runs now, and current the runtime id of each of its containers'
-// current instance, by "<ns>/<pod>/<container>". noNodes is a label filter a page
-// could not apply for want of nodes, which it answers only when the file holds
-// nothing of the view either. For a follow, starting is whether a container the view
+// current instance, by "<ns>/<pod>/<container>". noNodes is a label filter the
+// read could not apply for want of nodes, which a page or a follow answers only
+// when the file holds nothing of the view either. For a follow, starting is whether a container the view
 // reads has no log yet, which the follow waits for.
 type target struct {
 	cacheID   cluster.ClusterCacheID
@@ -145,8 +145,8 @@ func resolve(ctx context.Context, svc cluster.Service, id cluster.ClusterID, sco
 		streams, states, err := r.streamsOf(scope)
 		var noNodes refusal.NoNodes
 		var deferred error
-		if !follow && errors.As(err, &noNodes) {
-			// A page may still find the filter's place in the file's rows of a gone pod.
+		if errors.As(err, &noNodes) {
+			// The file's rows of a gone pod may still hold the filter's place.
 			deferred, err = err, nil
 		}
 		if err != nil {

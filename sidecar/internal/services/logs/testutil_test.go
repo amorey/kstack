@@ -803,7 +803,7 @@ func pages(t *testing.T, svc *Service, scope Scope, from PageFrom, size int) []F
 // for a newer page, back through each Prev for an older one.
 func pagesOn(t *testing.T, svc *Service, page FetchResponse, size int) []FetchResponse {
 	t.Helper()
-	newer := page.Request.PageFrom == PageFromFirst || page.Request.PageCursor != nil && cursorIn(t, page.Request.PageCursor).newer
+	newer := page.Request.PageFrom == PageFromFirst || page.Request.Cursor != nil && cursorIn(t, page.Request.Cursor).newer
 	out := []FetchResponse{page}
 	for range 100 {
 		c := page.Page.Prev
@@ -813,7 +813,7 @@ func pagesOn(t *testing.T, svc *Service, page FetchResponse, size int) []FetchRe
 		if c == nil {
 			return out
 		}
-		page = fetch(t, svc, FetchRequest{PageCursor: c, PageSize: size})
+		page = fetch(t, svc, FetchRequest{Cursor: c, PageSize: size})
 		out = append(out, page)
 	}
 	t.Fatal("the pages never end")
@@ -853,7 +853,7 @@ func until(d time.Duration) Window { return Window{Until: moment(d - time.Nanose
 // exclusive, size lines a page.
 func prevFrom(scope Scope, pod, container string, d time.Duration, size int) FetchRequest {
 	c := pageCursor{Scope: scope, resolvedWindow: resolvedWindow{ResolvedAt: at(time.Hour)}, at: lineAt(logline.StreamKey{Namespace: "prod", Pod: pod, Container: container}, d, 0)}
-	return FetchRequest{PageCursor: encoded(c), PageSize: size}
+	return FetchRequest{Cursor: encoded(c), PageSize: size}
 }
 
 // seenAt is Seen naming pod/container's first line at d past 10:00: what a read
@@ -965,4 +965,12 @@ func newLogServer() *logstest.Server {
 	s := logstest.New()
 	s.Refused = func(code int, message string) error { return &kubelet.StatusError{Code: code, Message: message} }
 	return s
+}
+
+// startAt is the start cursor of a follow of scope from the moment d past 10:00.
+func startAt(t *testing.T, scope Scope, d time.Duration) pageCursor {
+	t.Helper()
+	c, err := followStart(FollowRequest{Scope: scope, Since: moment(d)}, at(time.Hour))
+	require.NoError(t, err)
+	return c
 }

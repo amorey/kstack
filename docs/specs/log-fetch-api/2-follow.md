@@ -2,7 +2,7 @@
 
 **Package:** `services/logs` (paths relative to `sidecar/internal/`).
 **Prerequisites:** step 1.
-**Status:** Planned.
+**Status:** Built, in review.
 
 ## Goal
 
@@ -125,7 +125,8 @@ words stay as `follow.go` writes them. No code is added.
    callers, and each refuses it itself when nothing can satisfy the filter, a page with no
    stream as today and the follow's open with no file-only row to read. With rows, the follow
    sends them and then waits for nodes through its reconcile, which already waits on
-   `NoNodes`.
+   `NoNodes`, unless every source is a gone pod: no resolve judges a pod gone without nodes,
+   so that follow ends `no-nodes` once the rows are sent.
 5. **A follow takes a cursor's start and ignores its end.** The cursor's `Until`, `After` and
    counted sides say where a poll stops; a follow does not stop, so it reads them for nothing.
    A follow from a cursor delivers every line a poll of it would, at the same places, and then
@@ -149,7 +150,8 @@ words stay as `follow.go` writes them. No code is added.
    refusal (`FailDenied`), the server's answer for this log (`FailEnded`), and a second too loud
    to read (`FailLimit`). A held stream sends none, since it is read again; `errRowGone` is
    transient and holds, so it sends none. A container whose stream ended clean sends none, since
-   it finished. The notice is sent once per stream per generation: a stream tailed again at a
+   it finished. A container waiting to start sends none for `FailEnded`, since its log is still
+   to come. The notice is sent once per stream per generation: a stream tailed again at a
    later generation that fails again says so again.
    The engine's decisions about when a stream is held, ended or retried do not change. Only what
    was silent is said.
@@ -206,7 +208,8 @@ words stay as `follow.go` writes them. No code is added.
    ending the follow nor keeping it open once the later instance has stopped; a resolved
    stream's lines arriving once, from its tailer alone; the follow twin of
    `TestAGonePodIsFilteredWithNoNodesLeft`, a zone filter over a gone pod with no nodes left
-   delivering the cached rows then waiting, and the same with no cached row refused `no-nodes`;
+   delivering the cached rows then ending `no-nodes`, and the same with no cached row refused
+   `no-nodes`;
    a follow from a cursor over a scope whose one container is still starting, not ending at
    open.
 5. **`Seen` beside a page cursor on `Fetch`.** `checkRequest` stops refusing `Seen` on a

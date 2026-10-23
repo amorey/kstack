@@ -184,8 +184,8 @@ func TestANodeFilterNeedsNoNodeObject(t *testing.T) {
 	assert.Equal(t, "web-1", keysOf(got)[0].Pod)
 }
 
-// A label filter on a mirror with no nodes is refused, naming every label: by a
-// follow at once, and by a page once the file holds nothing the filter keeps.
+// A label filter on a mirror with no nodes is refused, naming every label, by a
+// page or a follow once the file holds nothing the filter keeps.
 func TestALabelFilterWithNoNodesIsRefused(t *testing.T) {
 	t.Parallel()
 	f := newMirror(t, webObjects()...)
@@ -195,12 +195,11 @@ func TestALabelFilterWithNoNodesIsRefused(t *testing.T) {
 	}
 	const refused = "Kstack cannot read this cluster's nodes, so it cannot filter by zone or arch"
 
-	_, err := resolve(t.Context(), f, "7", view, true)
-	assert.EqualError(t, err, refused)
-
-	got, err := resolveOf(t, f, view)
-	require.NoError(t, err, "a page looks in the file before it refuses")
-	assert.EqualError(t, got.noNodes, refused)
+	for _, follow := range []bool{false, true} {
+		got, err := resolve(t.Context(), f, "7", view, follow)
+		require.NoError(t, err, "a page and a follow look in the file before they refuse")
+		assert.EqualError(t, got.noNodes, refused)
+	}
 }
 
 // A pod whose node the mirror does not hold, while it holds others, is left out
