@@ -59,3 +59,127 @@ describe('MemoryPopoverContent', () => {
     expect(screen.getByRole('button', { name: 'Minikube' })).toHaveAttribute('aria-pressed', 'true');
   });
 });
+
+describe('MemoryInstructions', () => {
+  it('starts empty, with a prompt to add instructions', () => {
+    renderContent();
+    expect(screen.getByText('No instructions added')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Add instructions' })).toBeInTheDocument();
+  });
+
+  it('opens the editor on Add instructions, and saving shows the filled card', async () => {
+    const user = userEvent.setup();
+    renderContent();
+
+    await user.click(screen.getByRole('button', { name: 'Add instructions' }));
+    const textarea = screen.getByRole('textbox');
+    await user.type(textarea, 'Always use traefik.');
+    await user.click(screen.getByRole('button', { name: 'Save' }));
+
+    expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
+    expect(screen.getByText('Always use traefik.')).toBeInTheDocument();
+    // The memory cards' icon-only edit buttons share the same accessible name.
+    expect(screen.getByText('Edit')).toBeInTheDocument();
+  });
+
+  it('reopens the editor pre-filled on Edit', async () => {
+    const user = userEvent.setup();
+    renderContent();
+
+    await user.click(screen.getByRole('button', { name: 'Add instructions' }));
+    await user.type(screen.getByRole('textbox'), 'Always use traefik.');
+    await user.click(screen.getByRole('button', { name: 'Save' }));
+
+    await user.click(screen.getByText('Edit'));
+    expect(screen.getByRole('textbox')).toHaveValue('Always use traefik.');
+  });
+
+  it('discards the draft on Cancel, leaving the prior state unchanged', async () => {
+    const user = userEvent.setup();
+    renderContent();
+
+    await user.click(screen.getByRole('button', { name: 'Add instructions' }));
+    await user.type(screen.getByRole('textbox'), 'Never mind this.');
+    await user.click(screen.getByRole('button', { name: 'Cancel' }));
+
+    expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
+    expect(screen.getByText('No instructions added')).toBeInTheDocument();
+  });
+
+  it('Clear text only empties the draft, leaving the saved instructions until Save', async () => {
+    const user = userEvent.setup();
+    renderContent();
+
+    await user.click(screen.getByRole('button', { name: 'Add instructions' }));
+    await user.type(screen.getByRole('textbox'), 'Always use traefik.');
+    await user.click(screen.getByRole('button', { name: 'Save' }));
+
+    await user.click(screen.getByText('Edit'));
+    await user.click(screen.getByRole('button', { name: 'Clear text' }));
+    expect(screen.getByRole('textbox')).toHaveValue('');
+
+    await user.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(screen.getByText('Always use traefik.')).toBeInTheDocument();
+  });
+
+  it('commits an empty draft on Save, clearing the saved instructions', async () => {
+    const user = userEvent.setup();
+    renderContent();
+
+    await user.click(screen.getByRole('button', { name: 'Add instructions' }));
+    await user.type(screen.getByRole('textbox'), 'Always use traefik.');
+    await user.click(screen.getByRole('button', { name: 'Save' }));
+
+    await user.click(screen.getByText('Edit'));
+    await user.click(screen.getByRole('button', { name: 'Clear text' }));
+    await user.click(screen.getByRole('button', { name: 'Save' }));
+
+    expect(screen.queryByText('Always use traefik.')).not.toBeInTheDocument();
+    expect(screen.getByText('No instructions added')).toBeInTheDocument();
+  });
+
+  it('disables Save on an unchanged empty draft, and Clear text once already empty', async () => {
+    const user = userEvent.setup();
+    renderContent();
+
+    await user.click(screen.getByRole('button', { name: 'Add instructions' }));
+    expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Clear text' })).toBeDisabled();
+
+    await user.type(screen.getByRole('textbox'), 'Always use traefik.');
+    expect(screen.getByRole('button', { name: 'Save' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Clear text' })).toBeEnabled();
+  });
+
+  it('keeps instructions scoped to the cluster that saved them', async () => {
+    const user = userEvent.setup();
+    renderContent();
+
+    await user.click(screen.getByRole('button', { name: 'Add instructions' }));
+    await user.type(screen.getByRole('textbox'), 'Always use traefik.');
+    await user.click(screen.getByRole('button', { name: 'Save' }));
+
+    await user.click(screen.getByRole('button', { name: '2nd Cluster' }));
+    expect(screen.getByText('No instructions added')).toBeInTheDocument();
+    expect(screen.queryByText('Always use traefik.')).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: 'Back to Minikube' }));
+    expect(screen.getByText('Always use traefik.')).toBeInTheDocument();
+  });
+
+  it('discards an in-progress edit when the selected cluster changes', async () => {
+    const user = userEvent.setup();
+    renderContent();
+
+    await user.click(screen.getByRole('button', { name: 'Add instructions' }));
+    await user.type(screen.getByRole('textbox'), 'Half-typed...');
+
+    await user.click(screen.getByRole('button', { name: '2nd Cluster' }));
+    expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: 'Back to Minikube' }));
+    expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
+    expect(screen.queryByText('Half-typed...')).not.toBeInTheDocument();
+    expect(screen.getByText('No instructions added')).toBeInTheDocument();
+  });
+});

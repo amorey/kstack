@@ -67,7 +67,7 @@ export function MemoryRail({
   const clusters = [defaultCluster, ...OTHER_CLUSTERS];
 
   return (
-    <div className="flex h-full w-44 shrink-0 flex-col gap-2">
+    <div className="flex h-full w-[140px] shrink-0 flex-col gap-2">
       <div>
         {/* Clickable to expand/collapse, but — unlike a row below it — never takes
             the accent hover: it toggles the group, it doesn't select anything. */}
