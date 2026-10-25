@@ -41,7 +41,9 @@ describe('index.html boot mark', () => {
     expect(token(html, htmlSelector, 'color')).toBe(token(css, cssSelector, '--primary-foreground'));
   });
 
-  it('places the static mark inside #root, where the mount replaces it', () => {
-    expect(html).toMatch(/<div id="root"><div class="boot-mark" aria-hidden="true">K<\/div><\/div>/);
+  it('places the static mark and drag strip inside #root, where the mount replaces them', () => {
+    expect(html).toMatch(
+      /<div id="root"><div class="boot-drag" data-tauri-drag-region="deep"><\/div><div class="boot-mark" aria-hidden="true">K<\/div><\/div>/,
+    );
   });
 });

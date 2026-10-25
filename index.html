@@ -44,6 +44,12 @@
         background: #9f5436; /* --primary */
         color: #ffffff; /* --primary-foreground */
       }
+      /* ReadyGate's drag strip, so the window drags before the bundle paints. */
+      .boot-drag {
+        position: fixed;
+        inset: 0 0 auto;
+        height: 56px;
+      }
       .dark .boot-mark {
         background: #dec1b7; /* --primary */
         color: #331e16; /* --primary-foreground */
@@ -52,7 +58,7 @@
   </head>
 
   <body>
-    <div id="root"><div class="boot-mark" aria-hidden="true">K</div></div>
+    <div id="root"><div class="boot-drag" data-tauri-drag-region="deep"></div><div class="boot-mark" aria-hidden="true">K</div></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

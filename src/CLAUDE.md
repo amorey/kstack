@@ -23,7 +23,7 @@ The whole picture is [`docs/security-model.md`](../docs/security-model.md). What
 - Entry: `src/main.tsx` → `RouterProvider`. Routes in `src/routes/` (code-based, wired in `src/routeTree.ts`): `__root.tsx` mounts the provider stack; `_app.tsx` is a pathless layout rendering `AppLayout`; `chat.tsx` (`/chat`), `chat-id.tsx` (`/chat/$chatId`) and `dashboard.tsx` nest under it. `index.tsx` redirects to `DEFAULT_ROUTE`. **The chat id is a path param, not a search param** — `retainSearchParams` on `_app` would drag a search param into the dashboard. The Chat/Dashboard switch is the sidebar's `ModeNav` (router `Link`s).
 - **Layouts** (`src/layouts/`) are presentational shells rendering an `Outlet`. Secondary windows (log tail, exec) will get a sidebar-less layout under their own pathless route.
 - App-wide concerns live in `src/lib/`; reusable UI in `src/components/widgets/`.
-- **`ReadyGate` (`src/lib/ready-gate.tsx`) draws `AppMark`** at 48px, centred, in every state. `index.html` carries a static copy of the same mark inside `#root`, so first paint and React's first commit show the same thing in the same place — keep them matching.
+- **`ReadyGate` (`src/lib/ready-gate.tsx`) draws `AppMark`** at 48px, centred, in every state. `index.html` carries a static copy of the same mark inside `#root`, so first paint and React's first commit show the same thing in the same place — keep them matching. It also draws a 56px `data-tauri-drag-region` strip over its top edge, so the window drags before the app bar mounts; `index.html`'s static copy carries the same strip.
 
 ## Errors reach the host's log
 

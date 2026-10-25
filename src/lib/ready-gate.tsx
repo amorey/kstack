@@ -17,6 +17,10 @@
 // bind-wait and failures become stuck spinners instead of an explicit retry.
 // Every state draws the mark where index.html's static copy stood, so the mount
 // replaces one with the other and nothing moves.
+//
+// The app bar, the window's only title bar, mounts behind the gate, so the gate
+// draws its own drag strip. It overlays the top of the screen rather than taking
+// space from it, keeping the mark centred in the window.
 
 import { invoke } from '@tauri-apps/api/core';
 import { useCallback, useEffect, useState } from 'react';
@@ -25,6 +29,13 @@ import { Button } from '@kubetail/ui/elements/button';
 
 import { AppMark } from '@/components/widgets/app-mark';
 import { errorMessage, reportError } from '@/lib/error-bus';
+
+// Keeps the gate on screen in a dev build: `pending` never settles, `error` fails
+// as a start that timed out would. See docs/development-switches.md.
+async function devHold(hold: string | undefined) {
+  if (hold === 'pending') await new Promise(() => {});
+  if (hold === 'error') throw new Error('held by VITE_READY_GATE_HOLD');
+}
 
 type State = { status: 'pending' } | { status: 'ready' } | { status: 'error'; message: string };
 
@@ -36,6 +47,7 @@ export function ReadyGate({ children }: { children: React.ReactNode }) {
     let cancelled = false;
     (async () => {
       try {
+        if (import.meta.env.DEV) await devHold(import.meta.env.VITE_READY_GATE_HOLD);
         await invoke('ready');
         if (!cancelled) setState({ status: 'ready' });
       } catch (e) {
@@ -62,8 +74,10 @@ export function ReadyGate({ children }: { children: React.ReactNode }) {
       role="status"
       aria-live="polite"
       aria-busy={state.status === 'pending'}
-      className="flex min-h-(--app-min-h) flex-col items-center justify-center gap-3 bg-background p-6 text-sm"
+      className="relative flex min-h-(--app-min-h) flex-col items-center justify-center gap-3 bg-background p-6 text-sm"
     >
+      {/* The app bar's 56px, so the macOS traffic lights sit in it */}
+      <div data-testid="drag-strip" data-tauri-drag-region="deep" className="absolute inset-x-0 top-0 h-14" />
       <AppMark size={48} />
       {state.status === 'pending' ? (
         <span className="sr-only">Starting…</span>
