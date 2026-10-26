@@ -912,10 +912,7 @@ risk stays distinguishable from an unnoticed one, and is not repeated here.
   it — a notice with a brake, and it should say so — or it evicts, which contradicts a standing ADR
   and needs a new one first.
 
-- **R-08 — a release cannot be verified, and the pipeline making it is loose (medium; release owner).** Four gaps, all in `.github/`. Third-party actions float on tags, and
-  `dtolnay/rust-toolchain@master` floats on a *branch* in the job that builds what we ship — pin each
-  to a SHA with the version in a trailing comment, and add `.github/dependabot.yml` so the pins still
-  move. `release.yml` grants `contents: write` and `deployments: write` at the top, so every job runs
+- **R-08 — a release cannot be verified, and the pipeline making it is loose (medium; release owner).** Three gaps, all in `.github/`. `release.yml` grants `contents: write` and `deployments: write` at the top, so every job runs
   with the token that can publish; drop to `permissions: {}` and give only the final job what it
   needs (nothing creates a deployment, so that grant just goes). Audits run only on pull requests, so
   an advisory filed against a quiet `main` waits for whoever opens the next one — add a daily

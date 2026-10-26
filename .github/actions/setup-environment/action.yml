@@ -74,7 +74,7 @@ runs:
 
     - name: Set up Protoc
       if: inputs.setup-protoc == 'true'
-      uses: arduino/setup-protoc@v3
+      uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
 
     - name: Install Tauri Linux system dependencies
       if: inputs.setup-rust == 'true' && runner.os == 'Linux'
@@ -96,11 +96,11 @@ runs:
       shell: bash
       run: sed -n 's/^channel = "\(.*\)"/channel=\1/p' src-tauri/rust-toolchain.toml >> "$GITHUB_OUTPUT"
 
-    # `@master` is the ref that accepts an explicit toolchain; `components`
-    # mirrors rust-toolchain.toml, which is the pin devs get.
+    # `v1` takes the toolchain as an input; `components` mirrors
+    # rust-toolchain.toml, which is the pin devs get.
     - name: Set up Rust
       if: inputs.setup-rust == 'true'
-      uses: dtolnay/rust-toolchain@master
+      uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
       with:
         toolchain: ${{ steps.rust-toolchain.outputs.channel }}
         components: rustfmt, clippy
@@ -125,7 +125,7 @@ runs:
     # The caller decides whether to save; ci.yml's CACHE_MODE saves on main.
     - name: Set up Rust cache
       if: inputs.setup-rust == 'true' && inputs.rust-cache-key != ''
-      uses: Swatinem/rust-cache@v2
+      uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       with:
         workspaces: "./src-tauri"
         shared-key: ${{ inputs.rust-cache-key }}
@@ -134,11 +134,11 @@ runs:
 
     - name: Set up PNPM
       if: inputs.setup-node == 'true'
-      uses: pnpm/action-setup@v6
+      uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
 
     - name: Set up Node.js
       if: inputs.setup-node == 'true'
-      uses: actions/setup-node@v6
+      uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
       with:
         node-version: ${{ inputs.node-version }}
         cache: 'pnpm'
@@ -146,7 +146,7 @@ runs:
 
     - name: Set up Go
       if: inputs.setup-go == 'true'
-      uses: actions/setup-go@v6
+      uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
       with:
         go-version: ${{ inputs.go-version }}
         cache: false
@@ -176,7 +176,7 @@ runs:
       if: >-
         inputs.setup-go == 'true' && inputs.go-cache-key != ''
         && inputs.go-cache-mode != 'rebuild'
-      uses: actions/cache/restore@v6
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ${{ steps.go-cache-paths.outputs.path }}
         # Never matches, so restore-keys finds the newest cache.
