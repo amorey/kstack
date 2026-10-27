@@ -1,0 +1,375 @@
+// Copyright 2026 The Kstack Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// One scope's saved memories: each row edits in place from its menu, and
+// checking any row swaps the heading for a bulk bar. Every delete confirms. A
+// memory may have been written by the model from cluster data, so every field is
+// drawn as text, never as markdown.
+import { Fragment, useState } from 'react';
+
+import { Checkbox as CheckboxPrimitive } from '@base-ui/react/checkbox';
+import { Check, Minus, MoreHorizontal } from 'lucide-react';
+
+import { Button } from '@kubetail/ui/elements/button';
+import { Checkbox } from '@kubetail/ui/elements/checkbox';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@kubetail/ui/elements/dropdown-menu';
+import { Input } from '@kubetail/ui/elements/input';
+import { Separator } from '@kubetail/ui/elements/separator';
+import { Textarea } from '@kubetail/ui/elements/textarea';
+import { cn } from '@kubetail/ui/lib/utils';
+
+import { Dialog } from '@/components/widgets/dialog';
+import type { Memory } from '@/lib/memories';
+import { BODY_RULE, NAME_RULE, bodyFits, nameFits } from './writes';
+
+function Provenance({ memory }: { memory: Memory }) {
+  return (
+    <div className="flex items-center gap-2 text-xs text-muted-foreground">
+      <span className="font-medium break-all">{memory.name}</span>
+      <span className="shrink-0">
+        {memory.writtenBy === 'User' ? 'by you' : 'by Kstack'} · {new Date(memory.updatedAt).toLocaleDateString()}
+      </span>
+    </div>
+  );
+}
+
+// Edits one memory's body, or writes a new memory when there is none. The draft
+// is fixed when it opens, so a change arriving meanwhile never replaces what the
+// user is saving. A refused save keeps the draft and says why.
+function MemoryEditor({
+  memory,
+  onSave,
+  onCancel,
+}: {
+  memory?: Memory;
+  onSave: (name: string, body: string) => Promise<string | null>;
+  onCancel: () => void;
+}) {
+  const [name, setName] = useState(memory?.name ?? '');
+  const [draft, setDraft] = useState(memory?.body ?? '');
+  const [saving, setSaving] = useState(false);
+  const [refusal, setRefusal] = useState('');
+  const body = draft.trim();
+  const nameBroken = name !== '' && !nameFits(name);
+  const bodyBroken = !bodyFits(body);
+  const ready = name !== '' && body !== '' && !nameBroken && !bodyBroken;
+
+  const save = async () => {
+    setSaving(true);
+    setRefusal('');
+    const refused = await onSave(name, body);
+    if (refused) {
+      setRefusal(refused);
+      setSaving(false);
+    }
+  };
+
+  return (
+    <fieldset disabled={saving} className="flex flex-col gap-1.5 pt-0.5 pb-1">
+      {!memory && (
+        <>
+          <Input
+            aria-label="Name"
+            placeholder="name"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            className="h-8 font-mono text-xs"
+            autoFocus
+          />
+          {nameBroken && <p className="text-xs text-destructive">{NAME_RULE}</p>}
+        </>
+      )}
+      <Textarea
+        aria-label="Body"
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        className="h-14 resize-y text-xs"
+        autoFocus={!!memory}
+      />
+      {bodyBroken && <p className="text-xs text-destructive">{BODY_RULE}</p>}
+      {memory && <Provenance memory={memory} />}
+      {memory?.writtenBy === 'Model' && (
+        <p className="text-xs text-muted-foreground">Saving makes this your memory: Kstack will follow it.</p>
+      )}
+      {refusal !== '' && <p className="text-xs text-destructive">{refusal}</p>}
+      <div className="flex justify-end gap-1.5">
+        <Button variant="ghost" size="xs" className="h-7 px-3" onClick={onCancel}>
+          Cancel
+        </Button>
+        <Button size="xs" className="h-7 px-3" disabled={!ready} onClick={save}>
+          Save
+        </Button>
+      </div>
+    </fieldset>
+  );
+}
+
+function Row({
+  memory,
+  selecting,
+  selected,
+  onToggle,
+  onEdit,
+  onDelete,
+}: {
+  memory: Memory;
+  selecting: boolean;
+  selected: boolean;
+  onToggle: () => void;
+  onEdit: () => void;
+  onDelete: () => void;
+}) {
+  // The open menu holds the row's hover look: the cursor leaves the row for
+  // the menu, and a plain :hover would drop the trigger from under it.
+  const [menuOpen, setMenuOpen] = useState(false);
+  const revealed = selecting || menuOpen;
+  // The actions trigger stays in the tab order, hidden by opacity alone, so a
+  // keyboard reaches every row; focus inside the row shows the checkbox too.
+  const checkbox = revealed ? 'flex' : 'hidden group-hover/row:flex group-focus-within/row:flex';
+  const trigger = revealed ? '' : 'opacity-0 group-hover/row:opacity-100 group-focus-within/row:opacity-100';
+
+  return (
+    <div
+      className={cn(
+        'group/row flex items-start gap-2 rounded-xl py-3',
+        // Selecting indents every row the same, checked or not, so the checkbox
+        // column lines up; outside it the fill and inset come on hover or focus.
+        selecting
+          ? 'px-1.5 hover:bg-secondary focus-within:bg-secondary'
+          : 'hover:bg-secondary hover:px-1.5 focus-within:bg-secondary focus-within:px-1.5',
+        selected && 'bg-card hover:bg-card focus-within:bg-card',
+        menuOpen && !selected && 'bg-secondary px-1.5',
+      )}
+    >
+      <Checkbox checked={selected} onCheckedChange={onToggle} className={cn('mt-0.5', checkbox)} />
+      <div className="flex min-w-0 flex-1 flex-col gap-1">
+        <p className="text-sm break-words whitespace-pre-wrap text-card-foreground">{memory.body}</p>
+        <Provenance memory={memory} />
+      </div>
+      <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
+        <DropdownMenuTrigger
+          render={<Button variant="ghost" size="icon-xs" className={cn('text-muted-foreground', trigger)} />}
+          aria-label={`Actions for ${memory.name}`}
+        >
+          <MoreHorizontal aria-hidden />
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="end" sideOffset={4}>
+          <DropdownMenuItem onClick={onEdit}>Edit</DropdownMenuItem>
+          <DropdownMenuItem variant="destructive" onClick={onDelete}>
+            Delete
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
+    </div>
+  );
+}
+
+// The library's `Checkbox` draws a check mark in every state, so the select-all
+// control, which must show a dash while partly selected, draws its own.
+function SelectAllCheckbox({ selected, total, onToggle }: { selected: number; total: number; onToggle: () => void }) {
+  const all = selected === total;
+  return (
+    <CheckboxPrimitive.Root
+      checked={all}
+      indeterminate={!all}
+      onCheckedChange={onToggle}
+      className="mt-0.5 flex size-4 shrink-0 items-center justify-center rounded-[4px] border border-input bg-background outline-none focus-visible:ring-3 focus-visible:ring-ring/50 data-checked:border-primary data-checked:bg-primary data-checked:text-primary-foreground data-indeterminate:border-primary data-indeterminate:bg-primary data-indeterminate:text-primary-foreground"
+    >
+      <CheckboxPrimitive.Indicator className="grid place-content-center [&>svg]:size-3.5">
+        {all ? <Check /> : <Minus />}
+      </CheckboxPrimitive.Indicator>
+    </CheckboxPrimitive.Root>
+  );
+}
+
+function BulkBar({
+  selected,
+  total,
+  onToggleAll,
+  onCancel,
+  onDelete,
+}: {
+  selected: number;
+  total: number;
+  onToggleAll: () => void;
+  onCancel: () => void;
+  onDelete: () => void;
+}) {
+  return (
+    <div className="flex items-center justify-between px-1.5">
+      <div className="flex items-start gap-2.5">
+        <SelectAllCheckbox selected={selected} total={total} onToggle={onToggleAll} />
+        <div className="flex flex-col text-xs leading-4">
+          <span className="font-medium">{selected} selected</span>
+          <span className="text-muted-foreground">{total} memories in total</span>
+        </div>
+      </div>
+      <div className="flex items-center gap-1">
+        <Button variant="ghost" size="xs" className="h-7" onClick={onCancel}>
+          Cancel
+        </Button>
+        <Button variant="destructive" size="xs" className="h-7" onClick={onDelete}>
+          Delete ({selected})
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+const plural = (n: number) => (n === 1 ? 'memory' : 'memories');
+
+export function MemoryList({
+  scope,
+  memories,
+  adding,
+  onSave,
+  onAddDone,
+  onDelete,
+}: {
+  // Where the memories live, as the delete confirm names it.
+  scope: string;
+  memories: Memory[];
+  // Whether the new-memory editor is open.
+  adding: boolean;
+  // Resolves to why the sidecar refused, or null once saved; no memory adds one.
+  onSave: (memory: Memory | undefined, name: string, body: string) => Promise<string | null>;
+  onAddDone: () => void;
+  // Resolves to the ids still there.
+  onDelete: (ids: string[]) => Promise<string[]>;
+}) {
+  const [checkedIds, setCheckedIds] = useState<Set<string>>(new Set());
+  // The watch can drop a checked row, so only rows still listed count.
+  const selectedIds = new Set(memories.filter((m) => checkedIds.has(m.id)).map((m) => m.id));
+  // One row edits at a time; starting another discards the first's draft.
+  const [editingId, setEditingId] = useState<string | null>(null);
+  // The ids a confirm is open for: one row's, or the whole selection.
+  const [deleting, setDeleting] = useState<string[] | null>(null);
+  const [deleteFailed, setDeleteFailed] = useState(false);
+  const selecting = selectedIds.size > 0;
+
+  const toggle = (id: string) =>
+    setCheckedIds((prev) => {
+      const next = new Set(prev);
+      if (!next.delete(id)) next.add(id);
+      return next;
+    });
+
+  const toggleAll = () =>
+    setCheckedIds(selectedIds.size === memories.length ? new Set() : new Set(memories.map((m) => m.id)));
+
+  const closeConfirm = () => {
+    setDeleting(null);
+    setDeleteFailed(false);
+  };
+
+  // A delete that partly fails keeps the confirm open on what is left, so a
+  // retry asks only for those.
+  const confirmDelete = async () => {
+    if (!deleting) return;
+    setDeleteFailed(false);
+    const left = await onDelete(deleting);
+    setCheckedIds((prev) => new Set([...prev].filter((id) => !deleting.includes(id) || left.includes(id))));
+    if (left.length > 0) {
+      setDeleting(left);
+      setDeleteFailed(true);
+      return;
+    }
+    closeConfirm();
+  };
+
+  const count = deleting?.length ?? 0;
+
+  return (
+    <div className="flex min-h-0 flex-1 flex-col gap-0.5">
+      {selecting ? (
+        <BulkBar
+          selected={selectedIds.size}
+          total={memories.length}
+          onToggleAll={toggleAll}
+          onCancel={() => setCheckedIds(new Set())}
+          onDelete={() => setDeleting([...selectedIds])}
+        />
+      ) : (
+        <p className="text-xs font-medium text-muted-foreground">SAVED MEMORIES</p>
+      )}
+      {/* The inset is the list's, not each row's, so an editor's focus ring is
+          not clipped by the scroller. */}
+      <div className={cn('flex min-h-0 flex-1 flex-col overflow-y-auto pr-3 pl-1', selecting && 'gap-0.5')}>
+        {adding && (
+          <MemoryEditor
+            onSave={async (name, body) => {
+              const refused = await onSave(undefined, name, body);
+              if (!refused) onAddDone();
+              return refused;
+            }}
+            onCancel={onAddDone}
+          />
+        )}
+        {memories.length === 0 && !adding && (
+          <p className="py-2 text-xs text-muted-foreground">No saved memories yet.</p>
+        )}
+        {memories.map((memory, i) => (
+          <Fragment key={memory.id}>
+            {!selecting && i > 0 && <Separator className="mx-3 w-auto" />}
+            {editingId === memory.id ? (
+              <MemoryEditor
+                memory={memory}
+                onSave={async (name, body) => {
+                  const refused = await onSave(memory, name, body);
+                  if (!refused) setEditingId(null);
+                  return refused;
+                }}
+                onCancel={() => setEditingId(null)}
+              />
+            ) : (
+              <Row
+                memory={memory}
+                selecting={selecting}
+                selected={selectedIds.has(memory.id)}
+                onToggle={() => toggle(memory.id)}
+                onEdit={() => setEditingId(memory.id)}
+                onDelete={() => setDeleting([memory.id])}
+              />
+            )}
+          </Fragment>
+        ))}
+      </div>
+      <Dialog
+        open={deleting !== null}
+        onOpenChange={(open) => !open && closeConfirm()}
+        title={`Delete ${count} ${plural(count)}?`}
+        description={`The ${count} selected ${plural(count)} will be permanently deleted from ${scope}. This cannot be undone.`}
+      >
+        {deleteFailed && (
+          <p className="text-sm text-destructive">
+            {count} {plural(count)} could not be deleted.
+          </p>
+        )}
+        <div className="flex justify-end gap-2">
+          <Button variant="outline" onClick={closeConfirm}>
+            Cancel
+          </Button>
+          <Button variant="destructive" onClick={confirmDelete}>
+            Delete {count} {plural(count)}
+          </Button>
+        </div>
+      </Dialog>
+    </div>
+  );
+}

@@ -25,7 +25,7 @@ const { useActiveKubeContextMock, setContext, openDialog } = vi.hoisted(() => ({
   openDialog: vi.fn(),
 }));
 vi.mock('@/lib/active-kube-context', () => ({ useActiveKubeContext: useActiveKubeContextMock }));
-vi.mock('@/lib/dialog', () => ({ useDialog: () => ({ openDialog }) }));
+vi.mock('@/lib/dialog', () => ({ useDialog: () => ({ openDialog }), useDialogHost: () => null }));
 
 // The focused log view, which a switch clears.
 const { clearView } = vi.hoisted(() => ({ clearView: vi.fn() }));
@@ -41,6 +41,8 @@ const { memoriesState } = vi.hoisted(() => ({
   },
 }));
 vi.mock('@/lib/active-cluster', () => ({ useActiveCluster: () => ({ clusterID: 'c1' }) }));
+vi.mock('@/lib/clusters', () => ({ useClusters: () => ({ clusters: [] }) }));
+vi.mock('urql', () => ({ useMutation: () => [{}, vi.fn()] }));
 vi.mock('@/lib/memories', async () => {
   const { useSyncExternalStore } = await import('react');
   const subscribe = (listener: () => void) => {
@@ -121,12 +123,12 @@ describe('ContextOmnibox', () => {
     expect(clusterSegment()).toHaveTextContent('staging');
   });
 
-  it('opens the memory dialog from the brain icon', async () => {
+  it('opens the memory popover from the brain icon', async () => {
     const user = userEvent.setup();
     render(<ContextOmnibox />);
 
     await user.click(screen.getByRole('button', { name: 'Memory' }));
-    expect(openDialog).toHaveBeenCalledWith('memories');
+    expect(screen.getByText('Memory', { selector: 'p' })).toBeInTheDocument();
   });
 
   it('lights the brain icon while the cluster sees any memory', () => {

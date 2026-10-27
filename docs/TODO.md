@@ -703,10 +703,10 @@ Pending work across the three parts of the app. Grouped by area; detailed items 
 - **The memory button streams every memory to pulse on a save.** `MemoryButton`
   (`context-omnibox.tsx`) needs two facts: whether the cluster sees any memory, and when one is
   saved. It reads both off `useMemories`, so every webview holds the full `memoriesWatch` stream,
-  names and bodies included, whether or not the memory dialog is open. That is cheap today: each
+  names and bodies included, whether or not the memory popover is open. That is cheap today: each
   scope is capped at `ScopeBudget` (4 KiB), so a webview's snapshot is about 8 KiB and a save one
   memory. **Explore:** a gauge carrying only a count and a save counter for the cluster and every
-  cluster, read by a hook of its own, with the full watch opened by the dialog alone. **Weigh:** the
+  cluster, read by a hook of its own, with the full watch opened by the popover alone. **Weigh:** the
   gauge must stay current through deletes and moves between scopes, a second notion of "a save" in
   the sidecar beside the watch's own diff, and a second subscription while the dialog is open.
   **Trigger:** `ScopeBudget` or `BodyMax` growing enough that the stream's size shows.

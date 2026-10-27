@@ -15,8 +15,8 @@
 // The app bar's context omnibox — the address bar of the cluster surface: the
 // cluster dialog and the cluster in view. The cluster is the window's one scope, and
 // the segment is a quick switch over the same state the clusters dialog writes.
-import type { ReactNode } from 'react';
-import { useState } from 'react';
+import type { ReactNode, RefObject } from 'react';
+import { useRef, useState } from 'react';
 
 import { useLocation, useNavigate } from '@tanstack/react-router';
 import { Boxes, Brain, ChevronDown } from 'lucide-react';
@@ -33,6 +33,7 @@ import { Spinner } from '@kubetail/ui/elements/spinner';
 import { cn } from '@kubetail/ui/lib/utils';
 
 import { APP_BAR_CONTROL_CLASS, APP_BAR_HOVER_CLASS } from '@/components/widgets/app-bar-button';
+import { MemoryPopover } from '@/components/widgets/memory';
 
 import { useActiveCluster } from '@/lib/active-cluster';
 import { useActiveKubeContext } from '@/lib/active-kube-context';
@@ -171,8 +172,9 @@ function ClusterSegment() {
 // pulsing once per save: a primary copy of the brain drawn over the base for one
 // run of `--animate-memory-save-pulse` (index.css). Saves that land during a
 // pulse join it rather than restarting it.
-function MemoryButton() {
-  const { openDialog } = useDialog();
+// `anchorRef` is the omnibox's own container — the popover centers and sizes on
+// it, not on this button, which is narrower.
+function MemoryButton({ anchorRef }: { anchorRef: RefObject<HTMLElement | null> }) {
   const { clusterID } = useActiveCluster();
   const { memories, lastSaved } = useMemories(clusterID);
   const lit = memories.length > 0;
@@ -180,36 +182,39 @@ function MemoryButton() {
   const pulsing = lastSaved !== undefined && lastSaved !== pulsed;
 
   return (
-    <Button
-      variant="ghost"
-      size="icon-sm"
-      aria-label="Memory"
-      data-lit={lit}
-      onClick={() => openDialog('memories')}
-      className={cn(
-        'relative size-8 rounded-full',
-        lit ? 'text-primary' : 'text-muted-foreground',
-        APP_BAR_HOVER_CLASS,
-      )}
-    >
-      <Brain aria-hidden />
-      {pulsing && (
-        <Brain
-          aria-hidden
-          data-testid="memory-save-pulse"
-          className="absolute inset-0 m-auto animate-memory-save-pulse text-primary motion-reduce:animate-memory-save-fade"
-          onAnimationEnd={() => setPulsed(lastSaved)}
-        />
-      )}
-    </Button>
+    <MemoryPopover anchorRef={anchorRef}>
+      <Button
+        variant="ghost"
+        size="icon-sm"
+        aria-label="Memory"
+        data-lit={lit}
+        className={cn(
+          'relative size-8 rounded-full',
+          lit ? 'text-primary' : 'text-muted-foreground',
+          APP_BAR_HOVER_CLASS,
+        )}
+      >
+        <Brain aria-hidden />
+        {pulsing && (
+          <Brain
+            aria-hidden
+            data-testid="memory-save-pulse"
+            className="absolute inset-0 m-auto animate-memory-save-pulse text-primary motion-reduce:animate-memory-save-fade"
+            onAnimationEnd={() => setPulsed(lastSaved)}
+          />
+        )}
+      </Button>
+    </MemoryPopover>
   );
 }
 
 export function ContextOmnibox() {
   const { openDialog } = useDialog();
+  const containerRef = useRef<HTMLDivElement>(null);
 
   return (
     <div
+      ref={containerRef}
       data-testid="context-omnibox"
       // Opts out of the app bar's drag region: this is a control, and pressing
       // its padding should no more move the window than a browser's address bar.
@@ -236,7 +241,7 @@ export function ContextOmnibox() {
       </div>
       {/* The same size as the clusters button, so the segment centers on the
           omnibox rather than on the space left beside it. */}
-      <MemoryButton />
+      <MemoryButton anchorRef={containerRef} />
     </div>
   );
 }

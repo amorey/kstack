@@ -20,14 +20,12 @@
 import type { ComponentType } from 'react';
 
 import { ClusterSyncPanel } from '@/components/widgets/cluster-sync-panel';
-import { MemoryDialog } from '@/components/widgets/memory-dialog';
 import { SettingsDialog } from '@/components/widgets/settings-dialog';
 import { useDialog, type AppDialogProps, type DialogId } from '@/lib/dialog';
 
 // Partial: a `DialogId` may be reserved before its dialog is built.
 const DIALOGS: Partial<Record<DialogId, ComponentType<AppDialogProps>>> = {
   clusters: ClusterSyncPanel,
-  memories: MemoryDialog,
   settings: SettingsDialog,
 };
 

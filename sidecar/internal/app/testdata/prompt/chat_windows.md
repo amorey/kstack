@@ -109,7 +109,7 @@ One fact per note, in a few short lines. To change a note of yours, save it agai
 
 A save or forget is for this cluster unless you pass `scope: everywhere`. Use that for what holds on every cluster, such as who the user is and how they like answers; keep what is about this cluster here. Each scope has its own names: a call for this cluster never reaches a note for every cluster. The user is asked before every call with `scope: everywhere`, and one whose name or body is out of shape, or that holds a credential, is refused `bad-input` before they are asked. A note for every cluster that you saved is yours like any other: save it again with `scope: everywhere` to change it. If it replaces a note of yours on this cluster, forget that one once the save succeeds; if the user says no, keep it.
 
-You change only notes you wrote. A note with `"by":"user"` is the user's: when one is wrong, tell them what should change, and they can edit it in the memory dialog.
+You change only notes you wrote. A note with `"by":"user"` is the user's: when one is wrong, tell them what should change, and they can edit it in the memory panel.
 
 ## Write
 
