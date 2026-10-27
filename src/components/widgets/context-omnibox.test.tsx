@@ -25,7 +25,7 @@ const { useActiveKubeContextMock, setContext, openDialog } = vi.hoisted(() => ({
   openDialog: vi.fn(),
 }));
 vi.mock('@/lib/active-kube-context', () => ({ useActiveKubeContext: useActiveKubeContextMock }));
-vi.mock('@/lib/dialog', () => ({ useDialog: () => ({ openDialog }) }));
+vi.mock('@/lib/dialog', () => ({ useDialog: () => ({ openDialog }), useDialogHost: () => null }));
 
 // The focused log view, which a switch clears.
 const { clearView } = vi.hoisted(() => ({ clearView: vi.fn() }));
