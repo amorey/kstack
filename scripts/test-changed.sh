@@ -5,12 +5,14 @@
 #
 #   JS    vitest's `related`, which follows imports, so a hook's change runs the
 #         tests of the components using it. A change to the toolchain runs it all.
-#   Go    the changed packages. A change to go.mod or go.sum runs it all.
+#   Go    the changed packages. A change to go.mod or go.sum runs it all. Any
+#         change under tools/ runs its tests.
 #   Rust  the whole suite, and only when src-tauri/ or proto/ changed: it builds
 #         the sidecar first, and is the slowest of the three.
 #
 # BASE names the branch to diff against. It defaults to upstream/main when there
 # is an upstream remote, since a fork's origin/main can lag, else origin/main.
+# tools/coverchanged's resolveBase follows the same rule; keep them in step.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -51,6 +53,10 @@ else
     # shellcheck disable=SC2086 # one argument per package
     (cd sidecar && go test $go_pkgs)
   fi
+fi
+
+if has '^tools/'; then
+  (cd tools && go test ./...)
 fi
 
 if has '^(src-tauri|proto)/'; then

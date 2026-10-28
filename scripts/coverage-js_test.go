@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -92,5 +93,15 @@ coverage over 3 runs: min 99.000%, median 99.333%, max 100.000%
 func TestSpreadFailsWithNoSummary(t *testing.T) {
 	if err := spread(nil, io.Discard); err == nil {
 		t.Fatal("spread of no summaries succeeded")
+	}
+}
+
+func TestVitestWritesAnLcovOnlyWhenAsked(t *testing.T) {
+	const lcov = "--coverage.reporter=lcovonly"
+	if args := vitestArgs(false); slices.Contains(args, lcov) {
+		t.Errorf("vitestArgs(false) = %v, want no lcov reporter", args)
+	}
+	if args := vitestArgs(true); !slices.Contains(args, lcov) {
+		t.Errorf("vitestArgs(true) = %v, want the lcov reporter", args)
 	}
 }

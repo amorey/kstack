@@ -5,7 +5,7 @@
 `.github/workflows/coverage-spread.yml`.
 **Prerequisites:** step 1's PR 1 (#495) on `wip/coverage-gates`: `scripts/coverage-js.go` and
 `coverage-spread.yml`. Nothing on `main`.
-**Status:** Planned.
+**Status:** In review.
 **Pull request:** into `wip/coverage-gates`. Ref #97.
 
 ## Goal
@@ -31,7 +31,7 @@ and the recipe is:
 
 ```make
 cover-changed:
-	cd tools && go run ./coverchanged $(ARGS)
+	@cd tools && go run ./coverchanged $(ARGS)
 ```
 
 The command works from the repository root (`git rev-parse --show-toplevel`), wherever it is
@@ -40,10 +40,11 @@ started.
 Files: `main.go` (flags, measure, print), `diff.go` (the changed lines), `goprofile.go`,
 `lcov.go`, each with a `_test.go`. Step 3A adds `ignore.go`.
 
-`goprofile.go` reimplements what it needs of `sidecar/scripts/coverage.go`'s parsing and union:
-that file is a build-ignored `main` package in another module, so `tools/` cannot import it.
-The union keeps `coverage.go`'s check that the darwin and windows profiles add statements
-outside Linux, which catches a swapped or duplicated profile.
+`goprofile.go` parses with `golang.org/x/tools/cover`, which the module already holds through
+`staticcheck`, and unions as `sidecar/scripts/coverage.go` does: that file is a build-ignored
+`main` package in another module, so `tools/` cannot import it. The union keeps `coverage.go`'s
+check that the darwin and windows profiles add statements outside Linux, which catches a swapped
+or duplicated profile.
 
 ## The changed lines
 

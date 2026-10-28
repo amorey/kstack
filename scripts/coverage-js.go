@@ -7,6 +7,7 @@
 //	go run scripts/coverage-js.go                    # gate (make cover-js)
 //	go run scripts/coverage-js.go -nogate            # measure, do not gate
 //	go run scripts/coverage-js.go -summary p         # also copy the summary to p
+//	go run scripts/coverage-js.go -lcov p            # also write an lcov to p
 //	go run scripts/coverage-js.go -spread s1 s2 ...  # how summaries vary, run no tests
 //
 // The build tag keeps this file out of every build; `go run` takes the path
@@ -27,11 +28,15 @@ import (
 	"strings"
 )
 
-const summaryPath = "coverage/coverage-summary.json"
+const (
+	summaryPath = "coverage/coverage-summary.json"
+	lcovPath    = "coverage/lcov.info"
+)
 
 func main() {
 	nogate := flag.Bool("nogate", false, "measure and do not gate")
 	summary := flag.String("summary", "", "copy the coverage summary to `path`")
+	lcov := flag.String("lcov", "", "write an lcov of every line to `path`, for make cover-changed")
 	spreadRuns := flag.Bool("spread", false, "report how the summaries given as arguments vary, run no tests")
 	flag.Parse()
 
@@ -44,7 +49,7 @@ func main() {
 		flag.Usage()
 		os.Exit(2)
 	default:
-		err = measure(*nogate, *summary)
+		err = measure(*nogate, *summary, *lcov)
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -53,24 +58,21 @@ func main() {
 }
 
 // measure runs the suite and gates on scripts/coverage-threshold unless nogate.
-// A non-empty copyTo gets a copy of the summary.
-func measure(nogate bool, copyTo string) error {
+// A non-empty summaryTo gets a copy of the summary, and lcovTo an lcov. Both
+// are copied before the gate, so a run below the threshold still hands them over.
+func measure(nogate bool, summaryTo, lcovTo string) error {
 	// Through node, not pnpm: pnpm is a .cmd shim on Windows and a script with
 	// no shebang in some installs, and exec runs neither reliably.
-	cmd := exec.Command("node", filepath.Join("node_modules", "vitest", "vitest.mjs"), "run", "--coverage",
-		"--coverage.reporter=text", "--coverage.reporter=json-summary")
+	cmd := exec.Command("node", vitestArgs(lcovTo != "")...)
 	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("vitest: %w", err)
 	}
-	if copyTo != "" {
-		raw, err := os.ReadFile(summaryPath)
-		if err != nil {
-			return err
-		}
-		if err := os.WriteFile(copyTo, raw, 0o644); err != nil {
-			return err
-		}
+	if err := copyIfSet(summaryPath, summaryTo); err != nil {
+		return err
+	}
+	if err := copyIfSet(lcovPath, lcovTo); err != nil {
+		return err
 	}
 	l, err := readSummary(summaryPath)
 	if err != nil {
@@ -89,6 +91,29 @@ func measure(nogate bool, copyTo string) error {
 		return errors.New("coverage below threshold; add tests")
 	}
 	return nil
+}
+
+// copyIfSet copies from to to, unless to is empty.
+func copyIfSet(from, to string) error {
+	if to == "" {
+		return nil
+	}
+	raw, err := os.ReadFile(from)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(to, raw, 0o644)
+}
+
+// vitestArgs are node's arguments for one coverage run, with the lcov
+// reporter when lcov is set.
+func vitestArgs(lcov bool) []string {
+	args := []string{filepath.Join("node_modules", "vitest", "vitest.mjs"), "run", "--coverage",
+		"--coverage.reporter=text", "--coverage.reporter=json-summary"}
+	if lcov {
+		args = append(args, "--coverage.reporter=lcovonly")
+	}
+	return args
 }
 
 // lines is the line tally from vitest's json-summary.

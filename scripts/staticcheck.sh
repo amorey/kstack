@@ -1,7 +1,8 @@
 #!/bin/sh
-# Runs staticcheck over the sidecar once per GOOS, and over the live checks'
-# build tags, then merges the runs. A single run reports code used only by
-# another platform as unused; -merge reports U1000 only when every run agrees.
+# Runs staticcheck over the sidecar once per GOOS and once per live check's
+# build tag, and over tools/ once, then merges the runs. A single run reports
+# code used only by another platform as unused; -merge reports U1000 only when
+# every run agrees.
 set -eu
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -18,4 +19,5 @@ done
 for tag in livecache liveswitch; do
 	"$work/staticcheck" -f binary -tags "$tag" ./internal/agent/catalog >"$work/$tag.bin"
 done
+(cd "$root/tools" && "$work/staticcheck" -f binary ./...) >"$work/tools.bin"
 "$work/staticcheck" -merge "$work"/*.bin

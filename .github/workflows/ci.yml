@@ -136,8 +136,7 @@ jobs:
         with:
           setup-go: "true"
       - name: Run linter
-        working-directory: ./sidecar
-        run: test -z "$(gofmt -l .)"
+        run: test -z "$(gofmt -l sidecar tools)"
 
   go-vet:
     name: Go · Vet
@@ -171,6 +170,9 @@ jobs:
         run: |
           go test scripts/coverage-js.go scripts/coverage-js_test.go
           cd sidecar && go test scripts/coverage.go scripts/coverage_test.go
+      - name: Vet and test tools/
+        working-directory: ./tools
+        run: go vet ./... && go test ./...
       # After both passes, so the cache holds the Windows target's builds too,
       # and a failed job leaves the last cache the newest.
       - name: Save Go cache
@@ -480,6 +482,7 @@ jobs:
       # One runner per OS: every platform split in the sidecar is by OS, none
       # by architecture, so three profiles hold every file. macOS 27 is the
       # release users run; nothing in the sidecar branches on the macOS version.
+      # Keep in step with ciTargets in tools/coverchanged/main.go.
       matrix:
         include:
           - os: linux
@@ -622,7 +625,70 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
       - name: Check coverage against the threshold
-        run: make cover-js
+        run: make cover-js ARGS="-lcov $RUNNER_TEMP/lcov.info"
+      # Even when the gate failed, so Coverage · Changed lines lists the lines.
+      - name: Upload the lcov
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: typescript-coverage
+          path: ${{ runner.temp }}/lcov.info
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # Lists the PR's changed lines no test reaches (make cover-changed). A
+  # skipped coverage job passes no input, so a changed file of its language
+  # fails the run; a job that ran passes what it uploaded, and a missing file
+  # fails the run naming it.
+  coverage-changed:
+    name: Coverage · Changed lines
+    needs:
+      - go-coverage
+      - typescript-coverage
+    if: >-
+      github.event_name == 'pull_request' && !cancelled() &&
+      !(needs.go-coverage.result == 'skipped' && needs.typescript-coverage.result == 'skipped')
+    runs-on: ubuntu-24.04
+    steps:
+      # The whole history, for the merge base with the PR's base branch.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: ./.github/actions/setup-environment
+        with:
+          setup-go: "true"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: needs.go-coverage.result != 'skipped'
+        continue-on-error: true
+        with:
+          pattern: go-coverage-*
+          path: ${{ runner.temp }}/coverage
+          merge-multiple: true
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: needs.typescript-coverage.result != 'skipped'
+        continue-on-error: true
+        with:
+          name: typescript-coverage
+          path: ${{ runner.temp }}/coverage
+      - name: List the changed lines no test reaches
+        working-directory: ./tools
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          GO_RESULT: ${{ needs.go-coverage.result }}
+          TYPESCRIPT_RESULT: ${{ needs.typescript-coverage.result }}
+        shell: bash
+        run: |
+          inputs=()
+          if [ "$GO_RESULT" != skipped ]; then
+            for os in linux darwin windows; do
+              inputs+=("-$os" "$RUNNER_TEMP/coverage/coverage-$os.out")
+            done
+          fi
+          if [ "$TYPESCRIPT_RESULT" != skipped ]; then
+            inputs+=(-lcov "$RUNNER_TEMP/coverage/lcov.info")
+          fi
+          go run ./coverchanged -no-run -base "origin/$BASE_REF" "${inputs[@]}"
 
   # Rust · Vet's clippy already type-checks the build; this links the real
   # binary, then runs the tests under the same cache.
@@ -713,6 +779,7 @@ jobs:
       - go-coverage-gate
       - sandbox-apparmor
       - typescript-coverage
+      - coverage-changed
       - rust-test
       - typescript-test
       - typescript-build

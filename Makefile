@@ -2,7 +2,7 @@
 # so it doesn't belong in package.json scripts; this Makefile is the
 # place where Go, Rust, and JS commands meet.
 
-.PHONY: sidecar sidecar-dev bwrap pasta proto proto-go proto-rust test test-changed test-go test-rust test-js cover-go cover-js lint lint-go lint-rust lint-js lint-yaml vet vet-go staticcheck-go vet-rust check-sidecar-deps check-go-fix check-cache check-switch prompts clean clean-data
+.PHONY: sidecar sidecar-dev bwrap pasta proto proto-go proto-rust test test-changed test-go test-rust test-js cover-go cover-js cover-changed lint lint-go lint-rust lint-js lint-yaml vet vet-go staticcheck-go vet-rust check-sidecar-deps check-go-fix check-cache check-switch prompts clean clean-data
 
 # Build the Go sidecar into src-tauri/binaries/ with the Tauri-required
 # `<name>-<rust-host-triple>` filename. Tauri's externalBin picks it up.
@@ -51,6 +51,7 @@ test: test-go test-rust test-js
 
 test-go:
 	cd sidecar && go test ./...
+	cd tools && go test ./...
 
 # Rust integration test spawns the real sidecar binary, so build it first.
 test-rust: sidecar
@@ -103,12 +104,20 @@ check-switch:
 cover-js:
 	go run scripts/coverage-js.go $(ARGS)
 
+# Lists the changed lines no test reaches, as file:lines, and fails when there
+# are any (tools/coverchanged). Changed is as for test-changed. It measures the
+# languages with changed files on this OS; CI's Coverage · Changed lines checks
+# the union of all three. `ARGS="-no-run -linux l -darwin d -windows w -lcov f"`
+# reads CI's uploads instead of measuring.
+cover-changed:
+	@cd tools && go run ./coverchanged $(ARGS)
+
 # Run every linter in the repo.
 lint: lint-go lint-rust lint-js lint-yaml
 
 # `gofmt -l` lists unformatted files; non-empty = lint failure.
 lint-go:
-	@cd sidecar && unformatted=$$(gofmt -l .); \
+	@unformatted=$$(gofmt -l sidecar tools); \
 		if [ -n "$$unformatted" ]; then \
 			echo "gofmt: files need formatting:"; echo "$$unformatted"; exit 1; \
 		fi
@@ -135,6 +144,7 @@ vet: vet-go staticcheck-go vet-rust
 # them compiling.
 vet-go: check-sidecar-deps check-go-fix
 	cd sidecar && go vet ./... && go vet -tags livecache ./internal/agent/catalog && go vet -tags liveswitch ./internal/agent/catalog
+	cd tools && go vet ./...
 
 # One run per GOOS and live-check tag, merged (scripts/staticcheck.sh).
 staticcheck-go:
