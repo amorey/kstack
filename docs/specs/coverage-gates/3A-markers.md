@@ -59,7 +59,7 @@ gains
 - [ ] Every coverage marker this PR adds carries a reason I agree with
 ```
 
-Markers already on `main` are not re-checked; only changed lines are.
+Markers already on the base branch are not re-checked; only changed lines are.
 
 ## Tasks
 

@@ -27,9 +27,10 @@ Each is final for this sequence; record them in the ADR when the work lands.
    beside them, which a root `scripts/*.go` file cannot.
 3. **Locally and in CI it is the same command on the same inputs.** Locally the script measures
    the suites itself; in CI it reads the profiles the coverage jobs already upload. Either way
-   it intersects the same diff against the same base, so a PR never fails on a line the agent
-   could not see. Locally, a Go file this OS does not compile is listed as *not measured here*
-   and does not fail; CI gates it on the union of the three OSes.
+   it intersects the same diff against the same base, so the same profiles give the same list.
+   A local run is a preview: it measures one OS, and a timing-dependent line can move. Locally,
+   a Go file this OS does not compile is listed as *not measured here* and does not fail; CI
+   gates it on the union of the three OSes.
 4. **Lines, not branches, to start.** A Go profile is per statement block, which already splits
    `if`/`else` arms into blocks. v8's lcov carries branch records too, but a line gate is what
    an agent can act on today; a branch gate is a row in `docs/TODO.md` at landing.
@@ -54,15 +55,14 @@ Each is final for this sequence; record them in the ADR when the work lands.
    `cargo-mutants --in-diff`, Stryker's incremental mode with the vitest runner, Gremlins on the
    changed Go packages; `cargo-llvm-cov --lcov` for Rust, which `cover-changed` reads as it reads
    v8's.
-9. **Two ADRs, one each.** Step 1 lands on `main` alone with the tolerance ADR. The landing PR
-   writes the second, which links the first: the changed lines are the gate, the total is a
-   backstop.
+9. **Two ADRs, one each.** Step 1's tolerance PR writes the first. The landing PR writes the
+   second, which links the first: the changed lines are the gate, the total is a backstop.
 
 ## The pieces
 
 | Step | Spec | What it builds | Issue |
 | --- | --- | --- | --- |
-| 1 | [1-tolerance.md](1-tolerance.md) | A measured tolerance under each threshold, in three or more PRs | Closes #37 |
+| 1 | [1-tolerance.md](1-tolerance.md) | A measured tolerance under each threshold, in two PRs | Ref #37 |
 | 2 | [2-cover-changed.md](2-cover-changed.md) | `make cover-changed`: the changed lines tests do not reach, locally and in CI | Ref #97 |
 | 3A | [3A-markers.md](3A-markers.md) | Ignore markers with a reason, and the CI check that reads them | Ref #97 |
 | 3B | [3B-threshold-guards.md](3B-threshold-guards.md) | A threshold goes down only with the label, and up when CI says so | Ref #97 |
@@ -74,15 +74,12 @@ Each is final for this sequence; record them in the ADR when the work lands.
       └ 3B
 ```
 
-Step 2 needs step 1's `scripts/coverage-js.go` to write the lcov file CI gates on. Steps 3A and
-3B need step 2 and can be built at the same time.
+Step 2 needs step 1's `scripts/coverage-js.go`, on `wip/coverage-gates` since #495, to write
+the lcov file CI gates on. Steps 3A and 3B need step 2 and can be built at the same time.
 
-**Step 1's pull requests target `main`, not `wip/coverage-gates`.** It stands on its own, and
-the flaky failures it fixes hit every PR until it merges. It is at least three PRs, because its
-spread workflow must be on `main` before it can run: the tooling and workflow, then a PR per
-cheap fix the measurement points at, then the tolerance with its ADR and docs. The last closes
-#37. When `wip/coverage-gates` next takes `main` in, delete `1-tolerance.md` and its row above.
-Every other step is one pull request into `wip/coverage-gates`, marked `Ref #97`.
+Every pull request in this sequence targets `wip/coverage-gates`. Step 1 is two: the tooling and
+spread workflow (#495), then the tolerance with its ADR and docs, marked `Ref #37`. Every other
+step is one, marked `Ref #97`.
 
 ## Closing the issues
 
@@ -90,15 +87,14 @@ GitHub closes an issue from `Closes #n` only when the commit or PR reaches `main
 `wip/coverage-gates` closes nothing, and a squash of the `wip` branch drops its commits'
 messages, so:
 
-- Step 1's last PR, the one adding the tolerance, says `Closes #37` in its description and
-  squash commit. Its earlier PRs say `Ref #37`.
-- The landing PR from `wip/coverage-gates` into `main` says `Closes #97` in its description and
-  its squash commit. Steps 2, 3A and 3B say `Ref #97`.
+- The landing PR from `wip/coverage-gates` into `main` says `Closes #37` and `Closes #97` in
+  its description and its squash commit. Step 1's PRs say `Ref #37`; steps 2, 3A and 3B say
+  `Ref #97`.
 
 ## When it lands
 
 - Fold what is now true into the root `CLAUDE.md` (*Testing conventions*: run `make test-changed`
-  while working and `make cover-changed` until it prints nothing before opening a PR; what a
+  while working and `make cover-changed` until it exits 0 before opening a PR; what a
   marker is and that it needs a reason; the threshold rule), `sidecar/CLAUDE.md` (*Coverage is
   gated*) and `src/CLAUDE.md` (*Coverage is gated*).
 - Write the ADR *The changed lines are the gate and the total is a backstop*, recording
