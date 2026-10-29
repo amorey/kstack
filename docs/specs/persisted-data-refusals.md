@@ -24,7 +24,10 @@ After this spec:
    migrate failure and so a test can assert on the type rather than the text.
 2. The sidecar hands the reason for a failed start to the host on stdout, and the start screen
    shows it: *Failed to start: app.db was written by a newer Kstack (schema 3; this build reads up
-   to 2)*.
+   to 2)*. For `beehive.db` the line is *beehive.db was written by a newer Kstack*, without the
+   versions: beehive's runner returns plain text, and the typed error is asked for in
+   [amorey/beehive#162](https://github.com/amorey/beehive/issues/162). beehive is a separate
+   project; nothing here patches it or parses its text for numbers.
 3. One test per store pins that a newer file is refused with that error.
 
 ## Non-goals
@@ -39,6 +42,9 @@ Do not build any of these. Each was considered and rejected or deferred in the A
 - A native dialog. The start screen is the surface.
 - A change to `settings.json` or `host.json` handling.
 - Any new GraphQL field. `StoreFailed` and its message already reach the webview.
+- A reason for a failed bind. `ipc.Listen` failing in `run` keeps the generic *exited before
+  announcing readiness*. Only the `app.New` branch prints `FATAL`.
+- Parsing beehive's error text for its versions, or a change to beehive.
 
 ## Tasks
 
@@ -91,49 +97,73 @@ any open failure reaches `StoreFailed` with its message, and the message is the 
 `sidecar/main.go`, `run`: the `app.New` error branch that logs `app init` and returns 1.
 
 - Before `return 1`, write one line to `stdout`: `FATAL ` followed by `safe.Safe(err)`
-  (`internal/lib/safe`), which bounds the text and strips what must not reach a screen. One line:
-  replace any newline in the message with a space.
+  (`internal/lib/safe`), which bounds the text and redacts credential shapes. One line: replace
+  every `\n` **and `\r`** in the message with a space. The host's line reader ends a line at a
+  bare `\r` too, so a `\r` left in would cut the `FATAL` line short and forward the rest as a
+  stray log line.
 - Only this branch. A failed `Start` after `READY` is already reported by the running app, and a
   quit during startup is a clean exit.
 - stdout carries the host protocol and nothing else; the marker sits beside `READY ` in the
   comment above the `fmt.Fprintf` that prints `READY`.
-- Make the `app.New` wrap for the app database read as the user will see it. In
-  `internal/app/runtime.go`, where `appdb.Open` fails, the wrap is `open app database: %w`; the
-  final line should read `app.db was written by a newer Kstack (schema 3; this build reads up to 2)`
-  when the error is a `*sqlitemigrate.NewerError`, and keep the existing wrap otherwise. Do the
-  same for `beehive.db` in `internal/services/cluster/service.go` where `beehivesqlite.Open`
-  fails; beehive's runner is its own package, so match its message text with `strings.Contains`
-  on `newer than binary supports` there, and say so in a comment.
-- Test in `sidecar/main_test.go`, beside `TestRunFailsWhenTheAppCannotBeComposed`:
-  `TestRunNamesAFailedComposeOnStdout`. Compose fails as that test makes it fail; assert stdout
-  holds one line starting `FATAL ` that contains the error text, and no `READY`.
+- Make the message read as the user will see it:
+  - `internal/app/runtime.go`, where `appdb.Open` fails: when `errors.As` gives a
+    `*sqlitemigrate.NewerError`, the error is
+    `app.db was written by a newer Kstack (schema 3; this build reads up to 2)`; otherwise keep
+    the existing `open app database: %w` wrap.
+  - `internal/services/cluster/service.go`, where `beehivesqlite.Open` fails: when the error text
+    contains `newer than binary supports`, the error is `beehive.db was written by a newer Kstack`;
+    otherwise keep the existing wrap. The comment says beehive's runner has no typed error yet and
+    links amorey/beehive#162. Its text is not ours and does not change with task 1.
+- Tests:
+  - `sidecar/main_test.go`: **change** `TestRunFailsWhenTheAppCannotBeComposed`, which today
+    asserts stdout is empty in exactly this branch. It now asserts stdout is one line starting
+    `FATAL ` that contains the error text and no `READY`; update its comment to say `READY` follows
+    a composed app and `FATAL` a failed one. No second test.
+  - `internal/app/runtime_test.go`, beside `TestAnAppDBThatCannotOpenFailsTheBuild`:
+    `TestANewerAppDBFailsTheBuildNamingTheVersions`. Plant a newer `app.db` as in task 2 and
+    assert the exact text, with `(schema 999; this build reads up to 1)`. This is the only test of
+    the text the user sees.
+  - `internal/services/cluster/service_test.go`, beside `newTestService`:
+    `TestANewerBeehiveDBFailsTheServiceSayingSo`. Plant a newer `beehive.db` the same way (its
+    runner uses the same `schema_migrations` table) and assert the exact text.
 
 ### 4. The host carries the reason to the start screen
 
-`src-tauri/src/services/sidecar/service.rs`.
+`src-tauri/src/services/sidecar/service.rs`. The drain loop is an inline closure in `spawn`, fed
+by a real child, so the line handling is split out so a test can drive it. The reason rides the
+readiness channel, so `ready()` reads one source and cannot see a reason before it is stored.
 
 - Add `const FATAL_MARKER: &[u8] = b"FATAL ";` beside `READY_MARKER`.
-- In the drain task's `CommandEvent::Stdout` arm, before the `READY_MARKER` check: a line starting
-  with `FATAL_MARKER` stores the rest of the line in `State` (a new `fatal: Option<String>` field)
-  and continues. Keep forwarding every other line as today.
-- In `ready()`, the arm that returns `sidecar exited before announcing readiness`: if `State.fatal`
-  is set, return `AppError::Io(std::io::Error::other(<that message>))` instead.
-- Tests in the `tests` module at the bottom of `service.rs`, following the existing ones. The
-  drain loop takes its events from a channel, so feed it a `Stdout("FATAL app.db …")` then a
-  `Terminated` and assert `ready()` returns the message; and feed `Terminated` alone and assert the
-  existing text. Use `#[tokio::test(start_paused = true)]` if a wait is involved (root
-  `CLAUDE.md`). If the drain loop cannot be driven without a child process, split the line
-  handling into a function that takes the event and the `State` and test that; say which in the
-  handoff.
-- `src/lib/ready-gate.tsx` needs no change: it already shows `Failed to start: <message>` with a
-  Retry. `ready-gate.test.tsx` already pins that shape.
+- Replace the `watch::channel(false)` with a channel of a small enum, say
+  `enum Startup { Pending, Ready, Failed(String) }`, defined in this file. The `Pending` state is
+  the initial value.
+- Split the `CommandEvent::Stdout` handling into `fn stdout_line(line: &[u8], startup:
+  &watch::Sender<Startup>)`: a line starting `READY_MARKER` sends `Ready`; a line starting
+  `FATAL_MARKER` sends `Failed(rest)`, where `rest` is the remainder decoded with
+  `String::from_utf8_lossy` and **`trim_end`** (the reader keeps the trailing newline, as
+  `forward_sidecar_line` in `logs.rs` already allows for); any other line goes to
+  `forward_sidecar_line`. The drain loop calls it.
+- Split the wait in `ready()` into `async fn wait_ready(mut rx: watch::Receiver<Startup>) ->
+  Result<()>`: `Ready` is `Ok`; `Failed(msg)` is `AppError::Io(std::io::Error::other(msg))`; the
+  sender dropping while `Pending` keeps the existing *exited before announcing readiness*; the
+  budget elapsing keeps the existing `TimedOut`. `ready()` calls it with a clone of its receiver.
+- Tests in the `tests` module at the bottom of `service.rs`: `stdout_line` with a `READY ` line, a
+  `FATAL ` line with a trailing newline (the stored text has none), and a plain line (the channel
+  stays `Pending`); `wait_ready` with `#[tokio::test(start_paused = true)]` for each of the four
+  outcomes, driving the sender by hand.
+- `src/lib/ready-gate.tsx`: draw `state.message` through `VisibleText`
+  (`src/components/widgets/visible-text.tsx`) instead of as bare JSX text. The sidecar's text is
+  bounded and redacted but not control-stripped, and the root invariant is that every untrusted
+  string is drawn through `VisibleText`. `ready-gate.test.tsx` keeps passing as written; add no
+  test.
 
 ### 5. The register
 
 `docs/persisted-data.md`:
 
-- *Pinned by* for App DB, Cluster cache and Log cache: the tests from task 2, and
-  `TestRunNamesAFailedComposeOnStdout` and the host test from task 4 for the message path.
+- *Pinned by* for App DB, Cluster cache and Log cache: the tests from task 2; for App DB and
+  Control-plane store also the text tests from task 3, `TestRunFailsWhenTheAppCannotBeComposed`,
+  and the `wait_ready` tests from task 4 for the message path.
 - Delete the *Open on #512* section.
 - `sidecar/CLAUDE.md`, *Persisted formats*: one sentence that `run` prints `FATAL <reason>` on
   stdout when `app.New` fails and the host shows it on the start screen.
@@ -143,7 +173,9 @@ any open failure reaches `StoreFailed` with its message, and the message is the 
 - `sqlitemigrate.Apply` returns `*NewerError` for a newer file, and its test asserts the type.
 - A newer `app.db`, `kube/<id>.db` and `logs/<id>.db` is refused with that error, one test each.
 - A sidecar whose `app.db` or `beehive.db` is newer prints `FATAL <reason>` on stdout, exits 1, and
-  the start screen shows *Failed to start: <reason>*, with the file name and both versions in it.
+  the start screen shows *Failed to start: <reason>*, naming the file. For `app.db` the reason
+  holds both versions; for `beehive.db` it does not, until amorey/beehive#162 lands.
+- The start screen draws the reason through `VisibleText`.
 - The register's *Pinned by* column is filled for those rows and *Open on #512* is gone.
 - `make test-changed`, `make lint`, `make vet` pass. Coverage gates are not lowered.
 
