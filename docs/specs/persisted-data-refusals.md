@@ -138,11 +138,13 @@ readiness channel, so `ready()` reads one source and cannot see a reason before 
   `enum Startup { Pending, Ready, Failed(String) }`, defined in this file. The `Pending` state is
   the initial value.
 - Split the `CommandEvent::Stdout` handling into `fn stdout_line(line: &[u8], startup:
-  &watch::Sender<Startup>)`: a line starting `READY_MARKER` sends `Ready`; a line starting
+  &watch::Sender<Startup>)`: a line starting `READY_MARKER` sends `Ready` and keeps the
+  `tracing::info!("sidecar ready")` line, which `src-tauri/CLAUDE.md` promises; a line starting
   `FATAL_MARKER` sends `Failed(rest)`, where `rest` is the remainder decoded with
   `String::from_utf8_lossy` and **`trim_end`** (the reader keeps the trailing newline, as
   `forward_sidecar_line` in `logs.rs` already allows for); any other line goes to
-  `forward_sidecar_line`. The drain loop calls it.
+  `forward_sidecar_line`. Discard each send's result with `let _ =`, as the current code does: it
+  fails only when no receiver is left, which is teardown, not an error. The drain loop calls it.
 - Split the wait in `ready()` into `async fn wait_ready(mut rx: watch::Receiver<Startup>) ->
   Result<()>`: `Ready` is `Ok`; `Failed(msg)` is `AppError::Io(std::io::Error::other(msg))`; the
   sender dropping while `Pending` keeps the existing *exited before announcing readiness*; the
@@ -165,8 +167,12 @@ readiness channel, so `ready()` reads one source and cannot see a reason before 
   Control-plane store also the text tests from task 3, `TestRunFailsWhenTheAppCannotBeComposed`,
   and the `wait_ready` tests from task 4 for the message path.
 - Delete the *Open on #512* section.
+- *Newer file* for App DB and Control-plane store: `refused; the sidecar does not start and the
+  start screen names the file`.
 - `sidecar/CLAUDE.md`, *Persisted formats*: one sentence that `run` prints `FATAL <reason>` on
   stdout when `app.New` fails and the host shows it on the start screen.
+- `src-tauri/CLAUDE.md`, *Sidecar IPC*: the sentence that stdout carries the readiness protocol
+  now says a `FATAL <reason>` line ends readiness with that reason, which `ready()` returns.
 
 ## Done when
 
@@ -176,7 +182,8 @@ readiness channel, so `ready()` reads one source and cannot see a reason before 
   the start screen shows *Failed to start: <reason>*, naming the file. For `app.db` the reason
   holds both versions; for `beehive.db` it does not, until amorey/beehive#162 lands.
 - The start screen draws the reason through `VisibleText`.
-- The register's *Pinned by* column is filled for those rows and *Open on #512* is gone.
+- The register's *Pinned by* and *Newer file* columns are updated for those rows, *Open on #512*
+  is gone, and both `CLAUDE.md` files describe the `FATAL` line.
 - `make test-changed`, `make lint`, `make vet` pass. Coverage gates are not lowered.
 
 ## Handoff
