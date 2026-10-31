@@ -370,11 +370,8 @@ mod tests {
     #[test]
     fn pick_returns_pipe_path_on_windows() {
         let path = Endpoint::pick(Path::new("ignored")).expect("pick should succeed on windows");
-        assert!(
-            path.as_arg().starts_with(r"\\.\pipe\"),
-            "got: {}",
-            path.as_arg()
-        );
+        let arg = path.as_arg();
+        assert!(arg.starts_with(r"\\.\pipe\"), "got: {arg}");
     }
 
     /// `as_arg` is the contract with the sidecar CLI: whatever bytes we

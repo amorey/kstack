@@ -289,7 +289,7 @@ pub fn run() {
 
             // Custom macOS Dock menu (no Tauri API — see dock_menu module).
             #[cfg(target_os = "macos")]
-            crate::dock_menu::install(app.handle());
+            crate::dock_menu::macos::install(app.handle());
 
             #[cfg(all(desktop, unix))]
             spawn_signal_handler(app.handle());

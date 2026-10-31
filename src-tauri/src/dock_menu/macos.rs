@@ -12,14 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Custom macOS Dock menu. AppKit asks the `NSApplication` delegate via
-//! `applicationDockMenu:`, and tao's delegate doesn't implement it — so this
-//! module patches two IMPs onto tao's live delegate class:
-//! `applicationDockMenu:` (returns the static [`DOCK_MENU`], with actions on
-//! [`DockMenuTarget`]) and `applicationShouldTerminate:` (reroutes a user Quit
-//! through Tauri's graceful-shutdown hook; a system quit is left alone — see
-//! [`application_should_terminate`]). Main-thread only; `install` runs from the
-//! Tauri `setup` hook.
+//! Patches the Dock menu and the Quit reply onto AppKit, once during app
+//! setup. tao's `NSApplication` delegate implements neither
+//! `applicationDockMenu:` nor `applicationShouldTerminate:`, so `install` adds
+//! both to its live class. Wiring alone: AppKit runs it on the main thread,
+//! which no test runs on, so coverage ignores this file. What an item does and
+//! how a quit is answered are decided in `dock_menu/mod.rs`.
 
 use std::ffi::CStr;
 use std::sync::OnceLock;
@@ -29,9 +27,9 @@ use objc2::runtime::{AnyClass, AnyObject, Imp, Sel};
 use objc2::{define_class, msg_send, sel, ClassType};
 use objc2_app_kit::{NSApplication, NSMenu, NSMenuItem};
 use objc2_foundation::{MainThreadMarker, NSAppleEventManager, NSString};
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
 
-use crate::state::AppState;
+use super::{is_system_quit_event, run_action, terminate_reply, DockAction, K_AE_QUIT_REASON};
 
 /// Wraps a non-`Sync` value so it can live in a `static`. Sound because every
 /// access is on the main thread — `install` writes it, AppKit's main-thread
@@ -63,33 +61,15 @@ define_class!(
     impl DockMenuTarget {
         #[unsafe(method(newWindow:))]
         fn new_window(&self, _sender: Option<&AnyObject>) {
-            with_state(|app, state| {
-                if let Err(err) = state.window_manager.new_window(app) {
-                    tracing::error!(%err, "failed to open window from dock menu");
-                }
-            });
+            run_action(APP_HANDLE.get(), DockAction::NewWindow);
         }
 
         #[unsafe(method(showMainWindow:))]
         fn show_main_window(&self, _sender: Option<&AnyObject>) {
-            with_state(|app, state| {
-                if let Err(err) = state.window_manager.show_main_window(app) {
-                    tracing::error!(%err, "failed to show main window from dock menu");
-                }
-            });
+            run_action(APP_HANDLE.get(), DockAction::ShowMainWindow);
         }
     }
 );
-
-/// Run `f` with the Tauri app handle and state, or log if [`install`] never ran.
-fn with_state(f: impl FnOnce(&AppHandle, &AppState)) {
-    let Some(app) = APP_HANDLE.get() else {
-        tracing::error!("dock menu fired before install()");
-        return;
-    };
-    let state = app.state::<AppState>();
-    f(app, &state);
-}
 
 /// Install the Dock menu. Main-thread only; idempotent; patch failures are
 /// logged and swallowed (not worth aborting startup).
@@ -220,83 +200,25 @@ unsafe extern "C-unwind" fn application_dock_menu(
     }
 }
 
-/// `applicationShouldTerminate:` IMP. `terminate:` would skip Tauri's
-/// `RunEvent::ExitRequested` hook, so a user quit is cancelled and re-driven
-/// through [`AppHandle::exit`] (which doesn't route back through `terminate:`
-/// — no recursion). A system quit ([`is_system_initiated_quit`]) returns
-/// `NSTerminateNow` — cancelling would abort the user's logout; cleanup still
-/// runs via `RunEvent::Exit`.
+/// `applicationShouldTerminate:` IMP; the reply is [`terminate_reply`]'s.
 unsafe extern "C-unwind" fn application_should_terminate(
     _self: *mut AnyObject,
     _cmd: Sel,
     _sender: *mut AnyObject,
 ) -> usize {
-    // NSApplicationTerminateReply discriminants.
-    const NS_TERMINATE_CANCEL: usize = 0;
-    const NS_TERMINATE_NOW: usize = 1;
-
-    // A logout/restart/shutdown must run to completion — do not cancel it.
-    if is_system_initiated_quit() {
-        return NS_TERMINATE_NOW;
-    }
-
-    match APP_HANDLE.get() {
-        Some(app) => {
-            app.exit(0);
-            NS_TERMINATE_CANCEL
-        }
-        None => {
-            // Can't re-drive the exit without the handle; let AppKit terminate.
-            tracing::error!("applicationShouldTerminate: fired before install()");
-            NS_TERMINATE_NOW
-        }
-    }
-}
-
-/// Pack a four-character code (`OSType`) big-endian — the Rust equivalent of an
-/// Objective-C `'abcd'` literal.
-const fn four_char_code(code: [u8; 4]) -> u32 {
-    u32::from_be_bytes(code)
+    let exit = APP_HANDLE.get().map(|app| || app.exit(0));
+    terminate_reply(is_system_initiated_quit(), exit)
 }
 
 /// Whether the in-flight termination came from the OS (logout/restart/
-/// shutdown): a system quit arrives as a `kAEQuitApplication` Apple Event with
-/// a `kAEQuitReason` param; a user Quit posts `terminate:` directly (no event).
-/// Codes from `<CoreServices/.../AppleEvents.h>`.
+/// shutdown), read off the current Apple Event.
 fn is_system_initiated_quit() -> bool {
-    const K_AE_QUIT_APPLICATION: u32 = four_char_code(*b"quit");
-    const K_AE_QUIT_REASON: u32 = four_char_code(*b"why?");
-
     let manager = NSAppleEventManager::sharedAppleEventManager();
     let Some(event) = manager.currentAppleEvent() else {
         return false;
     };
-    event.eventID() == K_AE_QUIT_APPLICATION
-        && event.paramDescriptorForKeyword(K_AE_QUIT_REASON).is_some()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::four_char_code;
-
-    #[test]
-    fn packs_big_endian_first_byte_most_significant() {
-        // Mirrors the Objective-C `'abcd'` literal: first byte in the high position.
-        assert_eq!(four_char_code([0x12, 0x34, 0x56, 0x78]), 0x1234_5678);
-    }
-
-    #[test]
-    fn matches_the_apple_event_codes_in_use() {
-        // 'q'=0x71 'u'=0x75 'i'=0x69 't'=0x74
-        assert_eq!(four_char_code(*b"quit"), 0x7175_6974);
-        // 'w'=0x77 'h'=0x68 'y'=0x79 '?'=0x3f
-        assert_eq!(four_char_code(*b"why?"), 0x7768_793f);
-    }
-
-    #[test]
-    fn equivalent_to_u32_from_be_bytes() {
-        for code in [*b"quit", *b"why?", *b"abcd", [0, 0, 0, 0], [0xff; 4]] {
-            assert_eq!(four_char_code(code), u32::from_be_bytes(code));
-        }
-    }
+    is_system_quit_event(
+        event.eventID(),
+        event.paramDescriptorForKeyword(K_AE_QUIT_REASON).is_some(),
+    )
 }

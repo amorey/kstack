@@ -789,4 +789,27 @@ mod tests {
         assert!(exit_rx.try_recv().is_err());
         assert!(!state.lock().unwrap().exited);
     }
+
+    #[cfg(windows)]
+    #[test]
+    fn force_kill_by_pid_ends_a_running_process() {
+        let mut child = std::process::Command::new("ping")
+            .args(["-n", "600", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+
+        force_kill_by_pid(child.id());
+
+        // TerminateProcess's exit code; ping's own would be 0.
+        assert_eq!(child.wait().unwrap().code(), Some(1));
+    }
+
+    /// A pid naming no process is ignored.
+    #[cfg(windows)]
+    #[test]
+    fn force_kill_by_pid_ignores_a_pid_with_no_process() {
+        // Windows pids are small multiples of four; none is this large.
+        force_kill_by_pid(u32::MAX - 3);
+    }
 }
