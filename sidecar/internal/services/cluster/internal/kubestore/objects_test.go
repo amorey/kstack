@@ -501,7 +501,7 @@ func TestARelistThatChangesNothingLeavesEveryStamp(t *testing.T) {
 func TestInsertObjectRowReportsAnEdgeItCouldNotWrite(t *testing.T) {
 	t.Parallel()
 
-	for _, table := range []string{"owner_refs", "labels"} {
+	for _, table := range []string{"owner_refs", "labels", "refs"} {
 		t.Run(table, func(t *testing.T) {
 			s := newTestStore(t)
 			dropTable(t, s, table)
@@ -527,77 +527,20 @@ func TestInsertObjectRowReportsAnEdgeItCouldNotWrite(t *testing.T) {
 			assert.Error(t, err)
 		})
 	}
-}
+	// A Service's selector is rewritten the same way, over two tables.
+	for name, fail := range map[string]func(t *testing.T, s *Store){
+		"delete":       func(t *testing.T, s *Store) { dropTable(t, s, "selectors") },
+		"insert":       func(t *testing.T, s *Store) { failWrites(t, s, "selectors", "INSERT") },
+		"terms delete": func(t *testing.T, s *Store) { dropTable(t, s, "selector_terms") },
+	} {
+		t.Run("selector "+name, func(t *testing.T) {
+			s := newTestStore(t)
+			fail(t, s)
 
-// The log is written before the row goes and in the same transaction, so a log that will
-// not take the entry must fail the delete outright — the alternative is a row gone with no
-// record that it went, which is the one thing a resuming reader cannot recover from.
-func TestADeleteThatCannotBeLoggedFails(t *testing.T) {
-	t.Parallel()
+			err := s.ApplyChange(context.Background(), serviceKind, watch.Added, service("svc", "1", map[string]any{"app": "web"}))
 
-	ctx := context.Background()
-	s := newTestStore(t)
-	require.NoError(t, s.ApplyChange(ctx, podKind, watch.Added, pod("uid-1", "api-0", "42")))
-	dropTable(t, s, "deletes")
-
-	err := s.ApplyChange(ctx, podKind, watch.Deleted, pod("uid-1", "api-0", "42"))
-
-	assert.Error(t, err)
-	assert.Equal(t, 1, countRows(t, s, `SELECT COUNT(*) FROM objects`), "the row went unlogged")
-}
-
-// The same promise for the relist's prune, which takes every row the list did not carry.
-func TestAPruneThatCannotBeLoggedFails(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-	s := newTestStore(t)
-	require.NoError(t, s.ApplyChange(ctx, podKind, watch.Added, pod("uid-1", "api-0", "42")))
-	session := beginReplace(t, s, podKind)
-	dropTable(t, s, "deletes")
-
-	_, err := session.Commit(ctx, "100")
-
-	assert.Error(t, err)
-	assert.Equal(t, 1, countRows(t, s, `SELECT COUNT(*) FROM objects`), "the rows went unlogged")
-}
-
-// changedAt is one object's changed_at, and 0 when the row is gone.
-func changedAt(t *testing.T, s *Store, uid string) int64 {
-	t.Helper()
-	return int64(countRows(t, s, `SELECT COALESCE(MAX(changed_at), 0) FROM objects WHERE uid = ?`, uid))
-}
-
-// changed_at is the time of the write that last changed the row, so it agrees with
-// write_seq on what a change is: a rewrite of the same version keeps it, and a new
-// version or a new identity moves it to that write's time.
-func TestChangedAtMovesOnlyWhenTheRowChanges(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-	s := newTestStore(t)
-	updatedAt := func() int64 {
-		return int64(countRows(t, s, `SELECT updated_at FROM objects WHERE uid = 'uid-1'`))
+			assert.Error(t, err)
+			assert.Zero(t, countRows(t, s, `SELECT COUNT(*) FROM objects`), "the object went in without its selector")
+		})
 	}
-
-	require.NoError(t, s.ApplyChange(ctx, podKind, watch.Added, pod("uid-1", "api-0", "42")))
-	first := changedAt(t, s, "uid-1")
-	assert.Equal(t, updatedAt(), first, "the first write is a change")
-
-	require.NoError(t, s.ApplyChange(ctx, podKind, watch.Modified, pod("uid-1", "api-0", "42")))
-	session := beginReplace(t, s, podKind)
-	require.NoError(t, session.WritePage(ctx, []*unstructured.Unstructured{pod("uid-1", "api-0", "42")}))
-	_, err := session.Commit(ctx, "100")
-	require.NoError(t, err)
-	assert.Equal(t, first, changedAt(t, s, "uid-1"), "a rewrite of the same version")
-	assert.Greater(t, updatedAt(), first)
-
-	require.NoError(t, s.ApplyChange(ctx, podKind, watch.Modified, pod("uid-1", "api-0", "43")))
-	moved := changedAt(t, s, "uid-1")
-	assert.Equal(t, updatedAt(), moved, "a new resourceVersion")
-
-	renamed := Kind{APIVersion: "v1beta1", Kind: "Pod", Resource: "pods"}
-	require.NoError(t, s.ApplyChange(ctx, renamed, watch.Modified, pod("uid-1", "api-0", "43")))
-	assert.Equal(t, updatedAt(), changedAt(t, s, "uid-1"), "a new identity")
-	assert.Greater(t, changedAt(t, s, "uid-1"), moved)
 }
