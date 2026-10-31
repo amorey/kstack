@@ -108,16 +108,10 @@ func TestTheReexecKeepsTheKeyOutOfTheLaunchStrings(t *testing.T) {
 // A --keys-fd that is not a readable pipe stops the sidecar with an error, in
 // main, rather than start it without the keys.
 func TestABadKeysFDStopsTheSidecar(t *testing.T) {
-	exe, err := os.Executable()
-	require.NoError(t, err)
 	for _, fd := range []string{"--keys-fd=999", "--keys-fd=x"} {
-		cmd := exec.Command(exe, "--socket", "/nowhere", fd)
-		cmd.Env = append(os.Environ(), childEnv+"=main")
-		out, err := cmd.CombinedOutput()
-		var exit *exec.ExitError
-		require.ErrorAs(t, err, &exit, "%s: %s", fd, out)
-		assert.Equal(t, 2, exit.ExitCode(), "%s: %s", fd, out)
-		assert.Contains(t, string(out), fd)
+		code, out := runMain(t, "--socket", "/nowhere", fd)
+		assert.Equal(t, 2, code, "%s: %s", fd, out)
+		assert.Contains(t, out, fd)
 	}
 }
 
@@ -218,7 +212,12 @@ func TestAKeysFDThatIsNotAPipeIsAnError(t *testing.T) {
 	_ = w.Close()
 	t.Cleanup(func() { _ = r.Close() })
 
-	for _, fd := range []string{strconv.Itoa(dupFD(t, file)), "999", "x", strconv.Itoa(dupFD(t, r))} {
+	// A pipe's write end passes the pipe check and fails the read.
+	_, writeEnd, err := os.Pipe()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = writeEnd.Close() })
+
+	for _, fd := range []string{strconv.Itoa(dupFD(t, file)), "999", "x", strconv.Itoa(dupFD(t, r)), strconv.Itoa(dupFD(t, writeEnd))} {
 		_, _, err := scrubExec([]string{"sidecar", keysFDFlag + fd}, nil, nil)
 		assert.Error(t, err, fd)
 	}
