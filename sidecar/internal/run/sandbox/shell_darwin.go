@@ -38,11 +38,11 @@ func ShellMain(args []string) int {
 	if err != nil {
 		return fail(os.Stderr, ShellCommand, "cannot start "+a.argv[0], err)
 	}
-	if err := setTimeAndFiles(a); err != nil {
+	if err := setTimeAndFiles(a); err != nil { // coverage:ignore a limit clamped to the process's own hard limit is one the kernel accepts
 		return fail(os.Stderr, ShellCommand, "cannot set limits", err)
 	}
 	if a.processes > 0 {
-		if err := setClamped(unix.RLIMIT_NPROC, a.processes, 0); err != nil {
+		if err := setClamped(unix.RLIMIT_NPROC, a.processes, 0); err != nil { // coverage:ignore a limit clamped to the process's own hard limit is one the kernel accepts
 			return fail(os.Stderr, ShellCommand, "cannot set limits", err)
 		}
 	}
