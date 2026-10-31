@@ -175,4 +175,20 @@ mod tests {
 
         assert!(app.webview_windows().is_empty());
     }
+
+    /// The window manager mints `window-1` first, and Tauri refuses a second
+    /// window with a label already in use.
+    #[test]
+    fn a_failed_action_is_logged() {
+        let scratch = Scratch::new();
+        let app = mock_app(scratch.path(), SidecarService::without_process(None));
+        window(&app, "window-1");
+
+        let out = captured(|| run_action(Some(app.handle()), DockAction::NewWindow));
+
+        assert!(
+            out.contains("failed to open window from dock menu"),
+            "{out}"
+        );
+    }
 }
