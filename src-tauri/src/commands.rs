@@ -37,7 +37,9 @@ pub async fn ready(state: State<'_, AppState>) -> Result<()> {
 /// parks its thread until the webview exists — a main-thread build deadlocks
 /// Windows (WebView2's controller is created by the main-thread event loop),
 /// and parking an async worker would starve [`graphql_query`].
+// coverage:ignore-start the macro's line counts the last argument's parse failure, which an AppHandle never has
 #[tauri::command]
+// coverage:ignore-stop
 pub async fn new_window<R: Runtime>(app: AppHandle<R>) -> Result<()> {
     tauri::async_runtime::spawn_blocking(move || {
         app.state::<AppState>().window_manager.new_window(&app)?;

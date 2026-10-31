@@ -14,7 +14,7 @@
 
 //! macOS wake/network sources. **Wake**: an `NSObject` observer for
 //! `NSWorkspaceDidWakeNotification` (same `define_class` idiom as
-//! [`dock_menu`](crate::dock_menu)), registered on the main thread.
+//! [`dock_menu::macos`](crate::dock_menu::macos)), registered on the main thread.
 //! **Network**: `SCNetworkReachability` on the default route, callback on a
 //! dedicated `CFRunLoop` thread; the core derives the edge.
 //!
@@ -38,7 +38,7 @@ use tokio_util::sync::CancellationToken;
 use super::core::{self, RawEvent};
 
 /// Wraps a non-`Sync` value so it can live in a `static`. Sound because every
-/// access is on the main thread (see [`crate::dock_menu`] for the same idiom).
+/// access is on the main thread (see [`crate::dock_menu::macos`] for the same idiom).
 struct MainThreadStatic<T>(#[allow(dead_code)] T);
 // SAFETY: access is main-thread-only by construction.
 unsafe impl<T> Send for MainThreadStatic<T> {}

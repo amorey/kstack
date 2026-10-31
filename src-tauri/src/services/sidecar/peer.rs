@@ -51,12 +51,16 @@ pub fn peer_pid(stream: &Stream) -> Result<u32> {
     use std::os::fd::AsRawFd;
 
     let Stream::UdSocket(uds) = stream;
-    let fd = uds.inner().as_raw_fd();
+    local_peer_pid(uds.inner().as_raw_fd())
+}
 
+/// `LOCAL_PEERPID` of the socket `fd`.
+#[cfg(target_vendor = "apple")]
+fn local_peer_pid(fd: std::os::fd::RawFd) -> Result<u32> {
     let mut pid: libc::pid_t = 0;
     let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
-    // SAFETY: `fd` is borrowed from a live stream, and the out-params match
-    // LOCAL_PEERPID's documented type and width.
+    // SAFETY: `fd` is borrowed from a live descriptor, and the out-params
+    // match LOCAL_PEERPID's documented type and width.
     let rc = unsafe {
         libc::getsockopt(
             fd,
@@ -104,5 +108,15 @@ mod tests {
     fn credentials_without_a_pid_are_an_error() {
         assert_eq!(super::known_pid(Some(42)).unwrap(), 42);
         assert!(super::known_pid(None).is_err());
+    }
+
+    /// A descriptor the kernel cannot answer for is refused.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn a_descriptor_that_is_not_a_socket_is_an_error() {
+        use std::os::fd::AsRawFd;
+
+        let file = std::fs::File::open("/dev/null").expect("open");
+        assert!(super::local_peer_pid(file.as_raw_fd()).is_err());
     }
 }

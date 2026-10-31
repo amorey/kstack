@@ -17,7 +17,7 @@
 //!
 //! [`run`] (`app.rs`, the wiring) is the single entry point — `main.rs` (and the
 //! mobile entry point) call it. Module map: [`app_menu`], [`commands`],
-//! `dock_menu` (macOS), [`error`], [`services`] (`SidecarService`), [`state`]
+//! [`dock_menu`], [`error`], [`services`] (`SidecarService`), [`state`]
 //! ([`AppState`]), [`quit`], [`tray`], [`window_manager`].
 
 #![warn(clippy::unwrap_used)]
@@ -28,7 +28,6 @@ mod app;
 mod app_menu;
 mod cloud;
 mod commands;
-#[cfg(target_os = "macos")]
 mod dock_menu;
 mod error;
 mod host_file;

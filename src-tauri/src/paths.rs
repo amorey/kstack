@@ -604,6 +604,17 @@ mod tests {
         assert_eq!(dir, Path::new(r"C:\Users\x\AppData\Local\Kstack\run"));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn runtime_dir_is_created_under_the_data_dir() {
+        let scratch = crate::testutil::Scratch::new();
+
+        let dir = runtime_dir(scratch.path()).expect("runtime dir");
+
+        assert_eq!(dir, scratch.path().join("run"));
+        assert!(dir.is_dir());
+    }
+
     #[test]
     fn roots_resolve_on_the_app() {
         let scratch = crate::testutil::Scratch::new();
