@@ -520,8 +520,8 @@ func marshalToolCalls(rows []toolCallEntry, box tools.Box) rawjson.RawJSON {
 		out = append(out, c)
 	}
 	b, err := json.Marshal(out)
-	if err != nil {
-		panic(err) // strings, and arguments checked valid by argumentsJSON
+	if err != nil { // coverage:ignore strings, and arguments checked valid by argumentsJSON, always marshal
+		panic(err)
 	}
 	return rawjson.RawJSON(b)
 }

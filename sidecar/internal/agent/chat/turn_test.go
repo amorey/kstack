@@ -163,13 +163,23 @@ func TestASettleThatCannotLandLeavesTheRunUnfinished(t *testing.T) {
 
 	for _, tc := range []struct {
 		name, trigger string
+		reply         []llm.Chunk
 	}{
-		{"the content", `CREATE TRIGGER refuse BEFORE UPDATE OF content ON messages BEGIN SELECT RAISE(ABORT, 'refused'); END`},
-		{"the run's status", `CREATE TRIGGER refuse BEFORE UPDATE OF status ON agent_runs BEGIN SELECT RAISE(ABORT, 'refused'); END`},
-		{"the call's close", `CREATE TRIGGER refuse BEFORE UPDATE ON llm_calls BEGIN SELECT RAISE(ABORT, 'refused'); END`},
+		{name: "the content", trigger: `CREATE TRIGGER refuse BEFORE UPDATE OF content ON messages BEGIN SELECT RAISE(ABORT, 'refused'); END`},
+		{name: "the run's status", trigger: `CREATE TRIGGER refuse BEFORE UPDATE OF status ON agent_runs BEGIN SELECT RAISE(ABORT, 'refused'); END`},
+		{name: "the call's close", trigger: `CREATE TRIGGER refuse BEFORE UPDATE ON llm_calls BEGIN SELECT RAISE(ABORT, 'refused'); END`},
+		{
+			name:    "the provider's call",
+			trigger: `CREATE TRIGGER refuse BEFORE INSERT ON tool_calls WHEN NEW.runs_on = 'provider' BEGIN SELECT RAISE(ABORT, 'refused'); END`,
+			reply:   searchReply,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			s := newTestService(t)
+			// The search is offered beside a tool, as a turn offers it.
+			s := startServiceWithTool(t, testTool{name: "echo"})
+			if tc.reply != nil {
+				fakeOf(s).SetReply(tc.reply...)
+			}
 			c := seedChat(t, s.db, aChat("1", time.UnixMilli(1_000).UTC()))
 			_, err := s.db.Write.Exec(tc.trigger)
 			require.NoError(t, err)
@@ -180,6 +190,74 @@ func TestASettleThatCannotLandLeavesTheRunUnfinished(t *testing.T) {
 
 			assert.True(t, messageStatusOf(runStatusOf(t, s.db, RunID(msg.RunID))).inFlight(),
 				"the run is left for the next start to fail as stranded")
+		})
+	}
+}
+
+// A settle writes each call's approvals again, the call's own and its cluster
+// writes; one it cannot write leaves the run unfinished as any refused write does.
+// Each case arms the trigger while its call is held, after the approval's own
+// writes and before the settle's.
+func TestASettleThatCannotRewriteAnApprovalLeavesTheRunUnfinished(t *testing.T) {
+	t.Parallel()
+
+	const refuseApprovals = `CREATE TRIGGER refuse BEFORE UPDATE ON approvals BEGIN SELECT RAISE(ABORT, 'refused'); END`
+	for name, start := range map[string]func(t *testing.T, hold chan struct{}) (*service, ChatMessage){
+		"the call's own": func(t *testing.T, hold chan struct{}) (*service, ChatMessage) {
+			ran := make(chan struct{}, 1)
+			s := startServiceWithTool(t, &fakeBash{run: func(context.Context, string) (string, bool) {
+				ran <- struct{}{}
+				<-hold
+				return "ran", false
+			}})
+			fakeOf(s).SetToolCalls(bashCall("ls"))
+			msg := send(t, s, nil, "1", "hi")
+			_, id := awaitRequest(t, s, msg)
+			approve(t, s, id, true)
+			testutil.Wait(t, ran, "the command to run")
+			return s, msg
+		},
+		"a cluster write": func(t *testing.T, hold chan struct{}) (*service, ChatMessage) {
+			s := startServiceWithTool(t, recorderTool{testTool: testTool{name: "Recorder"}, hold: hold})
+			fakeOf(s).SetToolCalls(llm.StagedCall("Recorder", `{}`))
+			msg := send(t, s, nil, "1", "hi")
+			awaitWrite(t, s, msg, ApprovalRefused)
+			return s, msg
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			hold := make(chan struct{})
+			s, msg := start(t, hold)
+			_, err := s.db.Write.Exec(refuseApprovals)
+			require.NoError(t, err)
+			close(hold)
+
+			testutil.Wait(t, s.turnOf(msg.ChatID).retrying, "the settle to retry")
+			require.NoError(t, s.stop(t.Context()))
+
+			assert.True(t, messageStatusOf(runStatusOf(t, s.db, msg.RunID)).inFlight(),
+				"the run is left for the next start to fail as stranded")
+		})
+	}
+}
+
+// A turn that cannot read its chat, or finds none, fails before its model is
+// asked: the chat's cluster is what its tools reach. A send that creates its chat
+// reads no chat row, so the swap reaches the turn's read alone.
+func TestATurnThatCannotReadItsChatFails(t *testing.T) {
+	t.Parallel()
+
+	for name, swap := range map[string]string{
+		"a read that fails": `SELECT 1, 2`,
+		"no row":            `SELECT 1 WHERE 0`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := startServiceOn(t, swapped(map[stmtID]string{stmtSelectChat: swap}))
+
+			msg := send(t, s, nil, "1", "hi")
+
+			assert.Equal(t, StatusFailed, awaitSettled(t, s, msg.ChatID, msg.ID).Status)
+			assert.Zero(t, fakeOf(s).Asked())
 		})
 	}
 }

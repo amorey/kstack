@@ -248,3 +248,10 @@ func TestWithReplayIDSetsOneField(t *testing.T) {
 	assert.Equal(t, `1.50`, string(fields["n"]))
 	assert.Len(t, fields, 4)
 }
+
+// A payload that is not an object goes as it is.
+func TestWithReplayIDLeavesANonObjectAlone(t *testing.T) {
+	payload := json.RawMessage(`["call-1"]`)
+
+	assert.Equal(t, payload, withReplayID(payload, "id", "call00003"))
+}

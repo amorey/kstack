@@ -24,6 +24,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/openai/openai-go/v3/responses"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -871,4 +872,14 @@ func TestResponsesMintsASpentIDInsideItsPayload(t *testing.T) {
 		"message:user", "function_call(call00001)", "function_call_output(call00001)",
 	}, inputShape(t, rec.body))
 	assert.Equal(t, "fc_1", responsesInput(rec.body, 4)["id"], "the rest of the item goes as it came")
+}
+
+// An output item that is not a JSON object is unreadable: the record never
+// holds an item the API would refuse on replay.
+func TestResponsesRefusesAnItemThatIsNotAnObject(t *testing.T) {
+	blocks, refused, err := responsesWire{providerID: "openai"}.blocks([]responses.ResponseOutputItemUnion{{Type: "reasoning"}}, false)
+
+	assert.Nil(t, blocks)
+	assert.False(t, refused)
+	assert.Equal(t, ReadError("openai"), err)
 }

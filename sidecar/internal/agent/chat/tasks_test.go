@@ -19,6 +19,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
@@ -1256,4 +1257,40 @@ func TestTheParentsTaskStopReachesASubagentsCommand(t *testing.T) {
 
 	assert.True(t, s.chatTasks("c", parent).Stop("sub"))
 	assert.Equal(t, []bool{false}, held["sub"].stopsSeen())
+}
+
+// taskDirOf is the entry c1 under a root of the test's own, closed at cleanup.
+func taskDirOf(t *testing.T) (entryDir, string) {
+	t.Helper()
+	dir := t.TempDir()
+	root, err := os.OpenRoot(dir)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = root.Close() })
+	return entryDir{root: root, name: "c1"}, dir
+}
+
+// A task's file is always a new one: a second start under the same id is refused.
+func TestATaskFileIsNeverOpenedTwice(t *testing.T) {
+	t.Parallel()
+
+	d, _ := taskDirOf(t)
+	f, _, err := openTaskFile(d, "t1")
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	_, _, err = openTaskFile(d, "t1")
+
+	assert.ErrorIs(t, err, fs.ErrExist)
+}
+
+// Removing the file of a chat with no directory makes none.
+func TestRemovingATaskFileOfNoDirectoryMakesNone(t *testing.T) {
+	t.Parallel()
+
+	d, dir := taskDirOf(t)
+
+	removeTaskFile(d, "t1")
+
+	_, err := os.Stat(filepath.Join(dir, "c1"))
+	assert.ErrorIs(t, err, fs.ErrNotExist)
 }

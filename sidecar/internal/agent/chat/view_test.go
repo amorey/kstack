@@ -253,6 +253,7 @@ func TestWithoutViewCutsTheSection(t *testing.T) {
 	assert.Empty(t, withoutView(view("")), "the only section")
 	assert.Equal(t, s.withSandbox("", sandboxState{}), withoutView(s.withSandbox(view(""), sandboxState{})), "the first section")
 	assert.Equal(t, card, withoutView(card), "no section")
+	assert.Equal(t, viewHeading+"{", withoutView(viewHeading+"{"), "a section never closed")
 }
 
 // A grep is cut at its share as it spells, so one of escaped characters fits.

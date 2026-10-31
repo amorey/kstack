@@ -129,7 +129,7 @@ func (s *service) putGrant(ctx context.Context, st stmts, chatID ChatID, rule pe
 		return permissions.Rule{}, ErrGrantGone
 	}
 	b, err := json.Marshal(rule)
-	if err != nil {
+	if err != nil { // coverage:ignore a Rule is strings and bools, which always marshal
 		return permissions.Rule{}, err
 	}
 	if _, err := st.Exec(ctx, stmtUpsertChatGrant, rule.ID, string(chatID), string(b), millis(normalizeTime(s.now()))); err != nil {

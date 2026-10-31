@@ -593,3 +593,10 @@ func TestARouteAnswersItsOwnRequests(t *testing.T) {
 	assert.Len(t, f.Requests(), 2)
 	assert.Equal(t, 1, sub.Asked())
 }
+
+// Before its first stream the fake was handed no request, and blocks with no
+// text have none to answer by.
+func TestFakeBeforeItsFirstStream(t *testing.T) {
+	assert.Equal(t, Request{}, NewFake(0).LastRequest())
+	assert.Empty(t, lastTextOf([]Block{ToolUseBlock("call-1", "echo", []byte(`{}`))}))
+}

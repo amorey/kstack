@@ -1191,6 +1191,37 @@ func TestAFailedStartTakesBackTheRunAndTheLink(t *testing.T) {
 	assert.Empty(t, taskRows(t, s.db))
 }
 
+// A failed start whose take-back the store refuses leaves the run and the task's
+// row running, for the next start to fail and mark lost.
+func TestAFailedStartWhoseTakeBackFailsLeavesItsRows(t *testing.T) {
+	t.Parallel()
+
+	s := startServiceWithAgent(t)
+	refuse(t, s, "DELETE", "agent_runs")
+
+	msg := cancelAtTheStart(t, s)
+
+	runs := subagentRuns(t, s.db, msg.RunID)
+	require.Len(t, runs, 1)
+	assert.Equal(t, RunRunning, runStatusOf(t, s.db, runs[0].id))
+	rows := taskRows(t, s.db)
+	require.Len(t, rows, 1)
+	assert.Equal(t, taskRunning, rows[0].status)
+}
+
+// A start that cannot read the chat's context starts nothing.
+func TestAStartThatCannotReadTheContextStartsNothing(t *testing.T) {
+	t.Parallel()
+
+	s := startServiceOn(t, swapped(map[stmtID]string{stmtSelectNewestContext: `SELECT 1, 2`}))
+	tr := &turn{runJournal: &runJournal{s: s, chatID: "c", runID: "r", openTool: &toolCallEntry{}}}
+
+	_, err := tr.Start(t.Context(), tools.Delegation{Type: agent.GeneralPurpose, Prompt: "p"})
+
+	assert.ErrorContains(t, err, "newest context")
+	assert.Zero(t, tableCount(t, s.db, "agent_runs"))
+}
+
 // noticeTurnAfterAgent sends a question whose answer calls Agent, and returns the
 // answer of the turn the agent's end starts, once it settles.
 func noticeTurnAfterAgent(t *testing.T, s *service) ChatMessage {

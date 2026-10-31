@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -176,6 +177,18 @@ func TestNewFailsWhenTheStatementsWillNotPrepare(t *testing.T) {
 	_, err := New(db, chatsDirIn(t.TempDir()), monitorDirIn(t.TempDir()), fakeLLM(), noClusterCards, nil, tools.Box{}, noLists, sandbox.Status{}, testSettings(t))
 
 	assert.ErrorContains(t, err, "prepare chat statements")
+}
+
+// A service whose monitor's directory cannot be made is not built.
+func TestNewFailsWhenTheMonitorsDirectoryCannotBeMade(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(monitorDirIn(dir), nil, 0o600))
+
+	_, err := New(openTestDB(t, dir), chatsDirIn(dir), monitorDirIn(dir), fakeLLM(), noClusterCards, nil, tools.Box{}, noLists, sandbox.Status{}, testSettings(t))
+
+	assert.ErrorContains(t, err, "open the monitor's directory")
 }
 
 // A reconcile the service could not run is a failed start, not a service that
@@ -1534,10 +1547,14 @@ func TestASendWhoseStoreFailsWritesNothingAndLeavesTheChatFree(t *testing.T) {
 		id      stmtID
 		swap    string
 		trigger string
+		snap    *Snapshot
 	}{
 		{name: "the chat read", id: stmtSelectChat, swap: `SELECT 1, 2`},
 		{name: "the cluster check", id: stmtSelectClusterAccepts, swap: `SELECT 1, 2`},
+		{name: "the view's call", id: stmtSelectViewCall, swap: `SELECT 1, 2`, snap: &Snapshot{CallID: "call"}},
+		{name: "the newest context", id: stmtSelectNewestContext, swap: `SELECT 1, 2`},
 		{name: "the next seq", id: stmtNextSeq, swap: `SELECT 1, 2`},
+		{name: "the chat's touch", trigger: `CREATE TRIGGER refuse BEFORE UPDATE ON chats BEGIN SELECT RAISE(ABORT, 'refused'); END`},
 		{name: "the run insert", trigger: `CREATE TRIGGER refuse BEFORE INSERT ON agent_runs BEGIN SELECT RAISE(ABORT, 'refused'); END`},
 		{name: "the answer insert", trigger: `CREATE TRIGGER refuse BEFORE INSERT ON messages WHEN NEW.role = 'assistant' BEGIN SELECT RAISE(ABORT, 'refused'); END`},
 	} {
@@ -1553,9 +1570,10 @@ func TestASendWhoseStoreFailsWritesNothingAndLeavesTheChatFree(t *testing.T) {
 				require.NoError(t, err)
 			}
 
-			_, err := s.Send(t.Context(), &c.ID, ModeChat, "1", false, false, false, "fake", "fake", "high", reqID("1"), "hi", nil)
+			_, err := s.Send(t.Context(), &c.ID, ModeChat, "1", false, false, false, "fake", "fake", "high", reqID("1"), "hi", tc.snap)
 
 			assert.Error(t, err)
+			assert.NotErrorIs(t, err, ErrBadRequest)
 			assert.Nil(t, s.turnOf(c.ID))
 			assert.Zero(t, tableCount(t, s.db, "messages"))
 			assert.Zero(t, tableCount(t, s.db, "agent_runs"))
@@ -1577,6 +1595,60 @@ func TestARenameTheStoreRefusesIsNotAMissingChat(t *testing.T) {
 
 	assert.Error(t, err)
 	assert.NotErrorIs(t, err, ErrChatGone)
+}
+
+// A switch the store refuses is the store's error, not a missing chat, and
+// nothing is written.
+func TestASwitchTheStoreRefusesIsNotAMissingChat(t *testing.T) {
+	t.Parallel()
+
+	for name, flip := range map[string]func(s *service, id ChatID) error{
+		"the sandbox": func(s *service, id ChatID) error {
+			_, err := s.SetSandboxDisabled(t.Context(), id, true)
+			return err
+		},
+		"the network": func(s *service, id ChatID) error {
+			_, err := s.SetNetworkEnabled(t.Context(), id, true)
+			return err
+		},
+		"the network off": func(s *service, id ChatID) error {
+			_, err := s.SetNetworkEnabled(t.Context(), id, false)
+			return err
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := newTestService(t)
+			s.sandboxStatus = sandbox.Status{Available: true, NetworkAvailable: true}
+			c := seedChat(t, s.db, aChat("1", time.UnixMilli(1_000).UTC()))
+			refuse(t, s, "UPDATE", "chats")
+
+			err := flip(s, c.ID)
+
+			assert.ErrorContains(t, err, "refused")
+			assert.NotErrorIs(t, err, ErrChatGone)
+			stored, _, err := s.Get(t.Context(), c.ID)
+			require.NoError(t, err)
+			assert.False(t, stored.SandboxDisabled)
+			assert.False(t, stored.NetworkEnabled)
+		})
+	}
+}
+
+// A network switch that cannot read the chat it checks writes nothing.
+func TestANetworkSwitchThatCannotReadTheChatWritesNothing(t *testing.T) {
+	t.Parallel()
+
+	s := startServiceOn(t, swapped(map[stmtID]string{stmtSelectChat: `SELECT 1, 2`}))
+	s.sandboxStatus = sandbox.Status{Available: true, NetworkAvailable: true}
+	c := seedChat(t, s.db, aChat("1", time.UnixMilli(1_000).UTC()))
+
+	_, err := s.SetNetworkEnabled(t.Context(), c.ID, true)
+
+	assert.Error(t, err)
+	assert.NotErrorIs(t, err, ErrChatGone)
+	var enabled bool
+	require.NoError(t, s.db.Read.QueryRow(`SELECT network_enabled FROM chats WHERE id = ?`, string(c.ID)).Scan(&enabled))
+	assert.False(t, enabled)
 }
 
 // A call that ran lands its row under the model call that asked, with what was
@@ -1982,24 +2054,28 @@ func TestAToolThatPanicsClosesItsRow(t *testing.T) {
 	}}, toolCallRows(t, s.db, msg.RunID))
 }
 
-// A start that cannot close a call a previous process left open is a failed start:
-// the sweep is part of it, whichever table refuses.
+// A start that cannot close a call or a task a previous process left open is a
+// failed start: the sweep is part of it, whichever table refuses.
 func TestAStartThatCannotCloseAStrandedCallFails(t *testing.T) {
 	t.Parallel()
 
 	for _, tc := range []struct{ name, trigger string }{
 		{"the model call", `CREATE TRIGGER refuse BEFORE UPDATE ON llm_calls BEGIN SELECT RAISE(ABORT, 'refused'); END`},
 		{"the tool call", `CREATE TRIGGER refuse BEFORE UPDATE ON tool_calls BEGIN SELECT RAISE(ABORT, 'refused'); END`},
+		{"the task", `CREATE TRIGGER refuse BEFORE UPDATE ON background_tasks BEGIN SELECT RAISE(ABORT, 'refused'); END`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			db := openTestDB(t, t.TempDir())
 			now := time.UnixMilli(1_000).UTC()
 			c := seedChat(t, db, aChat("1", now))
 			turn := seedTurn(t, db, c.ID, now)
-			call := appdb.NewID()
+			call, toolCall := appdb.NewID(), appdb.NewID()
 			_, err := db.Write.Exec(`INSERT INTO llm_calls (id, run_id, seq, provider, model, started_at) VALUES (?, ?, 0, 'fake', 'fake', 0)`, call, string(turn.Run))
 			require.NoError(t, err)
-			_, err = db.Write.Exec(`INSERT INTO tool_calls (id, llm_call_id, seq, tool_name, contract_name, status, created_at) VALUES (?, ?, 0, 'echo', 'echo/v1', 'running', 0)`, appdb.NewID(), call)
+			_, err = db.Write.Exec(`INSERT INTO tool_calls (id, llm_call_id, seq, tool_name, contract_name, status, created_at) VALUES (?, ?, 0, 'echo', 'echo/v1', 'running', 0)`, toolCall, call)
+			require.NoError(t, err)
+			_, err = db.Write.Exec(`INSERT INTO background_tasks (id, chat_id, tool_call_id, output_path, status, started_at)
+				VALUES ('task-1', ?, ?, '/r/task-1.output', 'running', 0)`, string(c.ID), toolCall)
 			require.NoError(t, err)
 			_, err = db.Write.Exec(tc.trigger)
 			require.NoError(t, err)

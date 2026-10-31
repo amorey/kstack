@@ -1530,3 +1530,12 @@ func TestMessagesMintsARepeatedForeignID(t *testing.T) {
 	assert.Equal(t, "call00001", messagesContent(rec.body, 4)[0].(map[string]any)["id"])
 	assert.Equal(t, "call00001", messagesContent(rec.body, 5)[0].(map[string]any)["tool_use_id"])
 }
+
+// A reply block whose item is not a JSON object is unreadable: the record never
+// holds an item the API would refuse on replay.
+func TestMessagesRefusesABlockWhoseItemIsNotAnObject(t *testing.T) {
+	blocks, err := messagesWire{providerID: "anthropic"}.answer([]anthropic.ContentBlockUnion{{Type: "thinking"}}, messagesToolInputs{}, false)
+
+	assert.Nil(t, blocks)
+	assert.Equal(t, ReadError("anthropic"), err)
+}
