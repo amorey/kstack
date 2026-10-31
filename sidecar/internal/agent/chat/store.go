@@ -233,7 +233,7 @@ func deleteChat(ctx context.Context, st stmts, id ChatID) (bool, error) {
 		return false, fmt.Errorf("delete chat: %w", err)
 	}
 	n, err := res.RowsAffected()
-	if err != nil {
+	if err != nil { // coverage:ignore modernc.org/sqlite's RowsAffected never fails
 		return false, fmt.Errorf("delete chat: %w", err)
 	}
 	return n > 0, nil
@@ -474,7 +474,7 @@ func claimRun(ctx context.Context, st stmts, id RunID, at time.Time) error {
 		return fmt.Errorf("claim run: %w", err)
 	}
 	n, err := res.RowsAffected()
-	if err != nil {
+	if err != nil { // coverage:ignore modernc.org/sqlite's RowsAffected never fails
 		return fmt.Errorf("claim run: %w", err)
 	}
 	if n == 0 {
@@ -627,7 +627,7 @@ func upsertApproval(ctx context.Context, st stmts, a approval) error {
 	kind, request := approvalCall, sql.NullString{}
 	if a.Request != nil {
 		b, err := json.Marshal(a.Request)
-		if err != nil {
+		if err != nil { // coverage:ignore an ActionRequest is strings and bools, which always marshal
 			return fmt.Errorf("upsert approval: %w", err)
 		}
 		kind, request = approvalAction, sql.NullString{String: string(b), Valid: true}
@@ -980,7 +980,7 @@ func closeStrandedLLMCalls(ctx context.Context, st stmts, at time.Time) (int64, 
 		return 0, fmt.Errorf("close stranded llm calls: %w", err)
 	}
 	n, err := res.RowsAffected()
-	if err != nil {
+	if err != nil { // coverage:ignore modernc.org/sqlite's RowsAffected never fails
 		return 0, fmt.Errorf("close stranded llm calls: %w", err)
 	}
 	return n, nil

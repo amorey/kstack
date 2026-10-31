@@ -244,6 +244,23 @@ func TestTheStartSweepLeavesAChatsDirectoryItCannotList(t *testing.T) {
 	assert.Contains(t, logs.String(), "could not list the chats' directory")
 }
 
+// A monitor's directory the sweep cannot list is logged and left for the next
+// pass, which still reads the live clusters.
+func TestAMonitorSweepLeavesADirectoryItCannotList(t *testing.T) {
+	// CaptureLogs swaps the process's default logger, so this test stays serial.
+
+	dir := t.TempDir()
+	s, err := newService(openTestDB(t, dir), chatsDirIn(dir), monitorDirIn(dir), fakeLLM(), noClusterCards, nil, testReaders, noLists, sandbox.Status{}, testSettings(t))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.chatsRoot.Close(); _ = s.store.Close() })
+	require.NoError(t, s.monitorRoot.Close())
+	logs := testutil.CaptureLogs(t)
+
+	assert.NoError(t, s.sweepMonitors())
+
+	assert.Contains(t, logs.String(), "could not list the monitor's directory")
+}
+
 // The start sweep removes every entry of the chats' directory that is not a
 // chat's: what a failed removal or a crash left.
 func TestTheStartSweepRemovesTheDirectoriesOfGoneChats(t *testing.T) {

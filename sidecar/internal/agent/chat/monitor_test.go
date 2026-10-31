@@ -338,3 +338,56 @@ func TestTheMonitorStartsNoWatch(t *testing.T) {
 	_, watches := box.Runner("LogsWatch")
 	assert.False(t, watches)
 }
+
+// A monitor run holds no task, so there is none to stop.
+func TestAMonitorStopsNoTask(t *testing.T) {
+	t.Parallel()
+	assert.False(t, monitorTasks{}.Stop("task-1"))
+}
+
+// A stopping service starts no monitor run.
+func TestAStoppingServiceRunsNoMonitor(t *testing.T) {
+	t.Parallel()
+
+	s := startMonitorService(t, "", testTool{name: "echo"})
+	setMonitoring(t, s.db, "7", true)
+	require.NoError(t, s.stop(t.Context()))
+
+	_, err := s.RunMonitor(t.Context(), "7", fakeTarget(s), "look")
+
+	assert.ErrorIs(t, err, ErrStopping)
+	assert.Zero(t, tableCount(t, s.db, "agent_runs"))
+}
+
+// A run whose cluster cannot be read is the store's error, with nothing written.
+func TestAMonitorRunWhoseClusterCannotBeReadWritesNothing(t *testing.T) {
+	t.Parallel()
+
+	s := startMonitorService(t, "", testTool{name: "echo"})
+	_, err := s.db.Write.Exec(`ALTER TABLE clusters RENAME COLUMN monitoring_enabled TO renamed`)
+	require.NoError(t, err)
+
+	_, err = s.RunMonitor(t.Context(), "7", fakeTarget(s), "look")
+
+	assert.ErrorContains(t, err, "cluster monitoring")
+	assert.Zero(t, tableCount(t, s.db, "agent_runs"))
+	assert.Zero(t, fakeOf(s).Asked())
+}
+
+// A settle the store refuses leaves the run's row running for the next start to
+// fail; the caller still hears how the run ended.
+func TestAMonitorSettleTheStoreRefusesLeavesTheRunRunning(t *testing.T) {
+	t.Parallel()
+
+	s := startMonitorService(t, "", testTool{name: "echo"})
+	setMonitoring(t, s.db, "7", true)
+	_, err := s.db.Write.Exec(`CREATE TRIGGER refuse BEFORE UPDATE OF status ON agent_runs WHEN NEW.status = 'succeeded'
+		BEGIN SELECT RAISE(ABORT, 'refused'); END`)
+	require.NoError(t, err)
+
+	res, err := s.RunMonitor(t.Context(), "7", fakeTarget(s), "look")
+	require.NoError(t, err)
+
+	assert.Equal(t, RunSucceeded, res.Status)
+	assert.Equal(t, RunRunning, runStatusOf(t, s.db, res.RunID))
+}

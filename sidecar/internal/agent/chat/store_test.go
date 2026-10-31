@@ -118,12 +118,28 @@ func TestAReadWithTheWrongShapeIsReported(t *testing.T) {
 	assert.ErrorContains(t, err, "chat ids by cluster")
 	_, err = failStrandedRuns(ctx, st, "reason", time.UnixMilli(1_000).UTC())
 	assert.ErrorContains(t, err, "fail stranded runs")
+	assertCallReadsFail(t, st, ChatID(appdb.NewID()))
+}
+
+// assertCallReadsFail checks that each read of a chat's calls and notices reports
+// the failure its swapped statement provokes. The calls are read beside the run's
+// own writes, which no test swaps, so the failure is the calls' own.
+func assertCallReadsFail(t *testing.T, st stmts, id ChatID) {
+	t.Helper()
+	ctx := t.Context()
+	_, err := toolCallsByRun(ctx, st, callReads{calls: stmtSelectToolCalls, writes: stmtSelectRunClusterWrites}, string(id))
+	assert.ErrorContains(t, err, "tool calls")
+	_, err = clusterWritesByCall(ctx, st, stmtSelectClusterWrites, string(id))
+	assert.ErrorContains(t, err, "cluster writes")
+	_, err = waitingNotices(ctx, st, id, testReaders)
+	assert.ErrorContains(t, err, "waiting notices")
 }
 
 // multiRowReads is every helper that scans a loop of rows: the reads whose failures
 // the two tests around this swap the statement to provoke.
 var multiRowReads = []stmtID{
 	stmtSelectChats, stmtSelectMessages, stmtSelectChatIDsByCluster, stmtFailStrandedRuns,
+	stmtSelectToolCalls, stmtSelectClusterWrites, stmtSelectWaitingNotices,
 }
 
 // A read that fails partway through its rows is reported, never taken as the rows
@@ -144,7 +160,7 @@ func TestAReadThatFailsPartwayIsReported(t *testing.T) {
 	db := openTestDB(t, t.TempDir())
 	st := prepareTable(t, db, swapped(swaps)).Stmts()
 	c := seedChat(t, db, aChat("1", time.UnixMilli(1_000).UTC()))
-	seedTurn(t, db, c.ID, time.UnixMilli(1_000).UTC())
+	turn := seedTurn(t, db, c.ID, time.UnixMilli(1_000).UTC())
 
 	_, err := listChats(ctx, st)
 	assert.ErrorContains(t, err, "list chats")
@@ -154,6 +170,44 @@ func TestAReadThatFailsPartwayIsReported(t *testing.T) {
 	assert.ErrorContains(t, err, "chat ids by cluster")
 	_, err = failStrandedRuns(ctx, st, "reason", time.UnixMilli(1_000).UTC())
 	assert.ErrorContains(t, err, "fail stranded runs")
+	seedCallRows(t, db, turn.Run, c.ID)
+	assertCallReadsFail(t, st, c.ID)
+}
+
+// seedCallRows files under run one call with a cluster write, whose task has
+// ended with its notice waiting: a row for each read of a chat's calls.
+func seedCallRows(t *testing.T, db *appdb.DB, run RunID, chatID ChatID) {
+	t.Helper()
+	call, toolCall := appdb.NewID(), appdb.NewID()
+	for _, q := range []struct {
+		text string
+		args []any
+	}{
+		{`INSERT INTO llm_calls (id, run_id, seq, provider, model, started_at) VALUES (?, ?, 0, 'fake', 'fake', 0)`, []any{call, string(run)}},
+		{`INSERT INTO tool_calls (id, llm_call_id, seq, tool_name, contract_name, status, created_at) VALUES (?, ?, 0, 'echo', 'echo/v1', 'succeeded', 0)`, []any{toolCall, call}},
+		{`INSERT INTO approvals (id, tool_call_id, kind, request, status, reason, created_at, decided_at) VALUES (?, ?, 'action', '{}', 'allowed', 'auto', 0, 0)`, []any{appdb.NewID(), toolCall}},
+		{`INSERT INTO background_tasks (id, chat_id, tool_call_id, output_path, status, started_at, finished_at) VALUES (?, ?, ?, '/r/t.output', 'exited', 0, 0)`, []any{appdb.NewID(), string(chatID), toolCall}},
+	} {
+		_, err := db.Write.Exec(q.text, q.args...)
+		require.NoError(t, err, q.text)
+	}
+}
+
+// A replayed send whose calls cannot be read is the read's error, never an answer
+// that made no calls.
+func TestAReplayWhoseCallsCannotBeReadIsReported(t *testing.T) {
+	t.Parallel()
+
+	db := openTestDB(t, t.TempDir())
+	st := prepareTable(t, db, swapped(map[stmtID]string{stmtSelectRunToolCalls: `SELECT 1, 2`})).Stmts()
+	c := seedChat(t, db, aChat("1", time.UnixMilli(1_000).UTC()))
+	turn := seedTurn(t, db, c.ID, time.UnixMilli(1_000).UTC())
+	var key string
+	require.NoError(t, db.Read.QueryRow(`SELECT request_key FROM messages WHERE id = ?`, string(turn.User)).Scan(&key))
+
+	_, _, err := answerByRequestKey(t.Context(), st, key, testReaders)
+
+	assert.ErrorContains(t, err, "answer by request key")
 }
 
 // The watches re-read on every ping, and a write transaction is what they would

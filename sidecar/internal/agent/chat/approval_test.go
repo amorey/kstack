@@ -1381,6 +1381,58 @@ func TestARecordOfAPromptIsRefused(t *testing.T) {
 	assert.Empty(t, approvalRows(t, j.s.db))
 }
 
+// A record the store refuses is the store's error, and the open call carries no
+// write the record does not hold.
+func TestARecordTheStoreRefusesIsNotCarried(t *testing.T) {
+	t.Parallel()
+
+	s := newTestService(t)
+	refuse(t, s, "INSERT", "approvals")
+	call := &toolCallEntry{ID: ToolCallID(appdb.NewID())}
+	j := &runJournal{s: s, openTool: call}
+
+	err := j.recordAction(t.Context(), deleteX, permissions.Allowed, "auto mode")
+
+	assert.ErrorContains(t, err, "refused")
+	assert.Empty(t, call.ClusterWrites)
+}
+
+// A decision the request does not name is refused, whatever the request.
+func TestAnUnknownDecisionIsRefused(t *testing.T) {
+	t.Parallel()
+
+	for _, request := range []*tools.ActionRequest{nil, {Grantable: true}} {
+		_, err := (&waiter{request: request}).decide("sometimes")
+		assert.ErrorIs(t, err, ErrBadRequest)
+	}
+}
+
+// A call whose own first row cannot be written is never asked: nothing runs,
+// the call is closed not-run, and nothing waits on a request nobody can see.
+func TestACallWhoseRowCannotBeWrittenIsNotAsked(t *testing.T) {
+	t.Parallel()
+
+	sh := &fakeBash{}
+	s := startServiceWithTool(t, sh)
+	_, err := s.db.Write.Exec(`CREATE TRIGGER refuse BEFORE INSERT ON tool_calls WHEN NEW.status = 'awaiting_approval'
+		BEGIN SELECT RAISE(ABORT, 'refused'); END`)
+	require.NoError(t, err)
+	fakeOf(s).SetToolCalls(bashCall("ls"))
+
+	msg := send(t, s, nil, "1", "hi")
+	got := awaitSettled(t, s, msg.ChatID, msg.ID)
+
+	assert.Equal(t, StatusFailed, got.Status)
+	assert.Empty(t, sh.commands())
+	assert.Empty(t, approvalRows(t, s.db))
+	rows := toolCallRows(t, s.db, msg.RunID)
+	require.Len(t, rows, 1)
+	assert.JSONEq(t, `{"error":"not-run"}`, rows[0].errText)
+	s.turnsMu.Lock()
+	assert.Empty(t, s.pending)
+	s.turnsMu.Unlock()
+}
+
 // actionRequests are the kind and the stored request of every approval, in
 // the order written.
 func actionRequests(t *testing.T, db *appdb.DB) (kinds []string, requests []tools.ActionRequest) {

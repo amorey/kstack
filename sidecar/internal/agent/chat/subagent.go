@@ -182,7 +182,7 @@ func (a *agentTask) run(ctx context.Context, spec loop.Turn, f *os.File) {
 	c.loop(ctx, spec, c)
 	report := c.report[:tools.RuneBoundary(c.report, min(len(c.report), tools.FileLimit))]
 	_, err := f.WriteString(report)
-	if err = errors.Join(err, f.Close()); err != nil {
+	if err = errors.Join(err, f.Close()); err != nil { // coverage:ignore only a full or failing disk refuses a write to the file the start just made
 		slog.Warn("could not write an agent's report to its file", "err", err)
 	}
 }

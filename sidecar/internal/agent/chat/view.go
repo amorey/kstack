@@ -212,8 +212,8 @@ func cutTo(s string, limit int) string {
 // marshalledLen is how many bytes v takes in a section.
 func marshalledLen(v any) int {
 	raw, err := fencejson.Marshal(v)
-	if err != nil {
-		panic(err) // strings, counts and lists of them always marshal
+	if err != nil { // coverage:ignore strings, counts and lists of them always marshal
+		panic(err)
 	}
 	return len(raw)
 }

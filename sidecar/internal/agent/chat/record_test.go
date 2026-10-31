@@ -72,6 +72,15 @@ func TestBlocksOfRefusesAColumnThatIsNotJSON(t *testing.T) {
 	assert.Error(t, err)
 }
 
+// Citations that are not JSON are the read's error, never a message citing nothing.
+func TestCitationListRefusesAStringThatIsNotJSON(t *testing.T) {
+	t.Parallel()
+
+	_, err := ChatMessage{Citations: "not json"}.CitationList()
+
+	assert.ErrorContains(t, err, "citations")
+}
+
 // A block whose Input is not JSON fails loudly rather than writing a row the read
 // cannot parse. llm.ToolUseBlock is what keeps it from happening.
 func TestContentOfABlockWithBrokenInputPanics(t *testing.T) {

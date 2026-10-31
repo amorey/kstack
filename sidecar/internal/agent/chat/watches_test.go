@@ -336,3 +336,14 @@ func TestAWatchsTaskCarriesItsLines(t *testing.T) {
 	assert.Equal(t, "it reached its line limit", task.EndedBecause)
 	assert.Equal(t, end.Result.ViewAround, task.ViewAround)
 }
+
+// A watch starts only from a running call: its task's row hangs off the call.
+func TestAWatchStartsOnlyFromARunningCall(t *testing.T) {
+	t.Parallel()
+
+	s := newTestService(t)
+	for _, run := range []*runJournal{nil, {s: s, chatID: "c"}} {
+		_, err := s.chatWatches("c", run).Start(newFakeWatch())
+		assert.ErrorIs(t, err, errNoOpenCall)
+	}
+}

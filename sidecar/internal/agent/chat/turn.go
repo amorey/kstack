@@ -468,7 +468,7 @@ func (j *runJournal) ToolCallFinished(ctx context.Context, call, result llm.Bloc
 	row.Status, row.Result, row.Error = toolSucceeded, result.Text, ""
 	if shown != nil {
 		b, err := json.Marshal(shown)
-		if err != nil {
+		if err != nil { // coverage:ignore an Action is strings, bools and numbers, which always marshal
 			return fmt.Errorf("tool call finished: %w", err)
 		}
 		row.Shown = string(b)
@@ -761,7 +761,7 @@ func withStoredCalls(live, stored rawjson.RawJSON) rawjson.RawJSON {
 		}
 	}
 	b, err := json.Marshal(liveCalls)
-	if err != nil {
+	if err != nil { // coverage:ignore both lists were decoded from JSON, which always marshals back
 		return live
 	}
 	return rawjson.RawJSON(b)

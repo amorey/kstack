@@ -118,9 +118,7 @@ func withSection(card, heading string, fields map[string]any) string {
 	if err == nil {
 		card, err = clustercard.WithSection(card, heading, raw)
 	}
-	if err != nil {
-		// Strings, lists of strings and counts always marshal, and WithSection
-		// takes any one value.
+	if err != nil { // coverage:ignore strings, lists of strings and counts always marshal, and WithSection takes any one value
 		panic(err)
 	}
 	return card
