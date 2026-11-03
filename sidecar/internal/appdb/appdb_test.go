@@ -31,7 +31,7 @@ func TestOpenCreatesMigratesAndPersists(t *testing.T) {
 	var v int
 	require.NoError(t, db.Write.QueryRow(`SELECT COALESCE(MAX(version), 0) FROM schema_migrations`).Scan(&v))
 	require.Equal(t, 1, v)
-	requireTables(t, db.Write)
+	requireTables(t, db.Write.DB)
 	require.NoError(t, db.Close())
 
 	// Reopening the same file is idempotent — migrations are not re-applied.
@@ -40,7 +40,7 @@ func TestOpenCreatesMigratesAndPersists(t *testing.T) {
 	t.Cleanup(func() { _ = db2.Close() })
 	require.NoError(t, db2.Write.QueryRow(`SELECT COALESCE(MAX(version), 0) FROM schema_migrations`).Scan(&v))
 	require.Equal(t, 1, v)
-	requireTables(t, db2.Write)
+	requireTables(t, db2.Write.DB)
 }
 
 // The reader is opened through OpenReader, not a second OpenWriter: query_only is in
@@ -205,11 +205,11 @@ func TestTheCallTablesCascadeOffTheRun(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 
-	require.Equal(t, []string{"run_id -> agent_runs.id CASCADE"}, foreignKeys(t, db.Read, "llm_calls"))
-	require.Equal(t, []string{"spawned_run_id -> agent_runs.id SET NULL", "llm_call_id -> llm_calls.id CASCADE"}, foreignKeys(t, db.Read, "tool_calls"))
-	require.Equal(t, []string{"tool_call_id -> tool_calls.id CASCADE"}, foreignKeys(t, db.Read, "approvals"))
+	require.Equal(t, []string{"run_id -> agent_runs.id CASCADE"}, foreignKeys(t, db.Read.DB, "llm_calls"))
+	require.Equal(t, []string{"spawned_run_id -> agent_runs.id SET NULL", "llm_call_id -> llm_calls.id CASCADE"}, foreignKeys(t, db.Read.DB, "tool_calls"))
+	require.Equal(t, []string{"tool_call_id -> tool_calls.id CASCADE"}, foreignKeys(t, db.Read.DB, "approvals"))
 	require.Equal(t, []string{"tool_call_id -> tool_calls.id CASCADE", "chat_id -> chats.id CASCADE"},
-		foreignKeys(t, db.Read, "background_tasks"))
+		foreignKeys(t, db.Read.DB, "background_tasks"))
 
 	for _, q := range []string{
 		`INSERT INTO clusters (id, source, created_at, updated_at) VALUES ('k', 'cloud', 0, 0)`,
@@ -227,7 +227,7 @@ func TestTheCallTablesCascadeOffTheRun(t *testing.T) {
 		_, err := db.Write.Exec(q)
 		require.NoError(t, err, q)
 	}
-	requireForeignKeysClean(t, db.Read)
+	requireForeignKeysClean(t, db.Read.DB)
 
 	_, err = db.Write.Exec(`DELETE FROM agent_runs WHERE id = 'child'`)
 	require.NoError(t, err)
@@ -242,7 +242,7 @@ func TestTheCallTablesCascadeOffTheRun(t *testing.T) {
 		require.NoError(t, db.Read.QueryRow(`SELECT COUNT(*) FROM `+table).Scan(&n))
 		require.Zero(t, n, table)
 	}
-	requireForeignKeysClean(t, db.Read)
+	requireForeignKeysClean(t, db.Read.DB)
 }
 
 // A cluster's memories go with its row; a chat's delete leaves the memories it
@@ -254,7 +254,7 @@ func TestMemoriesHangOffTheirClusterAndOutliveTheirChat(t *testing.T) {
 	t.Cleanup(func() { _ = db.Close() })
 
 	require.Equal(t, []string{"chat_id -> chats.id SET NULL", "cluster_id -> clusters.id CASCADE"},
-		foreignKeys(t, db.Read, "memories"))
+		foreignKeys(t, db.Read.DB, "memories"))
 
 	for _, q := range []string{
 		`INSERT INTO clusters (id, source, created_at, updated_at) VALUES ('k', 'cloud', 0, 0)`,
@@ -295,7 +295,7 @@ func TestMemoriesHangOffTheirClusterAndOutliveTheirChat(t *testing.T) {
 	}
 	require.NoError(t, rows.Err())
 	require.Equal(t, []string{"m2", "m4"}, ids)
-	requireForeignKeysClean(t, db.Read)
+	requireForeignKeysClean(t, db.Read.DB)
 }
 
 func requireForeignKeysClean(t *testing.T, db *sql.DB) {

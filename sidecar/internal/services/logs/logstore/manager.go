@@ -55,6 +55,9 @@ type Manager struct {
 	sweeps func(cacheID int64, r sweepReport)
 	// podsPerSweep is the most pods one sweep asks about: sweepPods, or a test's.
 	podsPerSweep int
+	// closeBudget is how long a file's close waits for a connection still in use:
+	// sqlitepool.CloseBudget, or less in a test.
+	closeBudget time.Duration
 
 	// mu guards everything below. It is never held across a file's open, close or delete,
 	// so a slow disk or a long query on one cache stalls no other.
@@ -71,6 +74,13 @@ type Manager struct {
 	// removed is the caches Remove has retired. A cache's id is never reused, so refusing
 	// it for the manager's life is the whole rule.
 	removed map[int64]bool
+	// stale is each cache's file whose close ran out of budget, so a connection of it may
+	// still be open. SQLite's close of a file's last connection deletes the WAL by path,
+	// so nothing deletes or creates the file at that path until a clear, a removal or an
+	// open has waited that file's pools out. A cache has an entry or a stale file, never
+	// both: an open waits the stale file out first, and every path that records one has
+	// detached its entry.
+	stale map[int64]*file
 	// closed is set by Close, after which nothing opens.
 	closed bool
 	// podsGone answers which pods the mirror no longer holds, nil until SetPodsGone.
@@ -94,9 +104,11 @@ func NewManager(dir string, ret Retention) *Manager {
 		now:          time.Now,
 		after:        time.After,
 		podsPerSweep: sweepPods,
+		closeBudget:  sqlitepool.CloseBudget,
 		entries:      map[int64]*entry{},
 		busy:         map[int64]chan struct{}{},
 		removed:      map[int64]bool{},
+		stale:        map[int64]*file{},
 	}
 }
 
@@ -124,9 +136,17 @@ func (m *Manager) OpenOrCreate(cacheID int64) (*Store, error) {
 		return &Store{m: m, cacheID: cacheID, e: e}, nil
 	}
 
+	stale := m.stale[cacheID]
 	m.mu.Unlock()
-	f, err := openFile(m.path(cacheID))
+	if stale != nil {
+		if err := stale.closePools(); err != nil {
+			m.mu.Lock()
+			return nil, fmt.Errorf("open log store %d: %w", cacheID, err)
+		}
+	}
+	f, err := openFile(m.path(cacheID), m.closeBudget)
 	m.mu.Lock()
+	delete(m.stale, cacheID)
 	if err != nil {
 		return nil, fmt.Errorf("open log store %d: %w", cacheID, err)
 	}
@@ -134,6 +154,7 @@ func (m *Manager) OpenOrCreate(cacheID int64) (*Store, error) {
 		// Close ran while the file opened, and had no entry of this one to close.
 		m.mu.Unlock()
 		closeErr := f.close()
+		m.fileClosed(cacheID, f, closeErr)
 		m.mu.Lock()
 		return nil, errors.Join(fmt.Errorf("open log store %d: %w", cacheID, ErrClosed), closeErr)
 	}
@@ -174,24 +195,54 @@ func (m *Manager) Remove(cacheID int64) error {
 }
 
 // retireLocked closes cacheID's file if one is open, drops its entry, and deletes the
-// file. The delete runs whatever the close answered: the file is unusable either way.
-// It is called with mu held and lets go of it for the close and the delete.
+// file. A file a connection still holds is kept as stale and not deleted: the caller's
+// retry waits its pools out first. Any other close failure leaves the delete to run,
+// since the file is unusable either way. It is called with mu held and lets go of it for
+// the close and the delete.
 func (m *Manager) retireLocked(cacheID int64) error {
 	// First, so an open in flight installs its entry and a close in flight finishes
 	// before anything here looks.
 	m.acquireLocked(cacheID)
 	f := m.detachLocked(cacheID)
+	stale := m.stale[cacheID]
 	m.mu.Unlock()
 
-	var closeErr error
+	var err error
 	if f != nil {
-		closeErr = errors.Join(f.close(), sqlitepool.WaitClosed(sqlitepool.CloseBudget, f.pools()...))
+		err = f.close()
 	}
-	err := errors.Join(closeErr, deleteFiles(m.path(cacheID)))
+	// A stale file waited out is forgotten below; one still held stays.
+	if stale != nil {
+		if waitErr := stale.closePools(); waitErr != nil {
+			err = errors.Join(err, waitErr)
+		} else {
+			stale = nil
+		}
+	}
+	keep := stale != nil || (f != nil && m.fileClosed(cacheID, f, err))
+	if !keep {
+		err = errors.Join(err, deleteFiles(m.path(cacheID)))
+	}
 
 	m.mu.Lock()
+	if !keep {
+		delete(m.stale, cacheID)
+	}
 	m.releaseLocked(cacheID)
 	return err
+}
+
+// fileClosed records what closing cacheID's file f answered, and reports whether the file
+// is kept as stale: it is when err says a connection still holds it. Every path that
+// closes a file reports through here, so none can forget the rule. It takes mu.
+func (m *Manager) fileClosed(cacheID int64, f *file, err error) (stale bool) {
+	if !errors.Is(err, sqlitepool.ErrStillOpen) {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.stale[cacheID] = f
+	return true
 }
 
 // detachLocked takes cacheID's file out of its entry and drops the entry, so every claim
@@ -241,23 +292,32 @@ func (m *Manager) Start(context.Context) (func(context.Context) error, error) {
 func (m *Manager) Close() error {
 	m.mu.Lock()
 	m.closed = true
-	files := map[int64]*file{}
+	var ids []int64
+	var files []*file
 	for id := range m.entries {
-		files[id] = m.detachLocked(id)
+		ids = append(ids, id)
+		files = append(files, m.detachLocked(id))
 	}
-	for id := range files {
+	for _, id := range ids {
 		m.acquireLocked(id)
 	}
 	m.mu.Unlock()
 
-	var errs []error
-	for _, f := range files {
-		errs = append(errs, f.close())
+	// At once, so the files' waits for a connection still in use overlap: a shutdown
+	// spends one close budget, however many caches are open.
+	errs := make([]error, len(files))
+	var wg sync.WaitGroup
+	for i, f := range files {
+		wg.Go(func() { errs[i] = f.close() })
+	}
+	wg.Wait()
+	for i, f := range files {
+		m.fileClosed(ids[i], f, errs[i])
 	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	for id := range files {
+	for _, id := range ids {
 		m.releaseLocked(id)
 	}
 	return errors.Join(errs...)

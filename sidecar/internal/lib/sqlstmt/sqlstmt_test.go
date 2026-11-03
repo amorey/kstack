@@ -52,15 +52,14 @@ var testTable = []Statement{
 func openPools(t *testing.T) (write, read *sql.DB) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "test.db")
-	write, err := sqlitepool.OpenWriter(path)
+	w, err := sqlitepool.OpenWriter(path)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = write.Close() })
-	_, err = write.ExecContext(t.Context(), `CREATE TABLE t (id TEXT PRIMARY KEY)`)
+	t.Cleanup(func() { _ = w.Close() })
+	_, err = w.ExecContext(t.Context(), `CREATE TABLE t (id TEXT PRIMARY KEY)`)
 	require.NoError(t, err)
-	read, err = sqlitepool.OpenReader(path, 2)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = read.Close() })
-	return write, read
+	r := sqlitepool.OpenReader(path, 2)
+	t.Cleanup(func() { _ = r.Close() })
+	return w.DB, r.DB
 }
 
 func prepareTestSet(t *testing.T) *Set[testStmt] {

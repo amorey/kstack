@@ -15,6 +15,7 @@
 package logstore
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"os"
@@ -28,6 +29,7 @@ import (
 
 	"github.com/kstackhq/kstack/sidecar/internal/lib/sqlitemigrate"
 	"github.com/kstackhq/kstack/sidecar/internal/lib/sqlitemigrate/sqlitemigratetest"
+	"github.com/kstackhq/kstack/sidecar/internal/lib/sqlitepool"
 )
 
 // newTestManager is a manager over a temp directory, closed when the test ends.
@@ -479,4 +481,88 @@ func TestAStaleOpenChunkIsClosedWhenTheFileOpens(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, tail.Close(t.Context(), lines(at(1, 1))))
 	assert.Equal(t, []Chunk{chunk(at(0, 0), at(1, 1))}, chunksOfStream(t, s, id), "a tailer extends it")
+}
+
+// A file whose close ran out of budget may still have a connection open, and SQLite's
+// close of a file's last connection deletes the WAL by path: deleting the file and
+// creating a fresh one at that path would hand the fresh one's WAL to that close. So
+// nothing deletes or opens the path until a retry has waited the file's pools out.
+func TestNothingTouchesThePathOfAFileStillClosing(t *testing.T) {
+	t.Parallel()
+	m, dir := newTestManager(t)
+	m.closeBudget = 0
+	s := open(t, m, 1)
+	t.Cleanup(func() { assert.NoError(t, s.Close()) })
+	// Held straight from the pool, as a cancelled transaction's rollback holds one on
+	// database/sql's goroutine, so the close finds it in use.
+	var conn *sql.Conn
+	using(t, s, func(f *file) {
+		var err error
+		conn, err = f.db.Conn(context.Background())
+		require.NoError(t, err)
+	})
+	path := filepath.Join(dir, "1.db")
+
+	require.ErrorIs(t, m.Clear(1), sqlitepool.ErrStillOpen)
+	assert.FileExists(t, path, "deleted under an open connection")
+	_, err := m.OpenOrCreate(1)
+	assert.ErrorIs(t, err, sqlitepool.ErrStillOpen, "opened over an open connection")
+	require.ErrorIs(t, m.Remove(1), sqlitepool.ErrStillOpen, "the retry found the connection closed")
+	assert.FileExists(t, path)
+
+	require.NoError(t, conn.Close())
+
+	require.NoError(t, m.Remove(1))
+	assert.NoFileExists(t, path)
+}
+
+// The manager's Close keeps a file a connection still holds as stale too, since the
+// cache pass may still remove the cache after the shutdown began.
+func TestCloseKeepsAFileStillClosingForTheRemoveAfterIt(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	m := NewManager(dir, testRetention)
+	m.closeBudget = 0
+	s := open(t, m, 1)
+	t.Cleanup(func() { assert.NoError(t, s.Close()) })
+	var conn *sql.Conn
+	using(t, s, func(f *file) {
+		var err error
+		conn, err = f.db.Conn(context.Background())
+		require.NoError(t, err)
+	})
+	path := filepath.Join(dir, "1.db")
+
+	require.ErrorIs(t, m.Close(), sqlitepool.ErrStillOpen)
+	require.ErrorIs(t, m.Remove(1), sqlitepool.ErrStillOpen)
+	assert.FileExists(t, path, "deleted under an open connection")
+	require.NoError(t, conn.Close())
+
+	require.NoError(t, m.Remove(1))
+	assert.NoFileExists(t, path)
+}
+
+// The last claim's Close keeps a file a connection still holds as stale too: it is the
+// commonest close, and a Clear after it would otherwise delete under the connection.
+func TestTheLastCloseKeepsAFileStillClosing(t *testing.T) {
+	t.Parallel()
+	m, dir := newTestManager(t)
+	m.closeBudget = 0
+	s := open(t, m, 1)
+	var conn *sql.Conn
+	using(t, s, func(f *file) {
+		var err error
+		conn, err = f.db.Conn(context.Background())
+		require.NoError(t, err)
+	})
+	path := filepath.Join(dir, "1.db")
+
+	require.ErrorIs(t, s.Close(), sqlitepool.ErrStillOpen)
+
+	require.ErrorIs(t, m.Clear(1), sqlitepool.ErrStillOpen)
+	assert.FileExists(t, path, "deleted under an open connection")
+	require.NoError(t, conn.Close())
+
+	require.NoError(t, m.Clear(1))
+	assert.NoFileExists(t, path)
 }

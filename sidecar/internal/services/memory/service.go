@@ -138,7 +138,7 @@ type service struct {
 
 // newService prepares the statements over db. Nothing runs until Start.
 func newService(db *appdb.DB, uids ServerUIDReader) (*service, error) {
-	st, err := sqlstmt.Prepare[stmtID](context.Background(), db.Write, db.Read, statements)
+	st, err := sqlstmt.Prepare[stmtID](context.Background(), db.Write.DB, db.Read.DB, statements)
 	if err != nil {
 		return nil, fmt.Errorf("prepare memory statements: %w", err)
 	}

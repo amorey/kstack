@@ -18,9 +18,6 @@
 package sqlitepool
 
 import (
-	"context"
-	"database/sql"
-	"database/sql/driver"
 	"fmt"
 	"os"
 	"time"
@@ -32,7 +29,7 @@ import (
 // pool rather than fighting at the SQLite layer, with the standard PRAGMAs in the DSN
 // (WAL, 5s busy_timeout, synchronous=NORMAL, foreign_keys, auto_vacuum=INCREMENTAL,
 // immediate txlock).
-func OpenWriter(path string) (*sql.DB, error) {
+func OpenWriter(path string) (*Pool, error) {
 	// modernc applies these _pragma values on each new connection.
 	//
 	// auto_vacuum must reach a file before anything writes to it, and journal_mode=WAL
@@ -46,15 +43,12 @@ func OpenWriter(path string) (*sql.DB, error) {
 		"&_pragma=foreign_keys(on)" +
 		"&_pragma=auto_vacuum(incremental)" +
 		"&_txlock=immediate"
-	db, err := sql.Open("sqlite", dsn)
-	if err != nil { // coverage:ignore the driver is registered and opens lazily, so sql.Open cannot fail
-		return nil, err
-	}
+	db := newPool(newConnector(&sqlite.Driver{}, dsn))
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 	db.SetConnMaxIdleTime(5 * time.Minute)
 
-	// sql.Open is lazy — the file does not exist until a connection runs. Ping first,
+	// The pool is lazy — the file does not exist until a connection runs. Ping first,
 	// then fix the mode: a file written by an older build kept the umask it was born with.
 	// The siblings are absent on a fresh open; SQLite creates them from the database's
 	// mode once that is fixed.
@@ -98,18 +92,15 @@ func OpenWriter(path string) (*sql.DB, error) {
 // The pool keeps every connection it opens until the idle timeout takes it: database/sql's
 // default of 2 idle would close exactly the connections the pool was sized to keep, and
 // reopening one re-runs the pragmas.
-func OpenReader(path string, maxConns int) (*sql.DB, error) {
+func OpenReader(path string, maxConns int) *Pool {
 	dsn := "file:" + path +
 		"?_pragma=busy_timeout(5000)" +
 		"&_pragma=query_only(true)"
-	db, err := sql.Open("sqlite", dsn)
-	if err != nil { // coverage:ignore the driver is registered and opens lazily, so sql.Open cannot fail
-		return nil, err
-	}
+	db := newPool(newConnector(&sqlite.Driver{}, dsn))
 	db.SetMaxOpenConns(maxConns)
 	db.SetMaxIdleConns(maxConns)
 	db.SetConnMaxIdleTime(5 * time.Minute)
-	return db, nil
+	return db
 }
 
 // OpenQuery opens a pool of read-only connections at path for statements the caller
@@ -118,8 +109,8 @@ func OpenReader(path string, maxConns int) (*sql.DB, error) {
 // keeps no idle connection: every checkout is a fresh one, so nothing left on a
 // connection reaches the next checkout. The file must exist; nothing is opened until the
 // first checkout.
-func OpenQuery(d *sqlite.Driver, path string, maxConns int) *sql.DB {
-	db := sql.OpenDB(queryConnector(d, path))
+func OpenQuery(d *sqlite.Driver, path string, maxConns int) *Pool {
+	db := newPool(queryConnector(d, path))
 	db.SetMaxOpenConns(maxConns)
 	db.SetMaxIdleConns(0)
 	return db
@@ -128,30 +119,14 @@ func OpenQuery(d *sqlite.Driver, path string, maxConns int) *sql.DB {
 // OpenOwnQuery is OpenQuery for statements the caller wrote. Those leave nothing on a
 // connection, so the pool keeps every connection it opens until the idle timeout, as
 // OpenReader does, and d's hooks run once per connection rather than once per statement.
-func OpenOwnQuery(d *sqlite.Driver, path string, maxConns int) *sql.DB {
-	db := sql.OpenDB(queryConnector(d, path))
+func OpenOwnQuery(d *sqlite.Driver, path string, maxConns int) *Pool {
+	db := newPool(queryConnector(d, path))
 	db.SetMaxOpenConns(maxConns)
 	db.SetMaxIdleConns(maxConns)
 	db.SetConnMaxIdleTime(5 * time.Minute)
 	return db
 }
 
-func queryConnector(d *sqlite.Driver, path string) connector {
-	return connector{d: d, dsn: "file:" + path + "?mode=ro&_pragma=busy_timeout(5000)"}
+func queryConnector(d *sqlite.Driver, path string) *connector {
+	return newConnector(d, "file:"+path+"?mode=ro&_pragma=busy_timeout(5000)")
 }
-
-// connector opens through a caller's driver: modernc's own NewConnector always uses the
-// driver it registers as "sqlite".
-type connector struct {
-	d   *sqlite.Driver
-	dsn string
-}
-
-func (c connector) Connect(ctx context.Context) (driver.Conn, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	return c.d.Open(c.dsn)
-}
-
-func (c connector) Driver() driver.Driver { return c.d }

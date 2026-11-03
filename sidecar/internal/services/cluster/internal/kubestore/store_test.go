@@ -101,7 +101,7 @@ func db(t *testing.T, s *Store) *sql.DB {
 	t.Helper()
 	f, err := s.file()
 	require.NoError(t, err)
-	return f.db
+	return f.db.DB
 }
 
 // closedStore is a claim whose cache went away while it was held, so every read and write

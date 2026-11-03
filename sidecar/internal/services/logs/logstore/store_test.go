@@ -27,13 +27,14 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/kstackhq/kstack/sidecar/internal/lib/sqlitepool"
 	"github.com/kstackhq/kstack/sidecar/internal/lib/testutil"
 )
 
 // openTestFile opens a fresh file under a temp directory, closed when the test ends.
 func openTestFile(t *testing.T) *file {
 	t.Helper()
-	f, err := openFile(filepath.Join(t.TempDir(), "1.db"))
+	f, err := openFile(filepath.Join(t.TempDir(), "1.db"), sqlitepool.CloseBudget)
 	require.NoError(t, err)
 	t.Cleanup(func() { assert.NoError(t, f.close()) })
 	return f
@@ -158,12 +159,12 @@ func countStreams(t *testing.T, f *file) int {
 func TestAFileReopensWithWhatItHeld(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "logs", "1.db")
-	f, err := openFile(path)
+	f, err := openFile(path, sqlitepool.CloseBudget)
 	require.NoError(t, err)
 	insertStream(t, f)
 	require.NoError(t, f.close())
 
-	f, err = openFile(path)
+	f, err = openFile(path, sqlitepool.CloseBudget)
 	require.NoError(t, err)
 	t.Cleanup(func() { assert.NoError(t, f.close()) })
 
@@ -176,7 +177,7 @@ func TestAFileThatCannotOpenIsRefused(t *testing.T) {
 	// prepared opens a file and runs stmt on it, leaving it closed for openFile to try.
 	prepared := func(stmt string) func(t *testing.T, path string) {
 		return func(t *testing.T, path string) {
-			f, err := openFile(path)
+			f, err := openFile(path, sqlitepool.CloseBudget)
 			require.NoError(t, err)
 			id := insertStream(t, f)
 			_, err = f.db.Exec(`INSERT INTO chunks (stream_id, pattern, from_ns, from_ord, to_ns, to_ord, backend, at_beginning, at_end, open, bytes, read_at_ms)
@@ -215,7 +216,7 @@ func TestAFileThatCannotOpenIsRefused(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "logs", "1.db")
 			tc.setup(t, path)
 
-			_, err := openFile(path)
+			_, err := openFile(path, sqlitepool.CloseBudget)
 			assert.ErrorContains(t, err, tc.want)
 		})
 	}

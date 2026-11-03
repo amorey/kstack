@@ -213,8 +213,7 @@ func TestASweepSurvivesAVacuumItCannotRun(t *testing.T) {
 	// A read-only pool over the same file: the freelist still reads, and the vacuum that
 	// would hand its pages back cannot write.
 	f := openFileOf(t, store)
-	readOnly, err := openReadOnly(filepath.Join(dir, "1.db"))
-	require.NoError(t, err)
+	readOnly := openReadOnly(filepath.Join(dir, "1.db"))
 	t.Cleanup(func() { require.NoError(t, readOnly.Close()) })
 	// The handle being displaced is the only reference left to it, and Windows will not
 	// unlink a file something still holds open.

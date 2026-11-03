@@ -27,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/watch"
 
+	"github.com/kstackhq/kstack/sidecar/internal/lib/sqlitepool"
 	"github.com/kstackhq/kstack/sidecar/internal/lib/sqlstmt"
 )
 
@@ -95,18 +96,18 @@ type file struct {
 	// cacheID is the key the size verdict is published under, and what the janitor's log
 	// lines name.
 	cacheID int64
-	db      *sql.DB
+	db      *sqlitepool.Pool
 	// readDB is the reader pool beside the writer: the watches re-read on every ping, and
 	// a read must not queue behind the one write connection. Distinct from the manager's
 	// openReadOnly, which opens a CLOSED cache's file per call to measure it; this serves
 	// an open one for the file's life.
-	readDB *sql.DB
+	readDB *sqlitepool.Pool
 	// queryDB is KubeQuery's pool: read-only connections through queryDriver, none kept
 	// idle, so nothing one statement leaves on its connection reaches the next.
-	queryDB *sql.DB
+	queryDB *sqlitepool.Pool
 	// ownQueryDB is the same kind of connection for the sidecar's own statements, kept
 	// between them: a statement the sidecar wrote leaves nothing on its connection.
-	ownQueryDB *sql.DB
+	ownQueryDB *sqlitepool.Pool
 	// own is the statements the sidecar's readings run, compiled on ownQueryDB.
 	own *ownStmts
 	// onPrepare, onQuery and afterQuery are seams for a test: onPrepare runs as a
@@ -131,6 +132,8 @@ type file struct {
 	stopJanitor func()
 	// vacuumPages bounds what one sweep hands back: vacuumPagesPerSweep, or less in a test.
 	vacuumPages int64
+	// closeBudget is how long closePools waits for a connection still in use.
+	closeBudget time.Duration
 	// now is the wall clock in millis; a seam so a test can freeze it. Reads go through
 	// stamp, never here.
 	now func() int64
@@ -225,7 +228,7 @@ func (f *file) notify(key string) {
 	f.wakeJanitor()
 }
 
-// close closes both pools and ends every subscriber, which is how a clear or a
+// close closes the pools and ends every subscriber, which is how a clear or a
 // shutdown reaches a live watch.
 //
 // It interrupts the file's queries and waits for every operation on it to end first, so
@@ -237,13 +240,15 @@ func (f *file) close() error {
 		f.stopJanitor()
 	}
 	f.hub.Close()
-	return errors.Join(f.set.Close(), f.own.close(), f.queryDB.Close(), f.ownQueryDB.Close(), f.db.Close(), f.readDB.Close())
+	return errors.Join(f.set.Close(), f.own.close(), f.closePools())
 }
 
-// pools is what a delete of the file waits on after close: a connection still in use
-// at close holds the file past it.
-func (f *file) pools() []*sql.DB {
-	return []*sql.DB{f.db, f.readDB, f.queryDB, f.ownQueryDB}
+// closePools closes the pools and waits for a connection database/sql still holds, all
+// of them under one budget. Called again on a file whose wait ran out, it waits again.
+// The mode=ro pools go first; the reader's query_only is a rule for its statements,
+// not the file's mode, so it may close last.
+func (f *file) closePools() error {
+	return sqlitepool.CloseAll(f.closeBudget, f.queryDB, f.ownQueryDB, f.db, f.readDB)
 }
 
 // startJanitor spawns this file's sweeper, or nothing when no interval is set.
@@ -266,8 +271,9 @@ func (f *file) startJanitor(ret Retention) {
 // newFile wraps the open pools and their prepared set. Nothing else builds one —
 // openFile is the only caller.
 func newFile(
-	path string, cacheID int64, db, readDB, queryDB, ownQueryDB *sql.DB,
+	path string, cacheID int64, db, readDB, queryDB, ownQueryDB *sqlitepool.Pool,
 	set *sqlstmt.Set[stmtID], sizeLimitSender *conflate.Sender[int64, struct{}],
+	closeBudget time.Duration,
 ) *file {
 	queryCtx, cancelQueries := context.WithCancel(context.Background())
 	return &file{
@@ -285,6 +291,7 @@ func newFile(
 		janitorWakeups:  make(chan struct{}, 1),
 		sizeLimitSender: sizeLimitSender,
 		vacuumPages:     vacuumPagesPerSweep,
+		closeBudget:     closeBudget,
 		now:             func() int64 { return time.Now().UnixMilli() },
 	}
 }
@@ -309,7 +316,9 @@ func (s *Store) Release() {
 		delete(s.m.entries, s.cacheID)
 	}
 	if f != nil {
-		_ = s.m.closeFile(f)
+		if err := s.m.closeFile(f); err != nil {
+			s.m.closedLocked(s.cacheID, f, err)
+		}
 	}
 }
 
@@ -523,7 +532,7 @@ func (s *Store) Counts(ctx context.Context) (Counts, error) {
 		return Counts{}, err
 	}
 	defer done()
-	return countKinds(ctx, f.db)
+	return countKinds(ctx, f.db.DB)
 }
 
 // countKinds reads the tally off the trigger-maintained per-kind counts — O(kinds),

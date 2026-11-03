@@ -22,6 +22,7 @@ import (
 	"syscall"
 	"testing"
 
+	"github.com/kstackhq/kstack/sidecar/internal/lib/sqlitepool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -33,7 +34,7 @@ func TestALogFileIsOwnerOnly(t *testing.T) {
 	defer syscall.Umask(prev)
 	dir := filepath.Join(t.TempDir(), "logs")
 
-	f, err := openFile(filepath.Join(dir, "1.db"))
+	f, err := openFile(filepath.Join(dir, "1.db"), sqlitepool.CloseBudget)
 	require.NoError(t, err)
 	t.Cleanup(func() { assert.NoError(t, f.close()) })
 

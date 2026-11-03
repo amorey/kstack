@@ -31,7 +31,10 @@ cache at `<cache>/logs/<cache id>.db` (schema `migrations/0001_init.sql`: `strea
   outside its lock, one at a time per cache. Every operation goes through `Store.use`, and a close
   waits for them. `Clear` deletes the file; `Remove` also refuses the id for the manager's life;
   both still work after `Close`. A delete removes `-wal` and `-shm` first, or a fresh database
-  would replay the old WAL.
+  would replay the old WAL. A file whose close ran out of `sqlitepool.CloseBudget` is kept as
+  stale, and nothing deletes or creates its path until a retry has waited its pools out:
+  SQLite's close of a file's last connection deletes the WAL by path, which would be a fresh
+  file's.
 - `Retention` (`retention.go`) holds every knob. Ids never come back (`AUTOINCREMENT`).
 - **Only the page engine stamps a chunk's `read_at_ms`**; tailers and a follow's own walks stamp
   nothing.

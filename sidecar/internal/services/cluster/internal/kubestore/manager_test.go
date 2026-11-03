@@ -30,6 +30,7 @@ import (
 
 	"github.com/kstackhq/kstack/sidecar/internal/lib/sqlitemigrate"
 	"github.com/kstackhq/kstack/sidecar/internal/lib/sqlitemigrate/sqlitemigratetest"
+	"github.com/kstackhq/kstack/sidecar/internal/lib/sqlitepool"
 	"github.com/kstackhq/kstack/sidecar/internal/lib/testutil"
 )
 
@@ -586,40 +587,33 @@ func TestCountsOfANeverExistingCacheIsEmpty(t *testing.T) {
 	assert.NoFileExists(t, filepath.Join(dir, "1.db"))
 }
 
-// A clear closes the file whatever is holding it, so a read that resolved the file a
-// moment earlier finds it closed mid-query. The measurement must not fail for that —
-// the gauge behind it is meant to survive a clear — and the answer is on disk either
-// way.
-func TestStatsSurvivesTheFileClosingUnderIt(t *testing.T) {
+// A count on a cache whose file is stale reads the disk at once: a read-only open
+// creates nothing, so the gauge over it keeps answering while the file waits.
+func TestACountOnAStaleCacheReadsTheDisk(t *testing.T) {
 	t.Parallel()
 
-	ctx := context.Background()
-	m := NewManager(t.TempDir(), Retention{})
-	t.Cleanup(func() { require.NoError(t, m.Close()) })
+	m := newManagerWithOptions(t.TempDir(), withCloseBudget(0))
+	t.Cleanup(func() { _ = m.Close() })
 	store, err := m.OpenOrCreate(1)
 	require.NoError(t, err)
-	defer store.Release()
-	require.NoError(t, store.ApplyChange(ctx, Kind{APIVersion: "v1", Kind: "Pod", Resource: "pods"},
-		watch.Added, obj(map[string]any{
-			"apiVersion": "v1", "kind": "Pod",
-			"metadata": map[string]any{"uid": "uid-1", "name": "api-0", "resourceVersion": "1"},
-		})))
+	conn, err := openFileOf(t, store).db.Conn(context.Background())
+	require.NoError(t, err)
+	store.Release()
 
-	// The state a clear passes through: the entry still holds a file, and that file is
-	// closed. What a racing reader sees between resolving one and querying it.
-	require.True(t, cacheIsOpen(m, 1))
-	require.NoError(t, m.entries[1].file.close())
-
-	got, err := m.Stats(ctx, 1)
+	stats, err := m.Stats(context.Background(), 1)
 
 	require.NoError(t, err)
-	assert.True(t, got.Exists)
-	assert.Equal(t, 1, got.ObjectCount, "the read gave up instead of falling back to the file")
+	assert.True(t, stats.Exists)
+	require.ErrorIs(t, m.Clear(1), sqlitepool.ErrStillOpen, "the stale file was forgotten")
+	require.NoError(t, conn.Close())
+	require.NoError(t, m.Clear(1))
+	assert.NoFileExists(t, m.path(1))
 }
 
 // A close that fails leaves the file unusable whatever it reports, so the entry has to
 // be retired: a claim on it must answer ErrClosed rather than reach a dead database, and
-// the next open starts the cache fresh.
+// the next open starts the cache fresh. A failure that left no connection open does not
+// skip the delete, or the clear would have cleared nothing.
 func TestClearRetiresTheEntryWhenTheFileWillNotClose(t *testing.T) {
 	t.Parallel()
 
@@ -637,6 +631,7 @@ func TestClearRetiresTheEntryWhenTheFileWillNotClose(t *testing.T) {
 	_, err = store.Subscribe()
 	assert.ErrorIs(t, err, ErrClosed, "a subscription was handed back on a dead bus")
 	assert.False(t, cacheIsOpen(m, 1), "the retired entry is still bound")
+	assert.NoFileExists(t, m.path(1), "the failed close skipped the delete")
 }
 
 // A clear closes, unlinks and re-creates the file, and the fresh one has no schema until
@@ -920,14 +915,14 @@ func TestCountsFromDiskAnswersAVanishedFileAsEmpty(t *testing.T) {
 
 	m := NewManager(t.TempDir(), Retention{})
 
-	counts, err := m.countsFromDiskLocked(context.Background(), filepath.Join(t.TempDir(), "gone.db"))
+	counts, err := m.countsFromDiskLocked(context.Background(), filepath.Join(t.TempDir(), "gone.db"), 1)
 
 	require.NoError(t, err)
 	assert.Zero(t, counts.ObjectCount)
 }
 
-// Remove retires the entry whatever happens, but a close that fails is still reported —
-// the caller's next pass retries the unlink, and until it lands nothing may reopen.
+// Remove retires the entry and deletes the file whatever happens, but a close that fails
+// is still reported, and until a pass succeeds nothing may reopen.
 func TestRemoveReportsAFileThatWillNotClose(t *testing.T) {
 	t.Parallel()
 
@@ -938,6 +933,81 @@ func TestRemoveReportsAFileThatWillNotClose(t *testing.T) {
 	defer store.Release()
 
 	assert.ErrorIs(t, m.Remove(1), boom)
+	assert.NoFileExists(t, m.path(1), "the failed close skipped the delete")
+}
+
+// A file whose close ran out of budget may still have a connection open, and SQLite's
+// close of a file's last connection deletes the WAL by path: deleting the file and
+// creating a fresh one at that path would hand the fresh one's WAL to that close. So
+// nothing deletes or opens the path until a retry has waited the file's pools out.
+func TestNothingTouchesThePathOfAFileStillClosing(t *testing.T) {
+	t.Parallel()
+
+	m := newManagerWithOptions(t.TempDir(), withCloseBudget(0))
+	t.Cleanup(func() { _ = m.Close() })
+	store, err := m.OpenOrCreate(1)
+	require.NoError(t, err)
+	defer store.Release()
+	// Held straight from the pool, as a cancelled transaction's rollback holds one on
+	// database/sql's goroutine, so the close finds it in use.
+	conn, err := openFileOf(t, store).db.Conn(context.Background())
+	require.NoError(t, err)
+
+	require.ErrorIs(t, m.Clear(1), sqlitepool.ErrStillOpen)
+	assert.FileExists(t, m.path(1), "deleted under an open connection")
+	_, err = m.OpenOrCreate(1)
+	assert.ErrorIs(t, err, sqlitepool.ErrStillOpen, "opened over an open connection")
+	require.ErrorIs(t, m.Clear(1), sqlitepool.ErrStillOpen, "the retry found the connection closed")
+	assert.FileExists(t, m.path(1))
+
+	require.NoError(t, conn.Close())
+
+	require.NoError(t, m.Clear(1))
+	assert.NoFileExists(t, m.path(1))
+	fresh, err := m.OpenOrCreate(1)
+	require.NoError(t, err)
+	fresh.Release()
+}
+
+// Remove follows the same rule, and the retry deletes once the pools have closed.
+func TestRemoveWaitsOutAFileStillClosing(t *testing.T) {
+	t.Parallel()
+
+	m := newManagerWithOptions(t.TempDir(), withCloseBudget(0))
+	t.Cleanup(func() { _ = m.Close() })
+	store, err := m.OpenOrCreate(1)
+	require.NoError(t, err)
+	defer store.Release()
+	conn, err := openFileOf(t, store).db.Conn(context.Background())
+	require.NoError(t, err)
+
+	require.ErrorIs(t, m.Remove(1), sqlitepool.ErrStillOpen)
+	assert.FileExists(t, m.path(1), "deleted under an open connection")
+	require.NoError(t, conn.Close())
+
+	require.NoError(t, m.Remove(1))
+	assert.NoFileExists(t, m.path(1))
+}
+
+// The manager's Close keeps a file a connection still holds as stale too, since the
+// cache pass may still remove the cache after the shutdown began.
+func TestCloseKeepsAFileStillClosingForTheRemoveAfterIt(t *testing.T) {
+	t.Parallel()
+
+	m := newManagerWithOptions(t.TempDir(), withCloseBudget(0))
+	store, err := m.OpenOrCreate(1)
+	require.NoError(t, err)
+	defer store.Release()
+	conn, err := openFileOf(t, store).db.Conn(context.Background())
+	require.NoError(t, err)
+
+	require.ErrorIs(t, m.Close(), sqlitepool.ErrStillOpen)
+	require.ErrorIs(t, m.Remove(1), sqlitepool.ErrStillOpen)
+	assert.FileExists(t, m.path(1), "deleted under an open connection")
+	require.NoError(t, conn.Close())
+
+	require.NoError(t, m.Remove(1))
+	assert.NoFileExists(t, m.path(1))
 }
 
 // The manager has nothing to do at startup — the files open on demand — so it satisfies
@@ -1106,4 +1176,26 @@ func TestStatsReportsNoVerdictWithoutAJanitor(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.False(t, got.OverSizeLimit)
+}
+
+// The last release keeps a file a connection still holds as stale too: it is the
+// commonest close, and a Clear after it would otherwise delete under the connection.
+func TestTheLastReleaseKeepsAFileStillClosing(t *testing.T) {
+	t.Parallel()
+
+	m := newManagerWithOptions(t.TempDir(), withCloseBudget(0))
+	t.Cleanup(func() { _ = m.Close() })
+	store, err := m.OpenOrCreate(1)
+	require.NoError(t, err)
+	conn, err := openFileOf(t, store).db.Conn(context.Background())
+	require.NoError(t, err)
+
+	store.Release()
+
+	require.ErrorIs(t, m.Clear(1), sqlitepool.ErrStillOpen)
+	assert.FileExists(t, m.path(1), "deleted under an open connection")
+	require.NoError(t, conn.Close())
+
+	require.NoError(t, m.Clear(1))
+	assert.NoFileExists(t, m.path(1))
 }

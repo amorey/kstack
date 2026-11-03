@@ -30,15 +30,17 @@ package kubestore
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/amorey/gobus/conflate"
+	"modernc.org/sqlite"
 
 	"github.com/kstackhq/kstack/sidecar/internal/lib/sqlitemigrate"
 	"github.com/kstackhq/kstack/sidecar/internal/lib/sqlitepool"
@@ -53,11 +55,21 @@ type Manager struct {
 	dir string
 	// retention is what each open file's janitor sweeps to.
 	retention Retention
+	// closeBudget is how long a file's close waits for a connection still in use:
+	// sqlitepool.CloseBudget, or less in a test.
+	closeBudget time.Duration
 
-	// mu guards entries and removed, and is what serializes Clear against
+	// mu guards entries, stale and removed, and is what serializes Clear against
 	// OpenOrCreate/Release: a swap must never race a Store resolving its file.
 	mu      sync.Mutex
 	entries map[int64]*entry
+	// stale is each cache's file whose close ran out of budget, so a connection of it may
+	// still be open. SQLite's close of a file's last connection deletes the WAL by path,
+	// so nothing deletes or creates the file at that path until a Clear, Remove or open
+	// has waited that file's pools out. A cache has an entry or a stale file, never
+	// both: an open waits the stale file out first, and every path that records one has
+	// retired the entry.
+	stale map[int64]*file
 	// opens says a cache's file has come into existence, keyed by cache. A read never
 	// creates one, so a watch opened before the first worker or sweep has nothing to bind
 	// to and would otherwise wait out a poll.
@@ -125,15 +137,23 @@ func withDeleteFiles(f func(path string) error) option {
 }
 
 // withCloseFile substitutes the close both clears and the last release go through.
+// Close calls it once per open file, at once.
 func withCloseFile(fn func(f *file) error) option {
 	return func(m *Manager) { m.closeFile = fn }
+}
+
+// withCloseBudget shrinks how long a close waits for a connection still in use.
+func withCloseBudget(d time.Duration) option {
+	return func(m *Manager) { m.closeBudget = d }
 }
 
 // newManagerWithOptions is NewManager plus the seams.
 func newManagerWithOptions(dir string, opts ...option) *Manager {
 	m := &Manager{
 		dir:          dir,
+		closeBudget:  sqlitepool.CloseBudget,
 		entries:      map[int64]*entry{},
+		stale:        map[int64]*file{},
 		opens:        conflate.New[int64, struct{}](),
 		sizeLimitHub: conflate.New[int64, struct{}](),
 		deleteFiles:  deleteStoreFiles,
@@ -165,7 +185,10 @@ func (m *Manager) openOrCreateLocked(cacheID int64) (*Store, error) {
 	}
 	e, ok := m.entries[cacheID]
 	if !ok {
-		f, err := openFile(m.path(cacheID), cacheID, m.retention, m.sizeLimitHub.Sender())
+		if err := m.closeStaleLocked(cacheID); err != nil {
+			return nil, fmt.Errorf("open cache %d: %w", cacheID, err)
+		}
+		f, err := m.openFile(cacheID)
 		if err != nil {
 			return nil, err
 		}
@@ -259,26 +282,29 @@ func (m *Manager) Clear(cacheID int64) error {
 		if err := m.closeFile(e.file); err != nil {
 			// The file is unusable whatever the close reported, so the entry is retired
 			// rather than left installed: a claim on it must answer ErrClosed instead of
-			// reaching a dead database, and the next open starts the cache fresh.
+			// reaching a dead database, and the next open starts the cache fresh. A
+			// file a connection still holds is not deleted: the caller's retry waits
+			// its pools out first. Any other failure leaves the delete to run.
+			f := e.file
 			e.file = nil
 			delete(m.entries, cacheID)
-			return fmt.Errorf("clear: close store: %w", err)
+			if m.closedLocked(cacheID, f, err) {
+				return fmt.Errorf("clear: close store: %w", err)
+			}
+			return errors.Join(fmt.Errorf("clear: close store: %w", err), m.deleteFiles(path))
 		}
 	}
-	var waitErr error
-	if held {
-		waitErr = sqlitepool.WaitClosed(sqlitepool.CloseBudget, e.file.pools()...)
+	if err := m.closeStaleLocked(cacheID); err != nil {
+		return fmt.Errorf("clear: close store: %w", err)
 	}
-	// The delete runs whatever the wait answered: only Windows refuses it while a
-	// connection is open, and there it reports that itself.
-	deleteErr := errors.Join(waitErr, m.deleteFiles(path))
+	deleteErr := m.deleteFiles(path)
 
 	// Live claims still hold this entry — swap in a fresh file rather than dropping it,
 	// or every one of them would answer ErrClosed for a cache that is meant to stay
 	// usable. On a failed delete too: the caller retries the clear, and the cache has to
 	// keep working until it lands.
 	if held {
-		f, err := openFile(path, cacheID, m.retention, m.sizeLimitHub.Sender())
+		f, err := m.openFile(cacheID)
 		if err != nil {
 			// Nothing usable to swap in, so retire the entry: a later OpenOrCreate opens
 			// the cache fresh, and the claims left on this one answer ErrClosed rather
@@ -310,20 +336,54 @@ func (m *Manager) Remove(cacheID int64) error {
 	// the caller's next pass, and until it lands nothing may open the file again.
 	m.removed[cacheID] = true
 
-	var waitErr error
+	var closeErr error
 	if e, held := m.entries[cacheID]; held {
 		f := e.file
 		e.file = nil
 		delete(m.entries, cacheID)
+		// As in Clear, a file a connection still holds waits for the retry, and any
+		// other failure leaves the delete to run.
 		if err := m.closeFile(f); err != nil {
-			return fmt.Errorf("remove: close store: %w", err)
+			if m.closedLocked(cacheID, f, err) {
+				return fmt.Errorf("remove: close store: %w", err)
+			}
+			closeErr = fmt.Errorf("remove: close store: %w", err)
 		}
-		waitErr = sqlitepool.WaitClosed(sqlitepool.CloseBudget, f.pools()...)
 	}
-	// As in Clear, the delete runs whatever the wait answered.
-	if err := errors.Join(waitErr, m.deleteFiles(m.path(cacheID))); err != nil {
-		return fmt.Errorf("remove: delete files: %w", err)
+	if err := m.closeStaleLocked(cacheID); err != nil {
+		return fmt.Errorf("remove: close store: %w", err)
 	}
+	var deleteErr error
+	if err := m.deleteFiles(m.path(cacheID)); err != nil {
+		deleteErr = fmt.Errorf("remove: delete files: %w", err)
+	}
+	return errors.Join(closeErr, deleteErr)
+}
+
+// closedLocked records what closing cacheID's file f answered, and reports whether the
+// file is kept as stale: it is when err says a connection still holds it. Every path
+// that closes a file reports through here, so none can forget the rule.
+func (m *Manager) closedLocked(cacheID int64, f *file, err error) (stale bool) {
+	if !errors.Is(err, sqlitepool.ErrStillOpen) {
+		return false
+	}
+	m.stale[cacheID] = f
+	return true
+}
+
+// closeStaleLocked waits out the pools of cacheID's stale file, if there is one, and
+// forgets it once they have closed. Nothing is done to a cache with none. Under the
+// lock, as every close here is: a Clear or Remove must not find the entry gone while
+// its file is still closing.
+func (m *Manager) closeStaleLocked(cacheID int64) error {
+	f, ok := m.stale[cacheID]
+	if !ok {
+		return nil
+	}
+	if err := f.closePools(); err != nil {
+		return err
+	}
+	delete(m.stale, cacheID)
 	return nil
 }
 
@@ -410,20 +470,16 @@ func sidecarSize(path string) (int64, error) {
 // counts reads the per-kind tallies without taking a claim: through the open file when
 // one is, and otherwise through a read-only open.
 //
-// A failed read through the open file falls through rather than failing the
-// measurement. A Clear closes the file whatever holds it — a claim would narrow this
-// window, never close it — so a read that resolved one a moment earlier can find it
-// closed mid-query, and the answer is on disk either way. The fallback re-reads
-// whatever is there now; a genuine failure surfaces from it instead.
+// A read through the open file answers for the entry, failure included: the lock keeps
+// a Clear from closing the file under it. With no entry, the file on disk is read, a
+// stale file's included, since a read-only open creates nothing.
 func (m *Manager) countsLocked(ctx context.Context, path string, cacheID int64) (Counts, error) {
 	// The entry's file directly, not through a Store: a Store resolves its file under
 	// this same lock, which this call already holds.
 	if e, held := m.entries[cacheID]; held && e.file != nil {
-		if counts, err := countKinds(ctx, e.file.db); err == nil {
-			return counts, nil
-		}
+		return countKinds(ctx, e.file.db.DB)
 	}
-	return m.countsFromDiskLocked(ctx, path)
+	return m.countsFromDiskLocked(ctx, path, cacheID)
 }
 
 // countsFromDisk opens the file read-only and reads it, **under the manager's lock**.
@@ -432,35 +488,33 @@ func (m *Manager) countsLocked(ctx context.Context, path string, cacheID int64) 
 // and, through the gauge above it, ends a subscription the user is watching while
 // clearing. The lock costs one point read on an indexed table, and only for a cache
 // nothing has open.
-func (m *Manager) countsFromDiskLocked(ctx context.Context, path string) (Counts, error) {
-	db, err := openReadOnly(path)
-	if err != nil { // coverage:ignore sql.Open fails only for an unregistered driver
-		return Counts{}, err
-	}
-	defer db.Close() //nolint:errcheck // read-only, nothing to flush
-
-	counts, err := countKinds(ctx, db)
+func (m *Manager) countsFromDiskLocked(ctx context.Context, path string, cacheID int64) (Counts, error) {
+	db := openReadOnly(path)
+	counts, err := countKinds(ctx, db.DB)
 	if err != nil {
+		counts = Counts{}
 		if _, statErr := os.Stat(path); os.IsNotExist(statErr) {
 			// Removed between the stat above and this read: gone, not broken. SQLite
 			// reports a missing file as its own error, so the file is what says so.
-			return Counts{}, nil
+			err = nil
 		}
-		return Counts{}, err
 	}
-	return counts, nil
+	// The close waits for the read's connection, which a read a cancel interrupted
+	// lets go of on database/sql's own goroutine. One held past the budget is not kept
+	// as stale: the pool is mode=ro, and a read-only connection's close never
+	// checkpoints, so it deletes no WAL by path. The counts read are still the counts.
+	if closeErr := sqlitepool.CloseAll(m.closeBudget, db); closeErr != nil { // coverage:ignore only a connection a cancelled read lets go of late is held, and no test can hold it past the budget
+		slog.Warn("kubestore: count read close failed", "cacheID", cacheID, "err", closeErr)
+	}
+	return counts, err
 }
 
 // openReadOnly opens an existing cache file for reading. mode=ro is what makes this
 // safe to call from a read: SQLite refuses rather than creating, so no reader can
-// bring a removed cache back.
-func openReadOnly(path string) (*sql.DB, error) {
-	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)&mode=ro")
-	if err != nil { // coverage:ignore sql.Open fails only for an unregistered driver
-		return nil, fmt.Errorf("open read-only: %w", err)
-	}
-	db.SetMaxOpenConns(1)
-	return db, nil
+// bring a removed cache back. Through sqlitepool, so its Close waits for the
+// connection a cancelled read lets go of late, and a delete never finds it open.
+func openReadOnly(path string) *sqlitepool.Pool {
+	return sqlitepool.OpenOwnQuery(&sqlite.Driver{}, path, 1)
 }
 
 // path is cacheID's db file path within the manager's directory.
@@ -479,14 +533,13 @@ func deleteStoreFiles(path string) error {
 	return nil
 }
 
-// openFile opens the writer pool at path, applies the schema, and starts the file's janitor.
+// openFile opens cacheID's writer pool, applies the schema, and starts the file's janitor.
 //
 // The janitor starts HERE rather than at either call site: Clear reopens a fresh file for the
 // claims still held, and a start at the open alone would leave a cleared cache without a
 // sweeper — the cache most likely to need one, since a clear is what frees the pages.
-func openFile(
-	path string, cacheID int64, ret Retention, sizeLimitSender *conflate.Sender[int64, struct{}],
-) (*file, error) {
+func (m *Manager) openFile(cacheID int64) (*file, error) {
+	path := m.path(cacheID)
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("mkdir: %w", err)
 	}
@@ -495,30 +548,26 @@ func openFile(
 		return nil, fmt.Errorf("open pool: %w", err)
 	}
 
+	// A failure closes the pools under the budget and reports what that answered.
+	// Nothing else holds them and nothing cancels, so no connection is in use.
 	ctx := context.Background()
-	if _, err := sqlitemigrate.Apply(ctx, db, migrationsFS, "migrations"); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("migrate: %w", err)
+	if _, err := sqlitemigrate.Apply(ctx, db.DB, migrationsFS, "migrations"); err != nil {
+		return nil, errors.Join(fmt.Errorf("migrate: %w", err), sqlitepool.CloseAll(m.closeBudget, db))
 	}
 
 	// After the migrations, so a reader never races the schema onto a fresh file.
-	readDB, err := sqlitepool.OpenReader(path, readerPoolSize)
-	if err != nil { // coverage:ignore OpenReader is a sql.Open, which fails only for an unregistered driver
-		db.Close()
-		return nil, fmt.Errorf("open reader pool: %w", err)
-	}
+	readDB := sqlitepool.OpenReader(path, readerPoolSize)
 	// After both pools are open, so a failure here closes both.
-	set, err := sqlstmt.Prepare[stmtID](ctx, db, readDB, statements)
+	set, err := sqlstmt.Prepare[stmtID](ctx, db.DB, readDB.DB, statements)
 	if err != nil {
-		db.Close()
-		readDB.Close()
-		return nil, err
+		return nil, errors.Join(err, sqlitepool.CloseAll(m.closeBudget, db, readDB))
 	}
 
 	f := newFile(path, cacheID, db, readDB,
 		sqlitepool.OpenQuery(queryDriver, path, queryPoolSize),
-		sqlitepool.OpenOwnQuery(queryDriver, path, queryPoolSize), set, sizeLimitSender)
-	f.startJanitor(ret)
+		sqlitepool.OpenOwnQuery(queryDriver, path, queryPoolSize), set, m.sizeLimitHub.Sender(),
+		m.closeBudget)
+	f.startJanitor(m.retention)
 	return f, nil
 }
 
@@ -537,13 +586,26 @@ func (m *Manager) Close() error {
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	var errs []error
+	// At once, so the files' waits for a connection still in use overlap: a shutdown
+	// spends one close budget, however many caches are open.
+	var ids []int64
+	var files []*file
 	for id, e := range m.entries {
 		if e.file != nil {
-			errs = append(errs, m.closeFile(e.file))
+			ids = append(ids, id)
+			files = append(files, e.file)
 			e.file = nil
 		}
 		delete(m.entries, id)
+	}
+	errs := make([]error, len(files))
+	var wg sync.WaitGroup
+	for i, f := range files {
+		wg.Go(func() { errs[i] = m.closeFile(f) })
+	}
+	wg.Wait()
+	for i, f := range files {
+		m.closedLocked(ids[i], f, errs[i])
 	}
 	return errors.Join(errs...)
 }

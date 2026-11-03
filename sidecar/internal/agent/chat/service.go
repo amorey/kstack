@@ -304,7 +304,7 @@ func newService(db *appdb.DB, chatsDir, monitorDir string, llmSvc *llm.Service, 
 		_ = chatsRoot.Close()
 		return nil, fmt.Errorf("open the monitor's directory: %w", err)
 	}
-	st, err := sqlstmt.Prepare[stmtID](context.Background(), db.Write, db.Read, statements)
+	st, err := sqlstmt.Prepare[stmtID](context.Background(), db.Write.DB, db.Read.DB, statements)
 	if err != nil {
 		_ = chatsRoot.Close()
 		_ = monitorRoot.Close()

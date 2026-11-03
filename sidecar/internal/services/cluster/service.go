@@ -504,7 +504,7 @@ func New(db *appdb.DB, paths Paths, kubeconfigSvc kubeconfigService, pokeSvc *po
 	if err != nil {
 		return nil, fmt.Errorf("KSTACK_FAULTS: %w", err)
 	}
-	store, err := sqlstmt.Prepare[stmtID](context.Background(), db.Write, db.Read, statements)
+	store, err := sqlstmt.Prepare[stmtID](context.Background(), db.Write.DB, db.Read.DB, statements)
 	if err != nil {
 		return nil, fmt.Errorf("prepare cluster statements: %w", err)
 	}

@@ -11,9 +11,7 @@ package appdb
 
 import (
 	"context"
-	"database/sql"
 	"embed"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -37,8 +35,8 @@ const readerPoolSize = 4
 // on, the query_only reader pool the watches read from, so a read never queues
 // behind a write, and the change bus the two meet on.
 type DB struct {
-	Write *sql.DB
-	Read  *sql.DB
+	Write *sqlitepool.Pool
+	Read  *sqlitepool.Pool
 
 	hub *conflate.Hub[string, struct{}]
 
@@ -68,15 +66,11 @@ func Open(path string, sweepEvery time.Duration) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	if _, err := sqlitemigrate.Apply(context.Background(), w, migrationsFS, "migrations"); err != nil {
+	if _, err := sqlitemigrate.Apply(context.Background(), w.DB, migrationsFS, "migrations"); err != nil {
 		w.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
-	r, err := sqlitepool.OpenReader(path, readerPoolSize)
-	if err != nil { // coverage:ignore OpenReader opens lazily and fails only where sql.Open does, which a registered driver never does
-		w.Close()
-		return nil, err
-	}
+	r := sqlitepool.OpenReader(path, readerPoolSize)
 	db := &DB{
 		Write:       w,
 		Read:        r,
@@ -110,7 +104,7 @@ func (db *DB) Close() error {
 		_, _ = db.Write.Exec(`SELECT 1`)
 	}
 	db.hub.Close()
-	return errors.Join(db.Read.Close(), db.Write.Close())
+	return sqlitepool.CloseAll(sqlitepool.CloseBudget, db.Read, db.Write)
 }
 
 // The change bus over the file: a writer notifies a key after its commit, and every

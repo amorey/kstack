@@ -37,7 +37,7 @@ func openTestDB(t *testing.T) *appdb.DB {
 func openTestStore(t *testing.T) (*appdb.DB, *sqlstmt.Set[stmtID]) {
 	t.Helper()
 	db := openTestDB(t)
-	st, err := sqlstmt.Prepare[stmtID](context.Background(), db.Write, db.Read, statements)
+	st, err := sqlstmt.Prepare[stmtID](context.Background(), db.Write.DB, db.Read.DB, statements)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 	return db, st

@@ -36,8 +36,7 @@ func TestOpenReaderRefusesWrites(t *testing.T) {
 	_, err = w.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY); INSERT INTO t VALUES (1);`)
 	require.NoError(t, err)
 
-	r, err := OpenReader(path, 2)
-	require.NoError(t, err)
+	r := OpenReader(path, 2)
 	t.Cleanup(func() { r.Close() })
 
 	_, err = r.Exec(`INSERT INTO t VALUES (2)`)
@@ -103,7 +102,7 @@ func TestOpenWriterRefusesAFileItCannotRepair(t *testing.T) {
 	d := &sqlite.Driver{}
 	require.NoError(t, d.RegisterDeterministicScalarFunction("only_there", 1,
 		func(_ *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) { return args[0], nil }))
-	legacy := sql.OpenDB(connector{d: d, dsn: "file:" + path})
+	legacy := sql.OpenDB(newConnector(d, "file:"+path))
 	_, err := legacy.Exec(`CREATE TABLE legacy (id INTEGER PRIMARY KEY, x INTEGER)`)
 	require.NoError(t, err)
 	_, err = legacy.Exec(`CREATE INDEX legacy_x ON legacy (only_there(x))`)
@@ -120,8 +119,7 @@ func TestOpenWriterRefusesAFileItCannotRepair(t *testing.T) {
 // the DSN's pragmas, on a path a watch walks every 250ms.
 func TestOpenReaderKeepsEveryConnectionItOpens(t *testing.T) {
 	const n = 4
-	db, err := OpenReader(filepath.Join(t.TempDir(), "test.db"), n)
-	require.NoError(t, err)
+	db := OpenReader(filepath.Join(t.TempDir(), "test.db"), n)
 	t.Cleanup(func() { db.Close() })
 
 	// Held all at once: a Conn is exclusive until it is put back, so each checkout has to
@@ -130,8 +128,9 @@ func TestOpenReaderKeepsEveryConnectionItOpens(t *testing.T) {
 	// involved — a connection returns to the pool the moment it is released.
 	conns := make([]*sql.Conn, n)
 	for i := range conns {
-		conns[i], err = db.Conn(context.Background())
+		c, err := db.Conn(context.Background())
 		require.NoError(t, err)
+		conns[i] = c
 	}
 	for _, c := range conns {
 		require.NoError(t, c.Close())
@@ -249,17 +248,4 @@ func TestOpenQueryOpensThroughItsDriver(t *testing.T) {
 	require.NoError(t, q.QueryRow(`SELECT only_here()`).Scan(&n))
 	require.Equal(t, 7, n)
 	require.ErrorContains(t, w.QueryRow(`SELECT only_here()`).Scan(&n), "no such function")
-}
-
-// The connector opens through its driver, and refuses a context already done.
-func TestTheQueryConnectorIsItsDrivers(t *testing.T) {
-	d := &sqlite.Driver{}
-	c := connector{d: d, dsn: "file:" + filepath.Join(t.TempDir(), "test.db")}
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-
-	_, err := c.Connect(ctx)
-
-	require.ErrorIs(t, err, context.Canceled)
-	require.Same(t, d, c.Driver())
 }

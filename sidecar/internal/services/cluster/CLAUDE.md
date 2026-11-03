@@ -195,6 +195,9 @@ One SQLite file per cache behind a refcounted `Manager`. → [ADR: one store per
 cache](../../../../docs/adr/2026-08-26-cache-store-per-cache.md).
 
 - Nothing on the read side creates a file.
+- **A file whose close ran out of `sqlitepool.CloseBudget` is kept as stale**, and nothing deletes
+  or creates its path until a `Clear`, `Remove` or open has waited its pools out: SQLite's close
+  of a file's last connection deletes the WAL by path, which would be a fresh file's.
 - `ForgetCache` before `Manager.Remove`; `ForgetKind` before `Store.ClearKind`.
 - Every delete logs to `deletes` first; readers apply deletes before writes. → [ADR: write
   positions and the deletes log](../../../../docs/adr/2026-08-30-write-positions-and-the-deletes-log.md).

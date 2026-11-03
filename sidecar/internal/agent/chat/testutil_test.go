@@ -107,7 +107,7 @@ func prepareOn(t *testing.T, db *appdb.DB) *sqlstmt.Set[stmtID] {
 // prepareTable is prepareOn over a table of the test's own, from swapped.
 func prepareTable(t *testing.T, db *appdb.DB, table []sqlstmt.Statement) *sqlstmt.Set[stmtID] {
 	t.Helper()
-	s, err := sqlstmt.Prepare[stmtID](t.Context(), db.Write, db.Read, table)
+	s, err := sqlstmt.Prepare[stmtID](t.Context(), db.Write.DB, db.Read.DB, table)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = s.Close() })
 	return s

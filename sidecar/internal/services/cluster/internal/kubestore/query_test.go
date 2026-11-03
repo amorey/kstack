@@ -479,7 +479,7 @@ func queryConnOf(t *testing.T, s *Store) *sql.Conn {
 	t.Helper()
 	f, err := s.file()
 	require.NoError(t, err)
-	conn, err := queryConn(context.Background(), f.queryDB)
+	conn, err := queryConn(context.Background(), f.queryDB.DB)
 	require.NoError(t, err)
 	t.Cleanup(func() { conn.Close() })
 	return conn

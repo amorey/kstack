@@ -113,7 +113,7 @@ func (e *QueryError) Error() string { return e.Message }
 func (s *Store) Query(ctx context.Context, text string, maxRows, maxBytes int, args ...any) (QueryResult, error) {
 	var res QueryResult
 	err := s.withFile(ctx, func(ctx context.Context, f *file) error {
-		conn, err := queryConn(ctx, f.queryDB)
+		conn, err := queryConn(ctx, f.queryDB.DB)
 		if err != nil {
 			return err
 		}
@@ -179,7 +179,7 @@ func (s *Store) ReadOwn(ctx context.Context, read func(Reading) error) error {
 // snapshot runs use inside a read transaction on a connection of the own-query pool,
 // and lets the connection go before it returns.
 func (f *file) snapshot(ctx context.Context, use func(*sql.Tx) error) error {
-	conn, err := queryConn(ctx, f.ownQueryDB)
+	conn, err := queryConn(ctx, f.ownQueryDB.DB)
 	if err != nil {
 		return err
 	}

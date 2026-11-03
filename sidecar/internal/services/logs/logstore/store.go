@@ -25,7 +25,6 @@ package logstore
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"os"
@@ -33,6 +32,7 @@ import (
 	"slices"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/amorey/gobus/conflate"
 
@@ -48,10 +48,12 @@ const readerPoolSize = 4
 // prepared on both, and the bus every commit of lines pings by stream id.
 type file struct {
 	path   string
-	db     *sql.DB
-	readDB *sql.DB
-	set    *sqlstmt.Set[stmtID]
-	bus    *conflate.Hub[int64, struct{}]
+	db     *sqlitepool.Pool
+	readDB *sqlitepool.Pool
+	// closeBudget is how long closePools waits for a connection still in use.
+	closeBudget time.Duration
+	set         *sqlstmt.Set[stmtID]
+	bus         *conflate.Hub[int64, struct{}]
 	// w is the file's writer, nil for a file opened outside a manager.
 	w *writer
 	// heldRows and heldChunks are the stream rows and chunks in use, which a sweep
@@ -87,8 +89,8 @@ type file struct {
 
 // openFile opens the file at path, creating its directory, the file and the schema on
 // first touch. The directory is 0700 and the file 0600, since a log holds whatever the
-// cluster wrote.
-func openFile(path string) (*file, error) {
+// cluster wrote. closeBudget is how long its close waits for a connection still in use.
+func openFile(path string, closeBudget time.Duration) (*file, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("mkdir: %w", err)
 	}
@@ -96,33 +98,26 @@ func openFile(path string) (*file, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open writer: %w", err)
 	}
-	if _, err := sqlitemigrate.Apply(context.Background(), db, migrationsFS, "migrations"); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("migrate: %w", err)
+	// A failure closes the pools under the budget and reports what that answered.
+	// Nothing else holds them and nothing cancels, so no connection is in use.
+	if _, err := sqlitemigrate.Apply(context.Background(), db.DB, migrationsFS, "migrations"); err != nil {
+		return nil, errors.Join(fmt.Errorf("migrate: %w", err), sqlitepool.CloseAll(closeBudget, db))
 	}
 	// After the migrations, so a reader never races the schema onto a fresh file.
-	readDB, err := sqlitepool.OpenReader(path, readerPoolSize)
-	if err != nil { // coverage:ignore the writer just opened and migrated the same file
-		db.Close()
-		return nil, fmt.Errorf("open reader pool: %w", err)
-	}
-	set, err := sqlstmt.Prepare[stmtID](context.Background(), db, readDB, statements)
+	readDB := sqlitepool.OpenReader(path, readerPoolSize)
+	set, err := sqlstmt.Prepare[stmtID](context.Background(), db.DB, readDB.DB, statements)
 	if err != nil {
-		db.Close()
-		readDB.Close()
-		return nil, fmt.Errorf("prepare: %w", err)
+		return nil, errors.Join(fmt.Errorf("prepare: %w", err), sqlitepool.CloseAll(closeBudget, db, readDB))
 	}
 	// Closing a chunk is its tailer's last write, so a crash or a failed write leaves it
 	// open; no tailer runs before the file is open.
 	if _, err := set.Stmts().Exec(context.Background(), stmtCloseOpenChunks); err != nil {
-		set.Close()
-		db.Close()
-		readDB.Close()
-		return nil, fmt.Errorf("close open chunks: %w", err)
+		return nil, errors.Join(fmt.Errorf("close open chunks: %w", err), set.Close(),
+			sqlitepool.CloseAll(closeBudget, db, readDB))
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &file{
-		path: path, db: db, readDB: readDB, set: set, bus: conflate.New[int64, struct{}](),
+		path: path, db: db, readDB: readDB, closeBudget: closeBudget, set: set, bus: conflate.New[int64, struct{}](),
 		heldRows: holds{n: map[int64]int{}}, heldChunks: holds{n: map[int64]int{}},
 		wake: make(chan struct{}, 1), ctx: ctx, cancel: cancel,
 	}, nil
@@ -138,13 +133,13 @@ func (f *file) close() error {
 		f.w.stop()
 	}
 	f.inUse.Wait()
-	return errors.Join(f.set.Close(), f.db.Close(), f.readDB.Close())
+	return errors.Join(f.set.Close(), f.closePools())
 }
 
-// pools is what a delete of the file waits on after close: a connection still in use
-// at close holds the file past it.
-func (f *file) pools() []*sql.DB {
-	return []*sql.DB{f.db, f.readDB}
+// closePools closes both pools and waits for a connection database/sql still holds,
+// under one budget. Called again on a file whose wait ran out, it waits again.
+func (f *file) closePools() error {
+	return sqlitepool.CloseAll(f.closeBudget, f.db, f.readDB)
 }
 
 // bind is ctx ended also when the file closes, so a close interrupts the statements
@@ -260,6 +255,7 @@ func (s *Store) Close() error {
 	m.acquireLocked(s.cacheID)
 	m.mu.Unlock()
 	err := f.close()
+	m.fileClosed(s.cacheID, f, err)
 	m.mu.Lock()
 	m.releaseLocked(s.cacheID)
 	return err
