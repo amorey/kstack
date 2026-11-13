@@ -97,6 +97,13 @@ describe('ChatNav', () => {
     expect(screen.getByRole('link', { name: /new chat/i })).toHaveAttribute('href', '/chat');
   });
 
+  it('draws a border around New chat', () => {
+    renderNav();
+    const link = screen.getByRole('link', { name: /new chat/i });
+    expect(link).toHaveClass('border-border');
+    expect(link).not.toHaveClass('border-transparent');
+  });
+
   it('waits for the snapshot before saying there are no chats', () => {
     renderNav([], 'connecting');
     expect(screen.queryByText(/No chats yet/)).not.toBeInTheDocument();

@@ -23,6 +23,7 @@ import type { ComponentProps, KeyboardEvent, ReactElement } from 'react';
 
 import { CODE_TEXT } from '@/components/primitives/text-entry';
 import { VisibleText } from '@/components/primitives/visible-text';
+import { SIDEBAR_CONTROL_CLASS } from '@/lib/sidebar-style';
 
 export type ScopeMenuEntry =
   | { type: 'label'; key: string; label: string }
@@ -37,13 +38,14 @@ export type ScopeMenuEntry =
 type ScopeTriggerProps = ComponentProps<'button'> & { icon?: LucideIcon };
 
 // The button that opens a menu, as wide as the nav: an icon, what is chosen, and the
-// up-down chevron. Opaque on the sidebar's tint, like the search box.
+// up-down chevron. The hover needs its `dark:` form to paint over the control's dark fill.
 export function ScopeTrigger({ icon: Icon, className, children, ...props }: ScopeTriggerProps) {
   return (
     <button
       type="button"
       className={cn(
-        'flex h-9 w-full min-w-0 items-center gap-2 rounded-md border bg-background px-2.5 text-sm font-medium hover:bg-accent',
+        'flex h-9 w-full min-w-0 items-center gap-2 border px-2.5 text-sm font-medium hover:bg-accent dark:hover:bg-accent',
+        SIDEBAR_CONTROL_CLASS,
         className,
       )}
       {...props}

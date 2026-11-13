@@ -27,6 +27,7 @@ import { useDashboardNav } from '@/lib/dashboard-nav';
 import { filterNav, groupCount, PINNED, resolveDashboardResource } from '@/lib/dashboard-resources';
 import type { DashboardResource, NavGroup as Group, NavSection } from '@/lib/dashboard-resources';
 import { usePersistedFlag } from '@/lib/persisted-flag';
+import { SIDEBAR_CONTROL_CLASS } from '@/lib/sidebar-style';
 
 import { NamespacePicker } from './namespace-picker';
 import { NavGroup } from './nav-group';
@@ -119,8 +120,7 @@ export function DashboardResourceNav() {
           aria-label="Search kinds"
           placeholder="Search"
           containerClassName="max-w-none"
-          // Opaque on the sidebar's tint, as the frame draws it; dark mode keeps the library's.
-          className="bg-background"
+          className={SIDEBAR_CONTROL_CLASS}
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           onKeyDown={(e) => {

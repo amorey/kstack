@@ -32,6 +32,7 @@ import {
   DropdownMenuTrigger,
 } from '@kubetail/ui/elements/dropdown-menu';
 import { Spinner } from '@kubetail/ui/elements/spinner';
+import { cn } from '@kubetail/ui/lib/utils';
 import { Link } from '@tanstack/react-router';
 import { MessageCircle, MoreHorizontal, SquarePen } from 'lucide-react';
 import { useState } from 'react';
@@ -45,6 +46,7 @@ import { useActiveCluster } from '@/lib/active-cluster';
 import type { AppMode } from '@/lib/app-mode';
 import { chatModeOf, useChats } from '@/lib/chats';
 import type { Chat } from '@/lib/chats';
+import { SIDEBAR_CONTROL_CLASS } from '@/lib/sidebar-style';
 
 const ChatRenameMutation = graphql(`
   mutation ChatRename($id: ChatID!, $title: String!) {
@@ -155,9 +157,10 @@ export function ChatNav({ mode }: { mode: AppMode }) {
     <nav aria-label="Chats" className="flex flex-1 flex-col gap-1">
       {/* Writes nothing: the first send from `/chat` creates the chat, so a stray
           click leaves no empty row behind. The panel has no such link — typing in its
-          composer is how a dashboard chat starts. */}
+          composer is how a dashboard chat starts. `cn` merges away the button base's
+          `border-transparent`, which would otherwise win over the outline's color. */}
       {!onDashboard && (
-        <Link to="/chat" className={buttonVariants({ variant: 'outline', className: 'mb-2 w-full border-input' })}>
+        <Link to="/chat" className={cn(buttonVariants({ variant: 'outline' }), 'mb-2 w-full', SIDEBAR_CONTROL_CLASS)}>
           <SquarePen aria-hidden />
           New chat
         </Link>
@@ -170,7 +173,7 @@ export function ChatNav({ mode }: { mode: AppMode }) {
             aria-label="Search chats"
             placeholder="Search"
             containerClassName="max-w-none"
-            className="bg-background shadow-xs"
+            className={SIDEBAR_CONTROL_CLASS}
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             onKeyDown={(e) => {
