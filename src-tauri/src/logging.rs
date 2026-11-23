@@ -365,10 +365,39 @@ impl Capture {
     }
 }
 
+/// The test process's global default: interested in every callsite, enabled
+/// for no event, so it writes nothing.
+///
+/// `tracing` caches a callsite's interest for the whole process. While one
+/// dispatcher is registered, it asks only the default of the thread that
+/// reaches the callsite first; with no global default, a thread outside any
+/// capture answers `never`, and a capturing thread's event on that line is
+/// dropped. With this registered too, every callsite is asked of the capture
+/// as well, and `sometimes` keeps the choice per event.
+#[cfg(test)]
+struct Quiet;
+
+#[cfg(test)]
+impl<S: Subscriber> Layer<S> for Quiet {
+    fn register_callsite(&self, _: &'static Metadata<'static>) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::sometimes()
+    }
+
+    fn enabled(&self, _: &Metadata<'_>, _: tracing_subscriber::layer::Context<'_, S>) -> bool {
+        false
+    }
+}
+
 /// Captures this thread's events until the guard drops — the whole of a
 /// current-thread runtime's tasks, which `captured`'s closure cannot hold.
 #[cfg(test)]
 pub(crate) fn capture_thread() -> (Capture, tracing::subscriber::DefaultGuard) {
+    static QUIET: std::sync::Once = std::sync::Once::new();
+    QUIET.call_once(|| {
+        tracing::subscriber::set_global_default(tracing_subscriber::registry().with(Quiet))
+            .expect("no test sets another global default");
+    });
+
     let capture = Capture::default();
     let sink = capture.clone();
     let subscriber = tracing_subscriber::fmt()
@@ -723,6 +752,23 @@ mod tests {
         let set = std::env::var_os("KSTACK_LOG_LEVEL").is_some()
             || std::env::var_os("RUST_LOG").is_some();
         assert!(set || env_filter().to_string() == "info");
+    }
+
+    /// `tracing` caches a callsite's interest for the whole process, from
+    /// whichever thread reaches it first. A thread with no subscriber of its
+    /// own must not cache `never` for a line the capturing thread then emits.
+    #[test]
+    fn a_capture_holds_a_line_another_thread_reached_first() {
+        fn emit() {
+            tracing::info!("reached from either thread");
+        }
+
+        let out = captured(|| {
+            std::thread::spawn(emit).join().unwrap();
+            emit();
+        });
+
+        assert!(out.contains("reached from either thread"), "got: {out:?}");
     }
 
     /// `Capture` buffers nothing, so a flush keeps what was written.
